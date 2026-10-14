@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sync/atomic"
@@ -43,6 +44,12 @@ const (
 	PumpRTPError PumpEnd = "rtp_error"
 )
 
+// pumpPrefix starts the PumpEnd of a pump that panicked; the rest is the
+// panic text.
+const pumpPrefix = "panic: "
+
+func pumpPanic(v any) PumpEnd { return PumpEnd(pumpPrefix + fmt.Sprint(v)) }
+
 // RunPump bridges SCO and RTP until ctx ends or a link fails (spec 6.2). Pacing
 // is read-driven: every SCO read is answered with the same number of bytes from
 // the playout. Without reads for 100 ms a ticker keeps the downlink and RTP
@@ -54,14 +61,26 @@ const (
 // silence to SCO and leaves the playout in startup mode, then ends startup mode
 // once. A blocked link.Write delays the reaction to ctx; the caller unblocks it
 // (and the reader goroutine, after RunPump returns) by closing the link.
-func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock, log *slog.Logger) PumpEnd {
+func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock, log *slog.Logger) (end PumpEnd) {
+	defer func() {
+		if v := recover(); v != nil {
+			end = pumpPanic(v)
+		}
+	}()
 	if log == nil {
 		log = slog.Default()
 	}
 	var progress atomic.Int64 // clock time of the last completed SCO read or write
 	progress.Store(clk.Now().UnixNano())
 	res := make(chan PumpEnd, 1)
-	go func() { res <- runPump(ctx, link, r, settle, clk, log, &progress) }()
+	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				res <- pumpPanic(v)
+			}
+		}()
+		res <- runPump(ctx, link, r, settle, clk, log, &progress)
+	}()
 
 	// The loop's own stall check runs on the goroutine that may be blocked in a
 	// link write; this watchdog does not. Without any completed read or write
@@ -70,12 +89,12 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 	defer wd.Stop()
 	for {
 		select {
-		case end := <-res:
-			return end
+		case e := <-res:
+			return e
 		case <-ctx.Done():
 			select {
-			case end := <-res:
-				return end
+			case e := <-res:
+				return e
 			case <-time.After(unblockWait):
 				return PumpCtx // blocked in the link; the caller closes it
 			}
@@ -101,6 +120,11 @@ func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
+		defer func() {
+			if v := recover(); v != nil {
+				readErr <- panicError{v}
+			}
+		}()
 		for {
 			buf := make([]byte, mtu)
 			n, err := link.Read(buf)
@@ -188,7 +212,11 @@ func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 		select {
 		case <-ctx.Done():
 			return PumpCtx
-		case <-readErr:
+		case err := <-readErr:
+			var pe panicError
+			if errors.As(err, &pe) {
+				return pumpPanic(pe.v)
+			}
 			return PumpSCOEOF
 		case <-settleC:
 			settleC = nil
@@ -229,3 +257,8 @@ func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 		}
 	}
 }
+
+// panicError carries a panic of the link reader goroutine to the pump loop.
+type panicError struct{ v any }
+
+func (p panicError) Error() string { return fmt.Sprint(p.v) }

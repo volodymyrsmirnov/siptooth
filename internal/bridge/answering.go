@@ -148,11 +148,11 @@ func ataDefinite(err error) bool {
 func (c *Coordinator) onAnswerResult(m msg) {
 	if w := c.late; w != nil && w.gen == m.gen {
 		// The call ended before this result. A definite failure means the
-		// phone was never answered, so a later CallActive is not ours.
-		if ataDefinite(m.err) {
-			c.d.Logger.Info("late ATA failure, late CallActive window closed", "call_id", w.id, "error", m.err)
-			c.clearLate()
+		// phone was never answered, so a CallActive is not ours.
+		if w.ata == ataPending || w.ata == ataAmbiguous {
+			w.ata = ataStateOf(m.err)
 		}
+		c.resolveLate()
 		return
 	}
 	call := c.current(m.gen)
@@ -188,6 +188,11 @@ func (c *Coordinator) onAnswerResult(m msg) {
 
 func (c *Coordinator) onTelAnswering(call *activeCall, ev hfp.Event) {
 	switch ev.Kind {
+	case hfp.CallerID:
+		if call.setupCleared {
+			// +CLIP of a new ring: the old call is over.
+			c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
+		}
 	case hfp.CallActive:
 		if call.callActive {
 			return
@@ -234,15 +239,48 @@ func (c *Coordinator) sipEndedAnswering(call *activeCall, cause sip.EndCause) {
 
 // ---- late CallActive window (spec 4.4, last paragraph) ----
 
+// lateWatch is the window after a call ended in which a CallActive may still
+// prove that our ATA answered the phone. The phone call is ours only when
+// CallActive was seen AND the ATA result is ok or ambiguous; whichever of the
+// two is still unknown is waited for, bounded by the window.
 type lateWatch struct {
-	gen  int
-	id   string
-	stop chan struct{}
+	gen        int
+	id         string
+	stop       chan struct{}
+	callActive bool
+	ata        ataState
+}
+
+// resolveLate hangs up the phone once the call proves to be ours, and closes
+// the window on a definite ATA failure.
+func (c *Coordinator) resolveLate() {
+	w := c.late
+	switch {
+	case w == nil:
+	case w.ata == ataFailed:
+		c.clearLate()
+	case w.callActive && (w.ata == ataOK || w.ata == ataAmbiguous):
+		c.d.Logger.Warn("our ATA answered the phone after the call ended, hanging up the phone", "call_id", w.id)
+		c.clearLate()
+		if c.tel != nil {
+			c.hangupPhone(c.tel, w.id)
+		}
+	}
+}
+
+func ataStateOf(err error) ataState {
+	switch {
+	case err == nil:
+		return ataOK
+	case ataDefinite(err):
+		return ataFailed
+	}
+	return ataAmbiguous
 }
 
 func (c *Coordinator) armLate(call *activeCall) {
 	c.clearLate()
-	w := &lateWatch{gen: call.gen, id: call.id, stop: make(chan struct{})}
+	w := &lateWatch{gen: call.gen, id: call.id, stop: make(chan struct{}), callActive: call.callActive, ata: call.ata}
 	c.late = w
 	t := c.d.Clock.NewTimer(lateActiveWindow)
 	go func() {
@@ -279,11 +317,8 @@ func (c *Coordinator) onTelIdle(ev hfp.Event) {
 	}
 	switch ev.Kind {
 	case hfp.CallActive:
-		c.d.Logger.Warn("CallActive after the SIP side ended: our ATA answered, hanging up the phone", "call_id", w.id)
-		c.clearLate()
-		if c.tel != nil {
-			c.hangupPhone(c.tel, w.id)
-		}
+		w.callActive = true
+		c.resolveLate()
 	case hfp.CallSetupCleared, hfp.CallEnded:
 		c.clearLate()
 	}

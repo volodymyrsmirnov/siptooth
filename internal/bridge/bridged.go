@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/hfp"
@@ -126,6 +127,11 @@ func (c *Coordinator) onPumpEnd(m msg) {
 	call := c.current(m.gen)
 	if call == nil || call.state != stateBridged {
 		c.discard(m, "call over")
+		return
+	}
+	if strings.HasPrefix(string(m.pumpEnd), pumpPrefix) {
+		c.d.Logger.Error("panic in the media pump", "call_id", call.id, "panic", string(m.pumpEnd))
+		c.finish(call, endSpec{outcome: OutcomeMediaError, hangupBy: HangupSiptooth, hangupPhone: true, errText: "pump " + string(m.pumpEnd)})
 		return
 	}
 	switch m.pumpEnd {

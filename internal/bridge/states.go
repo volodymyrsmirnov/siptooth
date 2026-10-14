@@ -447,9 +447,11 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 		c.safely("close media", func() { closeMedia(c.d.Logger, m) })
 	}
 
-	// ATA went out, the phone was not seen answering and ATA did not
-	// definitely fail: a CallActive soon after is still our ATA's doing.
-	if call.answerSent && !call.callActive && call.ata != ataFailed && !noLateWindow(e.outcome) {
+	// ATA went out and did not definitely fail, yet ownership is not settled
+	// (no CallActive yet, or the ATA result is still pending): the window
+	// decides when the missing half arrives.
+	if call.answerSent && call.ata != ataFailed && !call.noCHUP && !noLateWindow(e.outcome) &&
+		!(call.callActive && (call.ata == ataOK || call.ata == ataAmbiguous)) {
 		c.armLate(call)
 	}
 

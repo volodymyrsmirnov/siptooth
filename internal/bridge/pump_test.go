@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -525,5 +526,22 @@ func TestBlockedLinkStalls(t *testing.T) {
 	}
 	if got != PumpSCOStall {
 		t.Fatalf("end = %q, want %q", got, PumpSCOStall)
+	}
+}
+
+func TestPumpPanicBecomesEnd(t *testing.T) {
+	r := newFakeRTP(0)
+	r.frameErr = func(int) error { panic("rtp exploded") }
+	p := startPump(t, 0, r)
+	for i := 0; i < 6; i++ {
+		p.phone.Write(make([]byte, 60))
+	}
+	select {
+	case end := <-p.end:
+		if !strings.HasPrefix(string(end), "panic: ") || !strings.Contains(string(end), "rtp exploded") {
+			t.Fatalf("end = %q", end)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("pump did not return")
 	}
 }

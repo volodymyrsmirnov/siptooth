@@ -193,11 +193,11 @@ func (c *Client) command(ctx context.Context, cmd, prefix string) ([]string, err
 	select {
 	case c.cmdSem <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ErrNotSent
+		return nil, fmt.Errorf("%w: %w", ErrNotSent, ctx.Err())
 	}
 	defer func() { <-c.cmdSem }()
-	if ctx.Err() != nil {
-		return nil, ErrNotSent
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrNotSent, err)
 	}
 	c.stMu.Lock()
 	if c.closed {

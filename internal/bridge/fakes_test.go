@@ -35,6 +35,8 @@ type fakeTel struct {
 	gate      chan struct{}
 	// hangupGate, when set, holds Hangup like a slow command queue.
 	hangupGate chan struct{}
+	// ignoreCtx makes a gated Answer behave as already written: only the gate ends it.
+	ignoreCtx bool
 }
 
 func newFakeTel() *fakeTel { return &fakeTel{events: make(chan hfp.Event, 32)} }
@@ -46,6 +48,10 @@ func (f *fakeTel) Answer(ctx context.Context) error {
 	err, gate := f.answerErr, f.gate
 	f.mu.Unlock()
 	if gate != nil {
+		if f.ignoreCtx { // the command is already on the wire
+			<-gate
+			return err
+		}
 		select {
 		case <-gate:
 		case <-ctx.Done(): // like hfp: a command cancelled before it was written was not sent
@@ -98,6 +104,7 @@ type fakeMedia struct {
 	pl           *rtp.Playout
 	panicOn      bool // Stats panics
 	panicSilence bool // WriteSilence panics
+	panicFrame   bool // WriteFrame panics
 	frames       int
 	writeErr     error
 }
@@ -117,6 +124,9 @@ func (m *fakeMedia) Update(r sdp.Media) { m.mu.Lock(); m.updates = append(m.upda
 func (m *fakeMedia) WriteFrame([]int16) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.panicFrame {
+		panic("frame exploded")
+	}
 	m.frames++
 	return m.writeErr
 }

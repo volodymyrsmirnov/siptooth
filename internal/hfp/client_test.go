@@ -346,3 +346,52 @@ func TestWaitingCallStaysUnansweredAfterCallEnds(t *testing.T) {
 	ag.send("+CIEV: 3,1") // a new incoming call
 	expectEvent(t, c, Ring)
 }
+
+// A command waiting for the slot is cancelled unsent and never reaches the phone.
+func TestCommandCancelledWhileWaitingForSlot(t *testing.T) {
+	ag, conn := newFakeAG(t, defaultCIND)
+	ag.silent["AT+CHUP"] = true
+	c := New(conn, slog.Default())
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	<-c.Events()
+	hctx, hcancel := context.WithCancel(context.Background())
+	go c.Hangup(hctx) // holds the slot, waiting for a reply that never comes
+	deadline := time.Now().Add(time.Second)
+	for {
+		ag.mu.Lock()
+		n := len(ag.received)
+		last := ""
+		if n > 0 {
+			last = ag.received[n-1]
+		}
+		ag.mu.Unlock()
+		if last == "AT+CHUP" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("AT+CHUP never sent")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	res := make(chan error, 1)
+	go func() { res <- c.Answer(ctx) }()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	err := <-res
+	if !errors.Is(err, ErrNotSent) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want ErrNotSent wrapping context.Canceled", err)
+	}
+	hcancel()
+	time.Sleep(20 * time.Millisecond)
+	ag.mu.Lock()
+	defer ag.mu.Unlock()
+	for _, cmd := range ag.received {
+		if cmd == "ATA" {
+			t.Fatal("the cancelled ATA reached the phone")
+		}
+	}
+}
