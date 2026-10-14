@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
@@ -159,7 +160,9 @@ type Coordinator struct {
 	chupMu       sync.Mutex
 	chups        map[int]context.CancelFunc // in-flight AT+CHUPs
 	chupN        int
-	late         *lateWatch // late-CallActive window of the last call (spec 4.4)
+	late         *lateWatch   // late-CallActive window of the last call (spec 4.4)
+	phone        phoneState   // what the handset is physically doing, from hfp events
+	cleanup      atomic.Int32 // background BYEs and AT+CHUPs in flight
 
 	statusMu sync.RWMutex
 	status   Status
@@ -223,11 +226,38 @@ func (c *Coordinator) SetRegistration(s RegistrationStatus) {
 	c.post(msg{kind: mRegistration, reg: s})
 }
 
-// Status returns the latest published snapshot.
+// Status returns the latest published snapshot. Background cleanups finish
+// outside the loop, so their in-flight count is read live.
 func (c *Coordinator) Status() Status {
 	c.statusMu.RLock()
-	defer c.statusMu.RUnlock()
-	return c.status
+	st := c.status
+	c.statusMu.RUnlock()
+	st.CleanupPending = st.CleanupPending || c.cleanup.Load() > 0
+	return st
+}
+
+// phoneState is what the handset is doing as far as its indicators say, whoever
+// owns the call. It is tracked from hfp events only (spec 3.1 power cycle).
+type phoneState int
+
+const (
+	phoneIdle phoneState = iota
+	phoneRinging
+	phoneOutgoing // the owner is setting up a call
+	phoneActive
+)
+
+func (c *Coordinator) trackPhone(k hfp.EventKind) {
+	switch k {
+	case hfp.Ring:
+		c.phone = phoneRinging
+	case hfp.OutgoingSetup:
+		c.phone = phoneOutgoing
+	case hfp.CallActive:
+		c.phone = phoneActive
+	case hfp.CallEnded, hfp.CallSetupCleared, hfp.Disconnected:
+		c.phone = phoneIdle
+	}
 }
 
 // Run processes events until ctx is done, then ends a call in progress as
@@ -246,6 +276,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 }
 
 func (c *Coordinator) shutdown() {
+	c.awaitPendingATA()
 	c.clearLate()
 	if c.cur != nil {
 		c.finish(c.cur, endSpec{outcome: OutcomeShutdown, hangupBy: HangupSiptooth, hangupPhone: c.cur.ours()})
@@ -283,6 +314,7 @@ func (c *Coordinator) dispatch(ctx context.Context, m msg) {
 	switch m.kind {
 	case mAttach:
 		c.telGen++
+		c.phone = phoneIdle
 		c.clearLate()
 		c.cancelChups()
 		c.tel, c.listener, c.adapterAddr = m.telRef, m.lis, m.addr
@@ -374,6 +406,8 @@ func (c *Coordinator) publishStatus() {
 		State:          stateIdle.String(),
 		LastOutcome:    c.lastOutcome,
 		Registration:   c.registration,
+		PhoneBusy:      c.phone != phoneIdle,
+		CleanupPending: c.late != nil,
 	}
 	if call := c.cur; call != nil {
 		st.State, st.CallID, st.Caller = call.state.String(), call.id, call.caller
@@ -428,6 +462,7 @@ func (c *Coordinator) onTimer(m msg) {
 // dropPhone forgets the HFP client; a call in progress ends as bluetooth_lost.
 func (c *Coordinator) dropPhone() {
 	c.tel, c.listener = nil, nil
+	c.phone = phoneIdle
 	c.telGen++
 	c.clearLate()
 	if c.cur != nil {
@@ -436,11 +471,14 @@ func (c *Coordinator) dropPhone() {
 }
 
 func (c *Coordinator) onTel(ctx context.Context, ev hfp.Event) {
+	c.trackPhone(ev.Kind)
 	switch ev.Kind {
 	case hfp.CallEnded, hfp.CallSetupCleared:
 		c.cancelChups() // the phone call is over; a queued AT+CHUP is stale
 	}
 	switch ev.Kind {
+	case hfp.OutgoingSetup:
+		c.onOutgoingSetup()
 	case hfp.Connected:
 		// PhoneConnected follows Attach.
 	case hfp.Disconnected:
@@ -456,6 +494,9 @@ func (c *Coordinator) onTel(ctx context.Context, ev hfp.Event) {
 			// Call waiting or a repeated RING: the call in progress is not touched.
 			c.d.Logger.Debug("ring while busy ignored", "call_id", c.cur.id, "state", c.cur.state.String())
 			return
+		}
+		if c.cur == nil {
+			c.clearLate() // a new call: a later CallActive is not the old ATA's
 		}
 		if !c.ready() {
 			c.d.Logger.Info("ring ignored: bluetooth not ready", "phone_connected", c.tel != nil, "audio_routing", c.routingOK)

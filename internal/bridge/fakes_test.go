@@ -173,6 +173,8 @@ type fakeCall struct {
 	ended       chan sip.EndCause
 	mu          sync.Mutex
 	hangup      int
+	// hangupGate, when set, holds Hangup (a BYE in flight) until closed.
+	hangupGate chan struct{}
 }
 
 func newFakeCall() *fakeCall {
@@ -192,7 +194,17 @@ func (c *fakeCall) Remote() sdp.Media {
 }
 func (c *fakeCall) MediaUpdates() <-chan sdp.Media { return c.updates }
 func (c *fakeCall) Ended() <-chan sip.EndCause     { return c.ended }
-func (c *fakeCall) Hangup(context.Context) error {
+func (c *fakeCall) Hangup(ctx context.Context) error {
+	c.mu.Lock()
+	gate := c.hangupGate
+	c.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.hangup++

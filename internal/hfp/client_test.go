@@ -395,3 +395,33 @@ func TestCommandCancelledWhileWaitingForSlot(t *testing.T) {
 		}
 	}
 }
+
+// Final fix wave A1: the owner placing a call is not a call to answer, but the coordinator must
+// know about it (a CallActive that follows is the owner's, never the ATA's).
+func TestOutgoingSetupEvent(t *testing.T) {
+	for _, setup := range []string{"2", "3"} {
+		c, ag := startClient(t, defaultCIND)
+		ag.send("+CIEV: 3," + setup)
+		expectEvent(t, c, OutgoingSetup)
+		if setup == "2" {
+			ag.send("+CIEV: 3,3") // dialing -> alerting: still the same outgoing call
+			expectNoEvent(t, c, 100*time.Millisecond)
+		}
+		ag.send("+CIEV: 3,0")
+		expectEvent(t, c, CallSetupCleared) // aborted before it was answered
+		ag.send("+CIEV: 3,2")
+		expectEvent(t, c, OutgoingSetup) // a second attempt is a new event
+		ag.send("+CIEV: 2,1")
+		expectEvent(t, c, CallActive)
+		ag.send("+CIEV: 3,0")
+		expectNoEvent(t, c, 100*time.Millisecond)
+	}
+}
+
+func TestOutgoingSetupNotEmittedDuringACall(t *testing.T) {
+	c, ag := startClient(t, defaultCIND)
+	ag.send("+CIEV: 2,1")
+	expectEvent(t, c, CallActive)
+	ag.send("+CIEV: 3,2") // a second call placed from the handset while one is active
+	expectNoEvent(t, c, 100*time.Millisecond)
+}

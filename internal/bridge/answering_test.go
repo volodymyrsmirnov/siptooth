@@ -339,18 +339,16 @@ func TestLateCallActiveWindowCloses(t *testing.T) {
 	r.wantHangups(fc, 0, 0)
 }
 
-func TestLateCallActiveWindowEndsOnNewCallOrCleared(t *testing.T) {
-	for name, ev := range map[string]hfp.EventKind{"setup cleared": hfp.CallSetupCleared, "call ended": hfp.CallEnded} {
-		t.Run(name, func(t *testing.T) {
-			r := newRig(t, nil).start()
-			fc := r.answer()
-			fc.ended <- sip.RemoteBye
-			r.waitEnded()
-			r.tel.send(ev, "")
-			r.tel.send(hfp.CallActive, "")
-			r.wantHangups(fc, 0, 0)
-		})
-	}
+// The window closes on CallEnded. CallSetupCleared alone does not: callsetup=0 routinely
+// precedes call=1 after our ATA (TestLateWindowSurvivesSetupClearedWhenATAWorked).
+func TestLateCallActiveWindowEndsOnCallEnded(t *testing.T) {
+	r := newRig(t, nil).start()
+	fc := r.answer()
+	fc.ended <- sip.RemoteBye
+	r.waitEnded()
+	r.tel.send(hfp.CallEnded, "")
+	r.tel.send(hfp.CallActive, "")
+	r.wantHangups(fc, 0, 0)
 }
 
 // ATA still pending when the far end hangs up; a definite failure arriving

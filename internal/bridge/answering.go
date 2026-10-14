@@ -315,8 +315,100 @@ func (c *Coordinator) onTelIdle(ev hfp.Event) {
 	case hfp.CallActive:
 		w.callActive = true
 		c.resolveLate()
-	case hfp.CallSetupCleared, hfp.CallEnded:
+	case hfp.CallEnded:
 		c.clearLate()
+	case hfp.CallSetupCleared:
+		// callsetup=0 routinely arrives before call=1 after our ATA: it says nothing
+		// about the answer. The window closes on CallEnded, an outgoing setup, a
+		// definite ATA failure, a new ring or expiry.
+	}
+}
+
+// onOutgoingSetup: the owner started a call from the handset. Whatever rings or
+// is pending is not about to become siptooth's call, so the late window and any
+// queued AT+CHUP go, and a call in progress ends as the owner's activity; the
+// phone is never hung up from here.
+func (c *Coordinator) onOutgoingSetup() {
+	c.clearLate()
+	c.cancelChups()
+	if call := c.cur; call != nil {
+		call.noCHUP = true
+		c.finish(call, endSpec{outcome: OutcomeOwnerAnswered, errText: "owner placed an outgoing call"})
+	}
+}
+
+// shutdownATAWait bounds how long shutdown waits for an ATA result.
+const shutdownATAWait = 3 * time.Second
+
+// awaitPendingATA runs at shutdown, before the call is torn down: when our ATA has no
+// result yet, ownership of the phone call is unknown and the answered cellular call
+// would be left without media. It waits (bounded) for the result and for a CallActive,
+// then resolves ownership the usual way. Other messages are kept for the final drain.
+func (c *Coordinator) awaitPendingATA() {
+	call, w := c.cur, c.late
+	switch {
+	case call != nil && call.answerSent && call.ata == ataPending && (call.state == stateAnswering || call.state == stateBridged):
+		w = nil
+	case call == nil && w != nil && w.ata == ataPending:
+	default:
+		return
+	}
+	gen, id := 0, ""
+	if call != nil {
+		gen, id = call.gen, call.id
+	} else {
+		gen, id = w.gen, w.id
+	}
+	pending := func() bool {
+		if call != nil {
+			return call.ata == ataPending
+		}
+		return w.ata == ataPending
+	}
+	t := c.d.Clock.NewTimer(shutdownATAWait)
+	defer t.Stop()
+	var stash []msg
+wait:
+	for pending() {
+		select {
+		case m := <-c.inbox:
+			switch {
+			case m.kind == mAnswer && m.gen == gen:
+				if call != nil {
+					call.ata = ataStateOf(m.err)
+				} else {
+					w.ata = ataStateOf(m.err)
+				}
+			case m.kind == mTel && m.telGen == c.telGen && m.tel.Kind == hfp.CallActive:
+				if call != nil {
+					call.callActive = true
+				} else {
+					w.callActive = true
+				}
+			case m.kind == mTel && m.telGen == c.telGen && (m.tel.Kind == hfp.CallEnded || m.tel.Kind == hfp.OutgoingSetup):
+				// The phone call is over or the owner's: nothing to answer for.
+				if call != nil {
+					call.noCHUP = true
+				} else {
+					w.ata = ataFailed
+				}
+				break wait
+			default:
+				stash = append(stash, m)
+			}
+		case <-t.C():
+			c.d.Logger.Warn("shutdown: ATA result still unknown, leaving the phone call", "call_id", id)
+			break wait
+		}
+	}
+	for _, m := range stash {
+		select {
+		case c.inbox <- m:
+		default:
+		}
+	}
+	if call == nil {
+		c.resolveLate()
 	}
 }
 

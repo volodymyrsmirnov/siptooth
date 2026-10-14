@@ -589,8 +589,10 @@ func closeMedia(log *slog.Logger, m Media) {
 // hangupSIP sends BYE in the background, bounded by cleanupTimeout.
 func (c *Coordinator) hangupSIP(sc sip.Call, callID string) {
 	c.bg.Add(1)
+	c.cleanup.Add(1)
 	go func() {
 		defer c.bg.Done()
+		defer c.cleanup.Add(-1)
 		c.safely("BYE", func() { c.byeNow(sc, callID) })
 	}()
 }
@@ -619,8 +621,10 @@ func (c *Coordinator) hangupPhone(t Telephony, callID string) {
 	c.chups[id] = cancel
 	c.chupMu.Unlock()
 	c.bg.Add(1)
+	c.cleanup.Add(1)
 	go func() {
 		defer c.bg.Done()
+		defer c.cleanup.Add(-1)
 		defer func() {
 			c.chupMu.Lock()
 			delete(c.chups, id)

@@ -52,6 +52,12 @@ type Status struct {
 	CallID        string     `json:"call_id,omitempty"`
 	Caller        string     `json:"caller,omitempty"` // cleaned number, empty when withheld or no call
 	CallStartedAt *time.Time `json:"call_started_at,omitempty"`
+	// PhoneBusy: the phone is physically occupied (ringing, setting up a call, or carrying one),
+	// whether or not siptooth forwards it. A power cycle would cut that call or ring.
+	PhoneBusy bool `json:"phone_busy"`
+	// CleanupPending: the late-CallActive window is armed or a background BYE / AT+CHUP is in
+	// flight, so the phone or the SIP dialog may still be touched.
+	CleanupPending bool `json:"cleanup_pending"`
 	// LastOutcome is the outcome of the most recent call, empty before any.
 	LastOutcome  string             `json:"last_outcome,omitempty"`
 	Registration RegistrationStatus `json:"registration"`

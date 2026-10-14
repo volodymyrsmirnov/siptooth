@@ -22,6 +22,9 @@ const (
 	CallEnded
 	CallSetupCleared
 	Disconnected
+	// OutgoingSetup: the handset started an outgoing call (callsetup 2 or 3 with no call up).
+	// It is the owner's call; nothing of it is ever answered or hung up by siptooth.
+	OutgoingSetup
 )
 
 func (k EventKind) String() string {
@@ -40,6 +43,8 @@ func (k EventKind) String() string {
 		return "call_setup_cleared"
 	case Disconnected:
 		return "disconnected"
+	case OutgoingSetup:
+		return "outgoing_setup"
 	}
 	return fmt.Sprintf("event(%d)", int(k))
 }
@@ -84,6 +89,7 @@ type Client struct {
 	vals       map[string]int // name -> value
 	agFeatures int
 	ringing    bool
+	outgoing   bool // an outgoing call is being set up (callsetup 2/3 seen with call=0)
 	waiting    bool // a call set up during another call: ignored until its setup ends
 	closed     bool
 	closeOnce  sync.Once // closes the transport and fails the pending transaction
@@ -459,6 +465,18 @@ func (c *Client) applyIndicator(idx, val int) {
 		}
 		if val == 0 && c.ringing {
 			c.ringing = false
+			if c.vals["call"] == 0 {
+				out = append(out, Event{Kind: CallSetupCleared})
+			}
+		}
+		// Outgoing setup (the handset dialing): reported once, and its abort is reported as
+		// the setup clearing so the coordinator can tell the phone is free again.
+		if (val == 2 || val == 3) && c.vals["call"] == 0 && !c.outgoing {
+			c.outgoing = true
+			out = append(out, Event{Kind: OutgoingSetup})
+		}
+		if val == 0 && c.outgoing {
+			c.outgoing = false
 			if c.vals["call"] == 0 {
 				out = append(out, Event{Kind: CallSetupCleared})
 			}
