@@ -111,6 +111,7 @@ Every `bluetooth.power_cycle_minutes` (default 60; `0` = off, otherwise 10..1440
 | One-way audio, or none | NAT checklist below. |
 | Far-end hang-up delayed | The far end's BYE did not reach siptooth; see below. |
 | Hooks fail | `siptooth hooks test --event call.ended` shows exit code, stdout and stderr; hooks run as you with a minimal environment. See `docs/hooks.md`. |
+| DNS fails only on a host with Tailscale MagicDNS | MagicDNS misplaces the EDNS0 OPT record in queries. siptooth's resolver (`internal/dnsv4`) sends queries without EDNS0, so lookups work; if `dns` still fails, test with `dig +noedns <host>`. |
 | `registration: registered=no` | Check `sip.username`, the password in `~/.siptooth/env`, `sip.registrar`, and that the transport matches the provider; the error is in `siptooth status` and as a `sip_registration` journal line. |
 
 ### One-way audio: NAT checklist

@@ -34,21 +34,31 @@ Create a PBX extension for siptooth (login `<account>-<ext>`, for example `1234-
 phone:
   number: "+380441234567"
 sip:
-  target: "sip:200@sip.zadarma.com"        # what the siptooth extension dials; TLS uses port 5061
-  transport: tls                           # UDP is also documented by Zadarma; TLS preferred
+  target: "sip:200@pbx.zadarma.com"        # what the siptooth extension dials; TLS uses port 5061
+  transport: tls                           # UDP 5060 also works; TLS preferred
   username: "1234-100"                     # password: SIPTOOTH_SIP_PASSWORD in ~/.siptooth/env
   register: true
-  from: "sip:1234-100@sip.zadarma.com"     # Zadarma identifies the extension by its login
+  from: "sip:1234-100@pbx.zadarma.com"     # Zadarma identifies the extension by its login
   display_name: "{caller}"                 # the caller's number, shown where Zadarma passes it through
   headers:
     X-CALLER-ID: "{caller}"
     X-CALL-ID: "{call_id}"
-  srtp: false                              # SRTP is not documented by Zadarma; test (M1) before enabling
+  srtp: true                               # required over TLS: plain RTP gets 488 SRTP required
 media:
-  codecs: [PCMA, PCMU]                     # Zadarma documents alaw/ulaw only
+  codecs: [PCMA, PCMU]                     # PCMA / PCMU
 ```
 
-Known from Zadarma's documentation: `sip.zadarma.com`, UDP 5060 and TLS 5061, PCMA / PCMU, and `P-Asserted-Identity` only for numbers attached to the account (so it cannot carry an arbitrary caller's number). Not documented, to be verified in M1: INVITE without REGISTER, TCP, SRTP, TLS certificate validity (Zadarma's own Asterisk guide disables verification; siptooth never does: if the certificate fails, use UDP), display-name presentation on internal calls and on forwarding, whether custom `X-` headers survive a forward to an external SIP URI, NAT latching, and in-dialog request routing to a registered flow.
+Verified on the Pi on 2026-10-14 (server `pbx.zadarma.com`, a CNAME of `pbxma1.zadarma.com`):
+
+- UDP 5060 works. TLS 5061 works with a valid `*.zadarma.com` Sectigo certificate (verification on, nothing disabled).
+- Over TLS Zadarma rejects plain RTP with `488 SRTP required`: set `srtp: true`. SDES `AES_CM_128_HMAC_SHA1_80` works.
+- REGISTER is required and works. The registrar reports `received`/`rport`; siptooth re-registers with the public flow and dials only after that, so the INVITE Contact is the public address.
+- Zadarma pings the registered contact with OPTIONS about every 30 s through the NAT, so far-end requests reach siptooth.
+- The INVITE is challenged with 407, then answered 200. Codecs PCMA / PCMU.
+- Caller ID: Zadarma replaces the caller with the extension name and number (for example "Inkhorn Office (100)") in its call history. The original number only reaches hooks and `X-CALLER-ID`; whether custom headers arrive at the destination could not be verified.
+- Hang-up from the phone side sends BYE, answered 200 OK.
+
+From Zadarma's documentation: `P-Asserted-Identity` only for numbers attached to the account (so it cannot carry an arbitrary caller's number). Still open: INVITE without REGISTER, TCP, display-name presentation on forwarding, and whether custom `X-` headers survive a forward to an external SIP URI.
 
 ## Generic PBX (best effort)
 
@@ -78,13 +88,13 @@ Run these from the Pi against each provider and record the outcome. `siptooth si
 
 | Check | What to look at | Result |
 | --- | --- | --- |
-| DNS / TLS | `doctor` `dns`, `sip_connect`: name resolves, TLS handshake and certificate verify | |
-| Auth | INVITE (and REGISTER) answered after the digest challenge; no 401/403 loop | |
-| REGISTER required? | INVITE accepted without `sip.register`? with it? | |
-| NAT mode / latching | `sip test`: `nat:` line and `latched source` in the report; `doctor` `nat_mapping`; audio both ways; `remote_media` in `call.connected` is the latched source | |
-| Codec | `sip test`: `codec:` line (PCMU / PCMA) | |
-| SRTP | does the trunk accept `sip.srtp: true`; `srtp_fail` stays 0 | |
-| Caller ID at destination | the number appears where the destination shows it (display name, `X-CALLER-ID`) | |
-| X- headers through forward | custom headers reach the final destination after a PBX forward | |
-| Far-end BYE reaches siptooth | `sip test --wait-remote-hangup`, end the call from the far side: `ended by: remote BYE`; in the daemon `hangup_by=far_end`, phone hung up within about 3 s, not `media_timeout` | |
+| DNS / TLS | `doctor` `dns`, `sip_connect`: name resolves, TLS handshake and certificate verify | Zadarma: resolves, TLS valid (`*.zadarma.com`, Sectigo) |
+| Auth | INVITE (and REGISTER) answered after the digest challenge; no 401/403 loop | Zadarma: 407 then 200 |
+| REGISTER required? | INVITE accepted without `sip.register`? with it? | Zadarma: required, works; re-registers with the public flow |
+| NAT mode / latching | `sip test`: `nat:` line and `latched source` in the report; `doctor` `nat_mapping`; audio both ways; `remote_media` in `call.connected` is the latched source | Zadarma: OPTIONS pings every ~30 s reach siptooth through the NAT |
+| Codec | `sip test`: `codec:` line (PCMU / PCMA) | Zadarma: PCMA / PCMU |
+| SRTP | does the trunk accept `sip.srtp: true`; `srtp_fail` stays 0 | Zadarma: UDP plain works; TLS needs `srtp: true` (488 otherwise), SDES AES_CM_128_HMAC_SHA1_80 |
+| Caller ID at destination | the number appears where the destination shows it (display name, `X-CALLER-ID`) | Zadarma: replaced by the extension name/number in call history; original only in hooks and `X-CALLER-ID` |
+| X- headers through forward | custom headers reach the final destination after a PBX forward | Zadarma: not verifiable at the destination |
+| Far-end BYE reaches siptooth | `sip test --wait-remote-hangup`, end the call from the far side: `ended by: remote BYE`; in the daemon `hangup_by=far_end`, phone hung up within about 3 s, not `media_timeout` | Zadarma: phone-side hang-up gives BYE 200 OK |
 | Max inter-packet gap | `sip test --tone` report: `max gap`, `lost`, `late` (is RTP continuous in silence?) | |
