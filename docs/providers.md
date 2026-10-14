@@ -19,12 +19,24 @@ sip:
   headers:
     X-CALLER-ID: "{caller}"
     X-CALL-ID: "{call_id}"
-  srtp: false
+  srtp: true                               # trunk media encryption Allowed or Required
 media:
   codecs: [PCMU, PCMA]
+  echo_suppression: false                  # real phones cancel their own echo; see below
 ```
 
 `sip.register` stays `false`. `X-CALLER-ID` carries the cellular caller's number to the agent; `X-CALL-ID` is siptooth's call ID, also in the hook payloads.
+
+Verified on the Pi (2026-10-14, Motorola, Pi behind home NAT, STUN):
+
+- TLS to `sip.rtc.elevenlabs.io:5061` with the certificate verified; the gateway is LiveKit (digest realm `LiveKit`): `100`, `407`, authenticated retry, `180`, `200`.
+- Before an agent is assigned the INVITE ends `404 No agent assigned to SIP trunk number +…`: TLS, auth and number matching already work at that point.
+- SRTP (SDES `AES_CM_128_HMAC_SHA1_80`) with media encryption `Allowed`; answer `PCMU`. The ACK goes over a new TLS connection to the `Contact` host the 200 names (`ip-…host.rtc.elevenlabs.io:5061`); ElevenLabs' BYE comes back on the original flow, so an agent ending the call hangs up the phone (`hangup_by=far_end`).
+- The agent starts talking on its 200 OK, before the phone is answered; the playout keeps that greeting whole (spec 6.3, `media.min_pause_ms`).
+- The conversation shows the caller from the `From` user part (`User ID`); its SIP tab listed no headers, so check `X-CALLER-ID` in the agent's dynamic variables before relying on it.
+- The agent's "User input audio format" stays `PCM 16000 Hz`; the 8 kHz call audio is converted on their side.
+- Test from a real phone. A laptop softphone (Google Voice in a browser) returned the agent's voice into its microphone: the agent heard itself and interrupted itself. From a phone the call was clean, so `media.echo_suppression` is off for this target; turn it on only if transcripts show the agent's own words as the caller's.
+- Caller level: speech about -25 dBFS median, -16 peaks (`caller_db_p50`/`p95`) with siptooth holding the phone's Bluetooth call volume at 15.
 
 ## Zadarma (cloud PBX)
 
@@ -88,13 +100,13 @@ Run these from the Pi against each provider and record the outcome. `siptooth si
 
 | Check | What to look at | Result |
 | --- | --- | --- |
-| DNS / TLS | `doctor` `dns`, `sip_connect`: name resolves, TLS handshake and certificate verify | Zadarma: resolves, TLS valid (`*.zadarma.com`, Sectigo) |
-| Auth | INVITE (and REGISTER) answered after the digest challenge; no 401/403 loop | Zadarma: 407 then 200 |
-| REGISTER required? | INVITE accepted without `sip.register`? with it? | Zadarma: required, works; re-registers with the public flow |
+| DNS / TLS | `doctor` `dns`, `sip_connect`: name resolves, TLS handshake and certificate verify | Zadarma: resolves, TLS valid (`*.zadarma.com`, Sectigo). ElevenLabs: TLS valid |
+| Auth | INVITE (and REGISTER) answered after the digest challenge; no 401/403 loop | Zadarma: 407 then 200. ElevenLabs: 407 (realm `LiveKit`) then 180, 200 |
+| REGISTER required? | INVITE accepted without `sip.register`? with it? | Zadarma: required, works; re-registers with the public flow. ElevenLabs: not used |
 | NAT mode / latching | `sip test`: `nat:` line and `latched source` in the report; `doctor` `nat_mapping`; audio both ways; `remote_media` in `call.connected` is the latched source | Zadarma: OPTIONS pings every ~30 s reach siptooth through the NAT |
-| Codec | `sip test`: `codec:` line (PCMU / PCMA) | Zadarma: PCMA / PCMU |
-| SRTP | does the trunk accept `sip.srtp: true`; `srtp_fail` stays 0 | Zadarma: UDP plain works; TLS needs `srtp: true` (488 otherwise), SDES AES_CM_128_HMAC_SHA1_80 |
-| Caller ID at destination | the number appears where the destination shows it (display name, `X-CALLER-ID`) | Zadarma: replaced by the extension name/number in call history; original only in hooks and `X-CALLER-ID` |
+| Codec | `sip test`: `codec:` line (PCMU / PCMA) | Zadarma: PCMA / PCMU. ElevenLabs: PCMU |
+| SRTP | does the trunk accept `sip.srtp: true`; `srtp_fail` stays 0 | Zadarma: UDP plain works; TLS needs `srtp: true` (488 otherwise), SDES AES_CM_128_HMAC_SHA1_80. ElevenLabs: SDES with media encryption `Allowed` |
+| Caller ID at destination | the number appears where the destination shows it (display name, `X-CALLER-ID`) | Zadarma: replaced by the extension name/number in call history; original only in hooks and `X-CALLER-ID`. ElevenLabs: shown as the conversation's `User ID` |
 | X- headers through forward | custom headers reach the final destination after a PBX forward | Zadarma: not verifiable at the destination |
-| Far-end BYE reaches siptooth | `sip test --wait-remote-hangup`, end the call from the far side: `ended by: remote BYE`; in the daemon `hangup_by=far_end`, phone hung up within about 3 s, not `media_timeout` | Zadarma: phone-side hang-up gives BYE 200 OK |
-| Max inter-packet gap | `sip test --tone` report: `max gap`, `lost`, `late` (is RTP continuous in silence?) | |
+| Far-end BYE reaches siptooth | `sip test --wait-remote-hangup`, end the call from the far side: `ended by: remote BYE`; in the daemon `hangup_by=far_end`, phone hung up within about 3 s, not `media_timeout` | Zadarma: phone-side hang-up gives BYE 200 OK. ElevenLabs: agent hang-up arrives as BYE (`remote BYE`, `hangup_by=far_end`) |
+| Max inter-packet gap | `sip test --tone` report: `max gap`, `lost`, `late` (is RTP continuous in silence?) | ElevenLabs: continuous in silence, max gap 40 ms, 0 lost over 78 s |
