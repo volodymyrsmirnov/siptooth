@@ -235,18 +235,35 @@ func (a *SIPAdapter) contact(ctx context.Context, host string, dec nat.Decision)
 	transport := strings.ToLower(cfg.Transport)
 	user := "siptooth"
 	if cfg.Register {
+		// The registered Contact's user is the AOR's (sip.from may differ from sip.username).
 		user = cfg.Username
+		if aor := strings.TrimPrefix(cfg.RegistrationAOR(), "sip:"); strings.Contains(aor, "@") {
+			user = aor[:strings.IndexByte(aor, '@')]
+		}
 		if a.d.Registration != nil {
 			if st, ok := a.d.Registration(); ok && st.Contact.IsValid() {
 				return ContactURI(user, st.Contact, transport), ContactRegistered
 			}
 		}
 	}
-	// The port far-end requests reach is the UA's actual local SIP port. Only
-	// when it is not known yet (an ephemeral TCP/TLS port before the first
-	// connection) does the configured port, else 5060, stand in as a last resort.
+	target := "sip:" + host
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		target = "sip:[" + host + "]"
+	}
+	// Over TCP/TLS the local port is ephemeral and exists only once the
+	// connection does: probe first (also in local mode, where the answer is
+	// ignored) and read the port afterwards.
+	var (
+		found netip.AddrPort
+		ok    bool
+	)
+	if transport != "udp" || dec.Mode != nat.ModeLocal {
+		found, ok = a.d.UA.DiscoverContact(ctx, target)
+	}
+	// The port far-end requests reach is the UA's actual local SIP port; the
+	// configured port, else 5060, only when it is still unknown.
 	port := uint16(cfg.LocalPort)
-	if ap, ok := a.d.UA.LocalAddr(); ok {
+	if ap, known := a.d.UA.LocalAddr(); known {
 		port = ap.Port()
 	}
 	if port == 0 {
@@ -255,12 +272,8 @@ func (a *SIPAdapter) contact(ctx context.Context, host string, dec nat.Decision)
 	if dec.Mode == nat.ModeLocal {
 		return ContactURI(user, netip.AddrPortFrom(dec.Local, port), transport), ContactLocal
 	}
-	target := "sip:" + host
-	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
-		target = "sip:[" + host + "]"
-	}
-	if ap, ok := a.d.UA.DiscoverContact(ctx, target); ok {
-		return ContactURI(user, ap, transport), ContactOptions
+	if ok {
+		return ContactURI(user, found, transport), ContactOptions
 	}
 	return ContactURI(user, netip.AddrPortFrom(dec.Media.Addr(), port), transport), ContactFallback
 }

@@ -203,8 +203,9 @@ type attempt struct {
 	// tag, until its BYE has been sent: an ACK that has been delivered always
 	// owes a BYE, even when the first ACK failed and a retransmitted 2xx
 	// delivers it later.
-	forks     map[string]*forkState
-	published bool
+	forks      map[string]*forkState
+	published  bool
+	challenges int
 	// decided is set once the goroutine knows which dialog (To tag) it keeps
 	// or that it keeps none. claimed holds the tags somebody owns (kept, or
 	// cleaned up once); pending holds 2xx that arrived before the decision.
@@ -291,7 +292,16 @@ func (a *attempt) run() {
 	if a.hasCredentials() {
 		opts.Username, opts.Password = u.opts.Username, u.opts.Password
 	}
-	werr := sess.WaitAnswer(a.waitCtx, opts)
+	// sipgo's WaitAnswer gives up after eleven responses, which a long ring
+	// with periodic 180s reaches. Re-enter it while the only problem is that
+	// count; challenges are capped in onResponse so this cannot spin on auth.
+	var werr error
+	for {
+		werr = sess.WaitAnswer(a.waitCtx, opts)
+		if werr == nil || !strings.Contains(werr.Error(), tooManyResponsesText) || a.waitCtx.Err() != nil {
+			break
+		}
+	}
 
 	// WaitAnswer may return an error (context canceled, "non provisional
 	// response received during CANCEL") with a 2xx sitting un-ACKed in
@@ -303,6 +313,15 @@ func (a *attempt) run() {
 	a.cleanup(a.decide(""))
 	a.publish(a.classify(sess, werr))
 }
+
+// tooManyResponsesText is the text of sipgo v1.6.0's WaitAnswer error for
+// more than ten responses on one call.
+const tooManyResponsesText = "more than 10 responses received"
+
+// maxChallenges bounds digest retries across WaitAnswer re-entries.
+const maxChallenges = 3
+
+var errTooManyChallenges = errors.New("sip: too many authentication challenges")
 
 func (a *attempt) onResponse(res *gosip.Response) error {
 	if f := a.req.OnResponse; f != nil {
@@ -327,6 +346,10 @@ func (a *attempt) onResponse(res *gosip.Response) error {
 		defer a.mu.Unlock()
 		if a.abandoned {
 			return errAbandonedAtChallenge
+		}
+		a.challenges++
+		if a.challenges > maxChallenges {
+			return errTooManyChallenges
 		}
 		a.seen1xx = false
 		a.cancelReq = nil

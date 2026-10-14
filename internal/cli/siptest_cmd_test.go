@@ -269,7 +269,7 @@ func TestSIPTestOptionsProbe(t *testing.T) {
 		if code != ExitOK {
 			t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
 		}
-		if !strings.Contains(out, "options: no answer, or no received/rport in Via") {
+		if !strings.Contains(out, "options: no answer") {
 			t.Errorf("no options failure line\n%s", out)
 		}
 	})

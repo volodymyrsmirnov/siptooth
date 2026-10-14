@@ -524,6 +524,8 @@ func TestUnregisterRemovesEveryContact(t *testing.T) {
 	tr := siptest.NewTrunk(t, "tcp")
 	reg := newFakeRegistrar(tr, 0)
 	reg.failRemoval.Store(true) // the REGISTER that would expire the guess keeps failing
+	reg.flowIP.Store("127.0.0.1")
+	reg.flowPort.Store(40000) // the registrar sees another port than the guess, so a follow-up is due
 	u := regUA(t, tr, nil)
 	r, log, _ := startReg(t, u, tr, 60*time.Second)
 	waitState(t, log, "registered on the guess", registered)
@@ -671,6 +673,24 @@ func TestRetransmittedReinviteIsAbsorbed(t *testing.T) {
 	}
 	if statuses[200] == 0 {
 		t.Errorf("no 200 seen: %v", statuses)
+	}
+	closeBounded(t, u)
+}
+
+func TestInitialContactUsesFlowPortOverTCP(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp")
+	newFakeRegistrar(tr, 0)
+	u := regUA(t, tr, nil)
+	_, log, _ := startReg(t, u, tr, 60*time.Second)
+	waitState(t, log, "registered", registered)
+	reqs := tr.RequestsFor("REGISTER")
+	if len(reqs) == 0 {
+		t.Fatal("no REGISTER")
+	}
+	first := contactAddr(t, reqs[0])
+	local, ok := u.LocalAddr()
+	if !ok || first.Port() != local.Port() || first.Port() == defaultSIPPort {
+		t.Fatalf("first REGISTER Contact %v, flow local %v (known %v): want the flow port", first, local, ok)
 	}
 	closeBounded(t, u)
 }

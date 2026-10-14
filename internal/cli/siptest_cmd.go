@@ -279,9 +279,9 @@ func (t *sipTest) probeOptions(ctx context.Context, ua *sip.UA, host string) {
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		target = "sip:[" + host + "]"
 	}
-	ap, ok := ua.DiscoverContact(ctx, target)
-	if !ok {
-		t.printf("options: no answer, or no received/rport in Via")
+	ap, reason := ua.DiscoverContactReason(ctx, target)
+	if reason != "" {
+		t.printf("options: %s", reason)
 		return
 	}
 	t.printf("options: received=%s rport=%d", ap.Addr(), ap.Port())
@@ -303,7 +303,7 @@ func onOff(b bool) string {
 // register registers the test's own Contact and waits for the first answer.
 func (t *sipTest) register(ctx context.Context, ua *sip.UA, cfg config.Config) (reg *sip.Registration, ok bool) {
 	states := make(chan sip.RegState, 16)
-	r := ua.Register(context.Background(), "", cfg.SIP.RegistrarHost(),
+	r := ua.Register(context.Background(), cfg.SIP.RegistrationAOR(), cfg.SIP.RegistrarHost(),
 		time.Duration(cfg.SIP.RegisterExpiresSeconds)*time.Second, func(s sip.RegState) {
 			select {
 			case states <- s:

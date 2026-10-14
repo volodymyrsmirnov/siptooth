@@ -282,11 +282,19 @@ func (r *Registration) initialContact(ctx context.Context) (netip.AddrPort, erro
 	if err != nil {
 		return netip.AddrPort{}, fmt.Errorf("sip: local address toward %s: %w", hop.Addr(), err)
 	}
-	port := r.u.opts.LocalPort
+	if r.u.transport != "udp" {
+		// The ephemeral local port exists only once the connection does:
+		// open it with an OPTIONS probe (its answer is not needed).
+		r.u.DiscoverContactReason(ctx, r.registrar.String())
+	}
+	port := uint16(r.u.opts.LocalPort)
+	if ap, ok := r.u.LocalAddr(); ok {
+		port = ap.Port()
+	}
 	if port == 0 {
 		port = defaultSIPPort
 	}
-	return netip.AddrPortFrom(local, uint16(port)), nil
+	return netip.AddrPortFrom(local, port), nil
 }
 
 // contactURI is the Contact for the flow address c.

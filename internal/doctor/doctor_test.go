@@ -191,7 +191,7 @@ func mode(t *testing.T, p string) os.FileMode {
 func TestDoctorRoutingNeedsPrivilege(t *testing.T) {
 	// The routing check must never say ok when it could not read the controller.
 	c := routingCheck(func() (uint8, error) { return 0, os.ErrPermission })
-	if c.Status != "warn" || !strings.Contains(c.Detail, "cannot verify routing without CAP_NET_RAW (run the probe once as root or check bluez-alsa docs)") || strings.Contains(c.Remedy, "sudo siptooth") {
+	if c.Status != "warn" || !strings.Contains(c.Detail, "cannot verify routing without CAP_NET_RAW (the service assumes HCI routing, as Raspberry Pi OS sets at boot)") || strings.Contains(c.Remedy, "sudo siptooth") {
 		t.Fatalf("%+v", c)
 	}
 	if c := routingCheck(func() (uint8, error) { return 1, nil }); c.Status != "ok" {

@@ -2,6 +2,7 @@ package sip
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -21,10 +22,23 @@ const discoverTimeout = time.Second
 // no usable received/rport; the caller then falls back to the media address
 // IP with the local SIP port.
 func (u *UA) DiscoverContact(ctx context.Context, target string) (netip.AddrPort, bool) {
+	ap, reason := u.DiscoverContactReason(ctx, target)
+	return ap, reason == ""
+}
+
+// Reasons DiscoverContactReason gives for not finding an address.
+const (
+	DiscoverNoAnswer = "no answer"
+	DiscoverNoVia    = "no received/rport in Via"
+)
+
+// DiscoverContactReason is DiscoverContact with the reason it found nothing:
+// "" on success, else DiscoverNoAnswer or DiscoverNoVia.
+func (u *UA) DiscoverContactReason(ctx context.Context, target string) (netip.AddrPort, string) {
 	var uri gosip.Uri
 	if err := gosip.ParseUri(target, &uri); err != nil {
 		u.log.Debug("contact discovery: bad target", "error", err)
-		return netip.AddrPort{}, false
+		return netip.AddrPort{}, DiscoverNoAnswer
 	}
 	ctx, cancel := context.WithTimeout(ctx, discoverTimeout)
 	defer cancel()
@@ -33,7 +47,7 @@ func (u *UA) DiscoverContact(ctx context.Context, target string) (netip.AddrPort
 	dest, err := u.destination(ctx, u.transport, u.opts.NextHop)
 	if err != nil {
 		u.log.Debug("contact discovery: next hop", "error", err)
-		return netip.AddrPort{}, false
+		return netip.AddrPort{}, DiscoverNoAnswer
 	}
 	req := gosip.NewRequest(gosip.OPTIONS, uri)
 	req.SetTransport(tp)
@@ -54,11 +68,19 @@ func (u *UA) DiscoverContact(ctx context.Context, target string) (netip.AddrPort
 	LogMessage(u.log, "send", req)
 	res, err := u.client.Do(ctx, req)
 	if err != nil {
-		u.forgetHop(u.opts.NextHop)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			// A timeout leaves the connection (and its local port) in place;
+			// any other failure means the flow is broken.
+			u.forgetHop(u.opts.NextHop)
+		}
 		u.log.Debug("contact discovery failed", "error", err)
-		return netip.AddrPort{}, false
+		return netip.AddrPort{}, DiscoverNoAnswer
 	}
-	return viaFlow(res)
+	ap, ok := viaFlow(res)
+	if !ok {
+		return netip.AddrPort{}, DiscoverNoVia
+	}
+	return ap, ""
 }
 
 // viaFlow extracts received/rport from the top Via of a response.

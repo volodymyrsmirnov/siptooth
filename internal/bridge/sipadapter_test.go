@@ -389,3 +389,50 @@ func TestAdapterDialAndMedia(t *testing.T) {
 		})
 	}
 }
+
+// The Contact port of a TCP flow is the local port of the established
+// connection, never the 5060 guess (spec 7.3).
+func TestPrepareTCPContactUsesFlowPort(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  func(*SIPAdapter, *siptest.Trunk, *AdapterDeps)
+		hold bool
+		src  string
+	}{
+		{"local mode", func(_ *SIPAdapter, _ *siptest.Trunk, _ *AdapterDeps) {}, false, ContactLocal},
+		{"options timeout", func(_ *SIPAdapter, _ *siptest.Trunk, d *AdapterDeps) {
+			d.Config.NAT.Mode = "public_ip"
+			d.Config.NAT.PublicIP = "198.51.100.7"
+		}, true, ContactFallback},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tr := siptest.NewTrunk(t, "tcp")
+			release := make(chan struct{})
+			t.Cleanup(func() { close(release) })
+			if c.hold {
+				tr.OnOptions(func(req *gosip.Request, tx gosip.ServerTransaction) { <-release })
+			}
+			var ua *sip.UA
+			a, _ := newAdapter(t, tr, func(d *AdapterDeps) {
+				ua = d.UA.(*sip.UA)
+				c.mod(nil, tr, d)
+			})
+			p, err := a.Prepare(context.Background(), "127.0.0.1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer p.Media.Close()
+			if p.ContactSource != c.src {
+				t.Fatalf("source = %q, want %q", p.ContactSource, c.src)
+			}
+			ap, ok := ua.LocalAddr()
+			if !ok {
+				t.Fatal("no flow after Prepare")
+			}
+			if want := fmt.Sprintf(":%d;transport=tcp", ap.Port()); !strings.HasSuffix(p.Contact, want) || ap.Port() == 5060 {
+				t.Fatalf("contact = %q, want port %d", p.Contact, ap.Port())
+			}
+		})
+	}
+}

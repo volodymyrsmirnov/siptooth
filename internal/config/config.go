@@ -14,6 +14,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/volodymyrsmirnov/siptooth/internal/placeholder"
 )
 
 // KnownEvents lists hook event names (spec section 10).
@@ -149,6 +151,17 @@ func (s SIP) RegistrarHost() string {
 		return s.Registrar
 	}
 	return targetHost(s.Target)
+}
+
+// RegistrationAOR is the address of record to register: sip.from when it is set
+// and free of placeholders, else sip:<username>@<registrar host>.
+func (s SIP) RegistrationAOR() string {
+	if s.From != "" {
+		if names, err := placeholder.Names(s.From); err == nil && len(names) == 0 {
+			return s.From
+		}
+	}
+	return "sip:" + s.Username + "@" + s.RegistrarHost()
 }
 
 // decode reads strict YAML (unknown keys are errors) over the defaults.

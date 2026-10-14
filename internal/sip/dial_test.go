@@ -1247,3 +1247,21 @@ func TestDialACKFailureReportsErrorAndDoesNotHang(t *testing.T) {
 		t.Errorf("%d BYEs reached the trunk", n)
 	}
 }
+
+func TestDialLongRingingManyProvisionals(t *testing.T) {
+	tr := siptest.NewTrunk(t, "udp")
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		for i := 0; i < 15; i++ {
+			tx.Respond(gosip.NewResponseFromRequest(req, 180, "Ringing", nil))
+			time.Sleep(100 * time.Millisecond)
+		}
+		answer200(tr)(req, tx)
+	})
+	u := newTestUA(t, tr, nil)
+	a := start(t, u, dialRequest(tr, nil))
+	r := result(t, a, 10*time.Second)
+	if r.Call == nil || r.Cause != "" {
+		t.Fatalf("result = %+v, want a Call after 15 provisionals", r)
+	}
+	closeBounded(t, u)
+}

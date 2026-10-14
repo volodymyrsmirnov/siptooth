@@ -70,6 +70,15 @@ func Validate(c Config, password string) []error {
 			add(field, "must be between %d and %d", lo, hi)
 		}
 	}
+	noURIPassword := func(field, uri string) {
+		rest := uri
+		if len(rest) >= 4 && strings.EqualFold(rest[:4], "sip:") {
+			rest = rest[4:]
+		}
+		if at := strings.IndexByte(rest, '@'); at >= 0 && strings.ContainsRune(rest[:at], ':') {
+			add(field, "must not contain a password in the user part (sip:user:password@host); put credentials in %s", PasswordVar)
+		}
+	}
 	noCtl := func(field, v string) bool {
 		if hasCtl(v) {
 			add(field, "must not contain CR, LF or NUL")
@@ -141,7 +150,11 @@ func Validate(c Config, password string) []error {
 			}
 		}
 	}
+	if c.SIP.Target != "" {
+		noURIPassword("sip.target", c.SIP.Target)
+	}
 	if c.SIP.From != "" && checkTemplate("sip.from", c.SIP.From) {
+		noURIPassword("sip.from", c.SIP.From)
 		if _, err := placeholder.ExpandURI(c.SIP.From, sample); err != nil {
 			add("sip.from", "%v", err)
 		}
@@ -163,10 +176,15 @@ func Validate(c Config, password string) []error {
 			add("sip.proxy", "port must be between 1 and 65535")
 		}
 	}
-	if c.SIP.Registrar != "" {
-		noCtl("sip.registrar", c.SIP.Registrar)
+	if c.SIP.Registrar != "" && noCtl("sip.registrar", c.SIP.Registrar) {
+		if err := checkHostPort(c.SIP.Registrar); err != nil {
+			add("sip.registrar", "must be host or host:port without a user part: %v", err)
+		}
 	}
 	inRange("sip.local_port", c.SIP.LocalPort, 0, 65535)
+	if c.SIP.LocalPort != 0 && transport != "udp" {
+		add("sip.local_port", "can be set only with sip.transport udp (TCP and TLS use an ephemeral port)")
+	}
 	noCtl("sip.username", c.SIP.Username)
 	if c.SIP.Username != "" && password == "" {
 		add("sip.username", "is set but %s is empty: put it in the environment or ~/.siptooth/env", PasswordVar)
@@ -239,6 +257,8 @@ func Validate(c Config, password string) []error {
 	if c.NAT.RTPBind != "" {
 		if ip, err := netip.ParseAddr(c.NAT.RTPBind); err != nil {
 			add("nat.rtp_bind", "must be an IP address")
+		} else if !ip.Is4() {
+			add("nat.rtp_bind", "must be an IPv4 address (the media path is IPv4 only)")
 		} else if ip.IsUnspecified() {
 			add("nat.rtp_bind", "must be a specific address, not 0.0.0.0 or :: (it is advertised to the far end)")
 		}
@@ -300,6 +320,45 @@ func Validate(c Config, password string) []error {
 		inRange(f+".timeout_seconds", h.TimeoutSeconds, 1, 300)
 	}
 	return errs
+}
+
+var hostnameRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9\-_.]*[A-Za-z0-9])?$`)
+
+// checkHostPort accepts host or host:port; an IPv6 literal needs brackets.
+func checkHostPort(v string) error {
+	host, port := v, ""
+	if strings.HasPrefix(v, "[") {
+		end := strings.IndexByte(v, ']')
+		if end < 0 {
+			return fmt.Errorf("unterminated IPv6 literal")
+		}
+		host = v[1:end]
+		if ip, err := netip.ParseAddr(host); err != nil || !ip.Is6() {
+			return fmt.Errorf("%q is not an IPv6 address", host)
+		}
+		rest := v[end+1:]
+		if rest == "" {
+			return nil
+		}
+		if rest[0] != ':' {
+			return fmt.Errorf("unexpected %q after the IPv6 literal", rest)
+		}
+		port = rest[1:]
+	} else if i := strings.IndexByte(v, ':'); i >= 0 {
+		if strings.Count(v, ":") > 1 {
+			return fmt.Errorf("an IPv6 address needs brackets")
+		}
+		host, port = v[:i], v[i+1:]
+	}
+	if port != "" || strings.HasSuffix(v, ":") {
+		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("port must be between 1 and 65535")
+		}
+	}
+	if !strings.HasPrefix(v, "[") && !hostnameRe.MatchString(host) {
+		return fmt.Errorf("%q is not a host name or IPv4 address", host)
+	}
+	return nil
 }
 
 func contains(list []string, s string) bool {

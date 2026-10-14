@@ -38,6 +38,14 @@ func TestValidate(t *testing.T) {
 		pw     string
 		want   string
 	}{
+		{"local_port with tls", func(c *Config) { c.SIP.LocalPort = 5070 }, "", "sip.local_port"},
+		{"target password", func(c *Config) { c.SIP.Target = "sip:600:secret@h.example;transport=tls" }, "", "sip.target: must not contain a password"},
+		{"from password", func(c *Config) { c.SIP.From = "sip:me:secret@h.example" }, "", "sip.from: must not contain a password"},
+		{"registrar password", func(c *Config) { c.SIP.Registrar = "sip:u:p@reg.example" }, "", "sip.registrar"},
+		{"registrar user part", func(c *Config) { c.SIP.Registrar = "u@reg.example" }, "", "sip.registrar"},
+		{"registrar bad port", func(c *Config) { c.SIP.Registrar = "reg.example:99999" }, "", "sip.registrar"},
+		{"registrar bare ipv6", func(c *Config) { c.SIP.Registrar = "2001:db8::1" }, "", "sip.registrar"},
+		{"rtp_bind ipv6", func(c *Config) { c.NAT.RTPBind = "2001:db8::1" }, "", "nat.rtp_bind: must be an IPv4"},
 		{"missing target", func(c *Config) { c.SIP.Target = "" }, "", "sip.target is required"},
 		{"sips target", func(c *Config) { c.SIP.Target = "sips:host.example" }, "", "sips:"},
 		{"not a sip uri", func(c *Config) { c.SIP.Target = "http://x" }, "", "sip.target"},
@@ -154,7 +162,9 @@ func TestValidateRanges(t *testing.T) {
 	}
 	cases := []rng{
 		{"power_cycle", func(c *Config, v int) { c.Bluetooth.PowerCycleMinutes = v }, []int{0, 10, 1440}, []int{-1, 9, 1441}, "power_cycle_minutes"},
-		{"local_port", func(c *Config, v int) { c.SIP.LocalPort = v }, []int{0, 1, 65535}, []int{-1, 65536}, "local_port"},
+		{"local_port", func(c *Config, v int) {
+			c.SIP.Transport, c.SIP.Target, c.SIP.LocalPort = "udp", "sip:600@h.example;transport=udp", v
+		}, []int{0, 1, 65535}, []int{-1, 65536}, "local_port"},
 		{"register_expires", func(c *Config, v int) { c.SIP.RegisterExpiresSeconds = v }, []int{60, 3600}, []int{59, 3601}, "register_expires_seconds"},
 		{"dial_timeout", func(c *Config, v int) { c.SIP.DialTimeoutSeconds = v }, []int{5, 120}, []int{4, 121}, "dial_timeout_seconds"},
 		{"jitter", func(c *Config, v int) { c.Media.JitterMs = v }, []int{20, 500}, []int{19, 501}, "jitter_ms"},
@@ -324,5 +334,42 @@ func TestTargetTransportParamParsing(t *testing.T) {
 	c.SIP.Target = "sip:a@host.example;transport=tls"
 	if p := problems(c, ""); !strings.Contains(p, "does not match") {
 		t.Errorf("real mismatch must be reported: %q", p)
+	}
+}
+
+func TestRegistrarAcceptsHostPort(t *testing.T) {
+	for _, r := range []string{"reg.example", "reg.example:5061", "10.0.0.1:5060", "[2001:db8::1]", "[2001:db8::1]:5061"} {
+		c := valid()
+		c.SIP.Registrar = r
+		if p := problems(c, ""); p != "" {
+			t.Errorf("registrar %q rejected: %s", r, p)
+		}
+	}
+	c := valid()
+	c.SIP.Transport = "udp"
+	c.SIP.Target = "sip:600@h.example;transport=udp"
+	c.SIP.LocalPort = 5070
+	if p := problems(c, ""); p != "" {
+		t.Errorf("udp local_port rejected: %s", p)
+	}
+}
+
+func TestRegistrationAOR(t *testing.T) {
+	c := valid()
+	c.SIP.Username = "alice"
+	if got, want := c.SIP.RegistrationAOR(), "sip:alice@sip.rtc.elevenlabs.io"; got != want {
+		t.Errorf("default = %q, want %q", got, want)
+	}
+	c.SIP.Registrar = "reg.example:5061"
+	if got, want := c.SIP.RegistrationAOR(), "sip:alice@reg.example:5061"; got != want {
+		t.Errorf("registrar = %q, want %q", got, want)
+	}
+	c.SIP.From = "sip:+3120@example.org"
+	if got := c.SIP.RegistrationAOR(); got != "sip:+3120@example.org" {
+		t.Errorf("from = %q", got)
+	}
+	c.SIP.From = "sip:{caller}@example.org"
+	if got := c.SIP.RegistrationAOR(); got != "sip:alice@reg.example:5061" {
+		t.Errorf("placeholder from = %q, want the username form", got)
 	}
 }

@@ -271,8 +271,8 @@ func adapterRoutingCheck(manu uint16, manuErr error, read func() (uint8, error))
 func routingCheck(read func() (uint8, error)) Check {
 	v, err := read()
 	if errors.Is(err, os.ErrPermission) {
-		return warn("sco_routing", "cannot verify routing without CAP_NET_RAW (run the probe once as root or check bluez-alsa docs)",
-			"the service assumes HCI routing when it cannot read it; if calls answer without audio, see docs/hardware-qualification.md")
+		return warn("sco_routing", "cannot verify routing without CAP_NET_RAW (the service assumes HCI routing, as Raspberry Pi OS sets at boot)",
+			"nothing to do unless calls are answered but silent: then check `systemctl status bthelper` and see docs/operations.md")
 	}
 	if err != nil {
 		return fail("sco_routing", err.Error(), "check that the adapter is up: bluetoothctl show")
