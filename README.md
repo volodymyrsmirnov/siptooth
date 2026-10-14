@@ -21,6 +21,7 @@ make deploy   # build for the Pi and copy it to pi@rpi-pt:~/.local/bin/siptooth
 | `siptooth install [--dry-run]` | write and enable the systemd user service (no sudo) |
 | `siptooth status [--json]` | daemon state via the control socket |
 | `siptooth config check` | validate and print the effective configuration (password redacted) |
+| `siptooth sip test [--caller N] [--seconds 20] [--tone] [--wait-remote-hangup]` | place a real SIP call to the target without Bluetooth and report responses, codec, NAT, packet loss, gaps and how the call ended (exit 0 only if answered with audio received) |
 | `siptooth hooks test --event EVENT` | run the matching hooks with a sample payload |
 | `siptooth version` | print the version |
 

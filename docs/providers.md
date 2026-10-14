@@ -74,17 +74,17 @@ Use `register: true` when the PBX should know where to reach siptooth (and to re
 
 ## M1 qualification checklist
 
-Run these from the Pi against each provider and record the outcome. The plan's `siptooth sip test` command is not in the current CLI; until it exists, observe with `siptooth doctor` (`dns`, `sip_connect`, `sip_options`, `local_address`, `nat_mapping`), `SIPTOOTH_LOG_LEVEL=debug` and a real test call.
+Run these from the Pi against each provider and record the outcome. `siptooth sip test --tone` places a real call to the configured target without Bluetooth (it registers its own Contact first when `sip.register` is on, and uses its own SIP and RTP ports, so it can run while the daemon runs). It prints the NAT decision, the Contact, every SIP response (`<- 180 Ringing`), the negotiated codec and SRTP, a progress line per second, and a final report (packets sent/received/lost/late, max inter-packet gap, latched source, received level, how the call ended). Use `--wait-remote-hangup` (max 300 s) to leave the call up and see whether the far end's BYE arrives (`remote BYE`) or only RTP stops (`media stopped`). Add `siptooth doctor` (`dns`, `sip_connect`, `sip_options`, `local_address`, `nat_mapping`) and `SIPTOOTH_LOG_LEVEL=debug` for detail. Exit status is 0 only when the call was answered and audio arrived.
 
 | Check | What to look at | Result |
 | --- | --- | --- |
 | DNS / TLS | `doctor` `dns`, `sip_connect`: name resolves, TLS handshake and certificate verify | |
 | Auth | INVITE (and REGISTER) answered after the digest challenge; no 401/403 loop | |
 | REGISTER required? | INVITE accepted without `sip.register`? with it? | |
-| NAT mode / latching | `nat_mode` in the summary line; `doctor` `nat_mapping`; audio both ways; `remote_media` in `call.connected` is the latched source | |
-| Codec | `codec` in the summary line (PCMU / PCMA) | |
+| NAT mode / latching | `sip test`: `nat:` line and `latched source` in the report; `doctor` `nat_mapping`; audio both ways; `remote_media` in `call.connected` is the latched source | |
+| Codec | `sip test`: `codec:` line (PCMU / PCMA) | |
 | SRTP | does the trunk accept `sip.srtp: true`; `srtp_fail` stays 0 | |
 | Caller ID at destination | the number appears where the destination shows it (display name, `X-CALLER-ID`) | |
 | X- headers through forward | custom headers reach the final destination after a PBX forward | |
-| Far-end BYE reaches siptooth | end the call from the far side: `hangup_by=far_end`, phone hung up within about 3 s, not `media_timeout` | |
-| Max inter-packet gap | longest gap in received RTP (watch `late` / `lost`; is RTP continuous in silence?) | |
+| Far-end BYE reaches siptooth | `sip test --wait-remote-hangup`, end the call from the far side: `ended by: remote BYE`; in the daemon `hangup_by=far_end`, phone hung up within about 3 s, not `media_timeout` | |
+| Max inter-packet gap | `sip test --tone` report: `max gap`, `lost`, `late` (is RTP continuous in silence?) | |
