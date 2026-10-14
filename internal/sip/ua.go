@@ -1,0 +1,241 @@
+// Package sip wraps emiago/sipgo for siptooth: one user agent that hosts the
+// client, the server for far-end requests that arrive on connections siptooth
+// opened, TLS and write-timeout policy, Contact discovery and keepalive
+// (spec sections 5.2, 5.5, 7.3).
+package sip
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/emiago/sipgo"
+	gosip "github.com/emiago/sipgo/sip"
+
+	"github.com/volodymyrsmirnov/siptooth/internal/nat"
+)
+
+// tcpWriteTimeout bounds every TCP and TLS write (spec 5.2), so teardown is
+// bounded even on a stuck connection. sipgo applies it as a write deadline
+// on each connection it creates. A variable only so tests can shorten it.
+var tcpWriteTimeout = 5 * time.Second
+
+// Options configures a UA.
+type Options struct {
+	Transport string // udp|tcp|tls
+	NextHop   string // host:port (sip.proxy or target host:port)
+	LocalPort int    // 0: ephemeral
+	Username  string
+	Password  string
+	UserAgent string // "siptooth/<version>"
+	// TLSConfig nil means system roots and MinVersion TLS 1.2. ServerName
+	// must stay empty: sipgo then sets it from the host of each connection's
+	// destination, so a follow-up connection to a node Contact verifies
+	// against that node's name.
+	TLSConfig *tls.Config
+	Logger    *slog.Logger
+	// Resolver is used for every DNS lookup (sipgo's and ResolveNextHop's).
+	// nil means net.DefaultResolver; tests inject their own.
+	Resolver *net.Resolver
+}
+
+// UA is siptooth's SIP user agent. It is safe for concurrent use.
+type UA struct {
+	opts      Options
+	transport string // lower case
+	log       *slog.Logger
+	resolver  *net.Resolver
+
+	ua      *sipgo.UserAgent
+	client  *sipgo.Client
+	server  *sipgo.Server
+	dialogs *sipgo.DialogClientCache
+
+	mu       sync.Mutex
+	closed   bool
+	cancels  []context.CancelFunc
+	nextHop  netip.AddrPort // cache for keepalive
+	haveNext bool
+}
+
+// NewUA builds the user agent. Nothing is sent and no socket is opened until
+// the first request. When LocalPort > 0 the next hop is resolved once here to
+// pick the local address toward it.
+func NewUA(o Options) (*UA, error) {
+	o.Transport = strings.ToLower(o.Transport)
+	switch o.Transport {
+	case "udp", "tcp", "tls":
+	default:
+		return nil, fmt.Errorf("sip: unsupported transport %q", o.Transport)
+	}
+	host, portStr, err := net.SplitHostPort(o.NextHop)
+	if err != nil || host == "" {
+		return nil, fmt.Errorf("sip: next hop %q must be host:port", o.NextHop)
+	}
+	if p, err := strconv.Atoi(portStr); err != nil || p < 1 || p > 65535 {
+		return nil, fmt.Errorf("sip: next hop %q has an invalid port", o.NextHop)
+	}
+	if o.LocalPort < 0 || o.LocalPort > 65535 {
+		return nil, fmt.Errorf("sip: invalid local port %d", o.LocalPort)
+	}
+	if o.UserAgent == "" {
+		o.UserAgent = "siptooth"
+	}
+	log := o.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	resolver := o.Resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+
+	tlsConf := &tls.Config{MinVersion: tls.VersionTLS12}
+	if o.TLSConfig != nil {
+		tlsConf = o.TLSConfig.Clone()
+		if tlsConf.MinVersion == 0 {
+			tlsConf.MinVersion = tls.VersionTLS12
+		}
+	}
+
+	// Spec 5.2: every TCP/TLS write is bounded. sipgo copies WriteTimeout
+	// into each connection and sets a write deadline before every Write.
+	transports := gosip.TransportsConfig{
+		TCP: &gosip.TransportTCP{WriteTimeout: tcpWriteTimeout},
+		TLS: &gosip.TransportTLS{TransportTCP: &gosip.TransportTCP{WriteTimeout: tcpWriteTimeout}},
+	}
+
+	sua, err := sipgo.NewUA(
+		sipgo.WithUserAgent(o.UserAgent),
+		sipgo.WithUserAgentDNSResolver(resolver),
+		sipgo.WithUserAgenTLSConfig(tlsConf),
+		sipgo.WithUserAgentTransportLayerOptions(
+			gosip.WithTransportLayerLogger(log),
+			gosip.WithTransportLayerTransports(transports),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("sip: new user agent: %w", err)
+	}
+
+	u := &UA{opts: o, transport: o.Transport, log: log, resolver: resolver, ua: sua}
+
+	copts := []sipgo.ClientOption{sipgo.WithClientLogger(log)}
+	if o.Transport == "udp" {
+		copts = append(copts, sipgo.WithClientNAT())
+	}
+	if o.LocalPort > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		hop, err := u.ResolveNextHop(ctx)
+		cancel()
+		if err != nil {
+			sua.Close()
+			return nil, fmt.Errorf("sip: resolve next hop for local port: %w", err)
+		}
+		local, err := nat.LocalAddrToward(hop.Addr())
+		if err != nil {
+			sua.Close()
+			return nil, fmt.Errorf("sip: local address toward %s: %w", hop.Addr(), err)
+		}
+		copts = append(copts, sipgo.WithClientConnectionAddr(netip.AddrPortFrom(local, uint16(o.LocalPort)).String()))
+	}
+	if u.client, err = sipgo.NewClient(sua, copts...); err != nil {
+		sua.Close()
+		return nil, fmt.Errorf("sip: new client: %w", err)
+	}
+	if u.server, err = sipgo.NewServer(sua, sipgo.WithServerLogger(log)); err != nil {
+		sua.Close()
+		return nil, fmt.Errorf("sip: new server: %w", err)
+	}
+	// The cache needs a Contact at construction; callers put the real,
+	// discovered one on every INVITE (spec 7.3), which takes precedence.
+	u.dialogs = sipgo.NewDialogClientCache(u.client, gosip.ContactHeader{Address: gosip.Uri{
+		Scheme: "sip", User: "siptooth", Host: "invalid",
+	}})
+
+	sua.TransportLayer().OnMessage(func(m gosip.Message) { LogMessage(log, "recv", m) })
+	return u, nil
+}
+
+// Close stops keepalives, the transaction layer and every connection.
+func (u *UA) Close() error {
+	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		return nil
+	}
+	u.closed = true
+	cancels := u.cancels
+	u.cancels = nil
+	u.mu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+	return u.ua.Close()
+}
+
+// Client is the sipgo client (WithClientNAT for UDP, bound to LocalPort when set).
+func (u *UA) Client() *sipgo.Client { return u.client }
+
+// Server is the sipgo server: register handlers (OnBye, OnAck, OnInvite,
+// OnOptions, OnNoRoute) for far-end requests. It never listens; requests
+// arrive on connections or the UDP flow siptooth opened.
+func (u *UA) Server() *sipgo.Server { return u.server }
+
+// Dialogs is the client dialog cache.
+func (u *UA) Dialogs() *sipgo.DialogClientCache { return u.dialogs }
+
+// UserAgent is the underlying sipgo user agent (transport layer access).
+func (u *UA) UserAgent() *sipgo.UserAgent { return u.ua }
+
+// Transport is "udp", "tcp" or "tls".
+func (u *UA) Transport() string { return u.transport }
+
+// NextHop is the configured next hop, "host:port".
+func (u *UA) NextHop() string { return u.opts.NextHop }
+
+// ResolveNextHop resolves the next hop host through A/AAAA lookups (no
+// NAPTR/SRV), preferring IPv4. A literal IP is returned as is.
+func (u *UA) ResolveNextHop(ctx context.Context) (netip.AddrPort, error) {
+	host, portStr, err := net.SplitHostPort(u.opts.NextHop)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return netip.AddrPort{}, err
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return netip.AddrPortFrom(ip.Unmap().WithZone(""), uint16(port)), nil
+	}
+	ips, err := u.resolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return netip.AddrPort{}, fmt.Errorf("sip: resolve %s: %w", host, err)
+	}
+	ip := preferIPv4(ips)
+	if !ip.IsValid() {
+		return netip.AddrPort{}, errors.New("sip: " + host + " has no addresses")
+	}
+	return netip.AddrPortFrom(ip, uint16(port)), nil
+}
+
+// preferIPv4 returns the first IPv4 address (4-in-6 unmapped), else the first address.
+func preferIPv4(ips []netip.Addr) netip.Addr {
+	for _, ip := range ips {
+		if ip.Unmap().Is4() {
+			return ip.Unmap()
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0].WithZone("")
+	}
+	return netip.Addr{}
+}
