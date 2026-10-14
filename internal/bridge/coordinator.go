@@ -6,7 +6,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -99,6 +101,13 @@ const (
 	mPrepared
 	mDial
 	mSIPEnded
+	mAnswer      // result of ATA
+	mSCO         // an SCO link (or its failure) from Accept or Dial
+	mPumpEnd     // RunPump returned
+	mMediaErr    // Media.Err delivered
+	mMediaUpdate // accepted re-INVITE media change
+	mLate        // the late-CallActive window closed
+	mPanic       // a call goroutine panicked
 )
 
 type msg struct {
@@ -121,6 +130,10 @@ type msg struct {
 	err      error
 	result   sip.DialResult // mDial
 	cause    sip.EndCause   // mSIPEnded
+
+	link    sco.Link  // mSCO
+	pumpEnd PumpEnd   // mPumpEnd
+	media   sdp.Media // mMediaUpdate
 }
 
 // Coordinator is the single owner of call state. Everything is mutated on the
@@ -141,6 +154,7 @@ type Coordinator struct {
 	lastOutcome  string
 	nextGen      int
 	cur          *activeCall
+	late         *lateWatch // late-CallActive window of the last call (spec 4.4)
 
 	statusMu sync.RWMutex
 	status   Status
@@ -227,8 +241,9 @@ func (c *Coordinator) Run(ctx context.Context) error {
 }
 
 func (c *Coordinator) shutdown() {
+	c.clearLate()
 	if c.cur != nil {
-		c.finish(c.cur, endSpec{outcome: OutcomeShutdown, hangupBy: HangupSiptooth})
+		c.finish(c.cur, endSpec{outcome: OutcomeShutdown, hangupBy: HangupSiptooth, hangupPhone: c.cur.ours()})
 	}
 	close(c.done)
 	// Helper goroutines that hold a resource (Prepare) post or release it
@@ -247,7 +262,19 @@ func (c *Coordinator) shutdown() {
 	}
 }
 
+// handle runs one message. A panic in a handler is contained: the call in
+// progress is torn down per the ownership rule and the loop keeps running.
 func (c *Coordinator) handle(ctx context.Context, m msg) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.onPanic(fmt.Sprint(r), debug.Stack())
+			c.publishStatus()
+		}
+	}()
+	c.dispatch(ctx, m)
+}
+
+func (c *Coordinator) dispatch(ctx context.Context, m msg) {
 	switch m.kind {
 	case mAttach:
 		c.telGen++
@@ -281,6 +308,20 @@ func (c *Coordinator) handle(ctx context.Context, m msg) {
 		c.onDialResult(m)
 	case mSIPEnded:
 		c.onSIPEnded(m)
+	case mAnswer:
+		c.onAnswerResult(m)
+	case mSCO:
+		c.onSCO(m)
+	case mPumpEnd:
+		c.onPumpEnd(m)
+	case mMediaErr:
+		c.onMediaErr(m)
+	case mMediaUpdate:
+		c.onMediaUpdate(m)
+	case mLate:
+		c.onLateTimer(m)
+	case mPanic:
+		c.onGoroutinePanic(m)
 	}
 	c.publishStatus()
 }
@@ -309,6 +350,11 @@ func (c *Coordinator) discard(m msg, why string) {
 		}
 	case mTimer:
 		c.d.Logger.Debug("late timer discarded", "timer", m.timer)
+	case mSCO:
+		if m.link != nil {
+			_ = m.link.Close()
+		}
+		c.d.Logger.Info("late SCO link closed", "why", why)
 	default:
 		c.d.Logger.Debug("late message discarded", "why", why, "kind", int(m.kind))
 	}
@@ -365,6 +411,8 @@ func (c *Coordinator) onTimer(m msg) {
 		c.onCallerIDWait(call)
 	case timerDial:
 		c.onDialTimeout(call)
+	default:
+		c.onCallTimer(call, m.timer)
 	}
 }
 
@@ -374,6 +422,7 @@ func (c *Coordinator) onTimer(m msg) {
 func (c *Coordinator) dropPhone() {
 	c.tel, c.listener = nil, nil
 	c.telGen++
+	c.clearLate()
 	if c.cur != nil {
 		c.finish(c.cur, endSpec{outcome: OutcomeBluetoothLost, hangupBy: HangupSiptooth})
 	}
@@ -398,6 +447,7 @@ func (c *Coordinator) onTel(ctx context.Context, ev hfp.Event) {
 		c.startCall(ctx)
 	default:
 		if c.cur == nil {
+			c.onTelIdle(ev)
 			return
 		}
 		switch c.cur.state {
@@ -405,6 +455,8 @@ func (c *Coordinator) onTel(ctx context.Context, ev hfp.Event) {
 			c.onTelDialing(c.cur, ev)
 		case stateAnswering:
 			c.onTelAnswering(c.cur, ev)
+		case stateBridged:
+			c.onTelBridged(c.cur, ev)
 		}
 	}
 }

@@ -8,6 +8,8 @@ import (
 
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
 	"github.com/volodymyrsmirnov/siptooth/internal/hfp"
+	"github.com/volodymyrsmirnov/siptooth/internal/hooks"
+	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
 
@@ -442,75 +444,21 @@ func TestLateResultOfOldGenerationIgnoredByNewCall(t *testing.T) {
 }
 
 func TestAnsweredEntersAnswering(t *testing.T) {
-	r := newRig(t, nil).start()
+	r := newRig(t, func(c *config.Config) { c.Calls.MediaTimeoutSeconds = 0 }).start()
 	r.ringAndDial("+380501234567")
 	fc := newFakeCall()
 	r.sip.attempt(0).send(sip.DialResult{Call: fc, Status: 200, Reason: "OK"})
 	r.waitState("answering")
+	r.waitFor("ATA", func() bool { a, _ := r.tel.counts(); return a == 1 })
+	r.tel.send(hfp.CallActive, "")
+	a, _ := sco.NewPipe(60)
+	r.lis.links <- a
+	r.waitState("bridged")
 	r.clock.Advance(time.Minute) // the dial timer no longer applies
 	r.settle()
-	if r.c.Status().State != "answering" {
-		t.Fatal("dial timer ended an answered call")
+	if r.c.Status().State != "bridged" {
+		t.Fatalf("state = %s: the dial timer ended an answered call", r.c.Status().State)
 	}
-	r.assertNoPhoneAction()
-}
-
-func TestAnsweringTerminations(t *testing.T) {
-	tests := []struct {
-		name     string
-		do       func(r *rig, fc *fakeCall)
-		outcome  string
-		byes     int
-		hangupBy string
-	}{
-		{"far end bye", func(r *rig, fc *fakeCall) { fc.ended <- sip.RemoteBye }, OutcomeFarEndEnded, 0, HangupFarEnd},
-		{"transport lost", func(r *rig, fc *fakeCall) { fc.ended <- sip.TransportLost }, OutcomeFarEndEnded, 0, HangupFarEnd},
-		{"caller gives up", func(r *rig, fc *fakeCall) { r.tel.send(hfp.CallSetupCleared, "") }, OutcomeCallerAbandoned, 1, HangupCaller},
-		{"owner answers", func(r *rig, fc *fakeCall) { r.tel.send(hfp.CallActive, "") }, OutcomeOwnerAnswered, 1, ""},
-		{"bluetooth lost", func(r *rig, fc *fakeCall) { r.tel.send(hfp.Disconnected, "") }, OutcomeBluetoothLost, 1, HangupSiptooth},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			r := newRig(t, nil).start()
-			r.ringAndDial("+380501234567")
-			fc := newFakeCall()
-			r.sip.attempt(0).send(sip.DialResult{Call: fc, Status: 200, Reason: "OK"})
-			r.waitState("answering")
-			tt.do(r, fc)
-			e := r.waitEnded()
-			if e.Outcome != tt.outcome || e.HangupBy != tt.hangupBy {
-				t.Errorf("ended = %+v", e)
-			}
-			if e.SIPCallID != "sip-call-1" || e.SIPStatus != 200 || e.Codec != "PCMU" || e.RemoteMedia != "203.0.113.9:4000" {
-				t.Errorf("ended call info = %+v", e)
-			}
-			r.waitFor("BYE count", func() bool { return fc.hangups() == tt.byes })
-			r.assertNoPhoneAction()
-			if r.sip.media(0).closeCount() != 1 {
-				t.Error("media not closed")
-			}
-			r.assertSingleEnded()
-			if fc.hangups() != tt.byes {
-				t.Errorf("BYEs = %d, want %d", fc.hangups(), tt.byes)
-			}
-		})
-	}
-	t.Run("shutdown", func(t *testing.T) {
-		r := newRig(t, nil).start()
-		r.ringAndDial("+380501234567")
-		fc := newFakeCall()
-		r.sip.attempt(0).send(sip.DialResult{Call: fc, Status: 200, Reason: "OK"})
-		r.waitState("answering")
-		r.cancel()
-		<-r.done
-		r.done <- nil
-		if fc.hangups() != 1 {
-			t.Errorf("BYEs after Run returned = %d, want 1", fc.hangups())
-		}
-		if e := r.hooks.named("call.ended"); len(e) != 1 || e[0].Outcome != OutcomeShutdown {
-			t.Errorf("ended = %+v", e)
-		}
-	})
 }
 
 // Every way a call can end in Dialing and Answering emits exactly one
@@ -688,5 +636,53 @@ func TestProxyIsNextHop(t *testing.T) {
 	}
 	if r.sip.req(0).NextHop != "proxy.example.net:5061" {
 		t.Errorf("NextHop = %q", r.sip.req(0).NextHop)
+	}
+}
+
+func TestSIPResponseLogged(t *testing.T) {
+	r := newRig(t, nil).start()
+	r.ringAndDial("+380501234567")
+	r.sip.req(0).OnResponse(180, "Ringing")
+	out := r.log.String()
+	for _, want := range []string{`msg="sip response"`, "call_id=call-1", "status=180", "reason=Ringing"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log lacks %q", want)
+		}
+	}
+}
+
+// hangup_by is null for endings during Dialing, except when siptooth itself
+// cuts the call short (shutdown, lost Bluetooth).
+func TestHangupByWhileDialing(t *testing.T) {
+	tests := []struct {
+		name string
+		do   func(r *rig)
+		want string
+	}{
+		{"rejected", func(r *rig) { r.sip.attempt(0).send(sip.DialResult{Cause: sip.FailRejected, Status: 486}) }, ""},
+		{"error", func(r *rig) { r.sip.attempt(0).send(sip.DialResult{Cause: sip.FailError, Err: errBoom}) }, ""},
+		{"timeout", func(r *rig) { r.waitArmed(2); r.clock.Advance(30 * time.Second) }, ""},
+		{"caller abandoned", func(r *rig) { r.tel.send(hfp.CallSetupCleared, "") }, ""},
+		{"owner answered", func(r *rig) { r.tel.send(hfp.CallActive, "") }, ""},
+		{"bluetooth lost", func(r *rig) { r.tel.send(hfp.Disconnected, "") }, HangupSiptooth},
+		{"shutdown", func(r *rig) { r.cancel() }, HangupSiptooth},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newRig(t, nil).start()
+			r.ringAndDial("+380501234567")
+			tt.do(r)
+			var e hooks.CallInfo
+			if tt.name == "shutdown" {
+				<-r.done
+				r.done <- nil
+				e = r.hooks.named("call.ended")[0]
+			} else {
+				e = r.waitEnded()
+			}
+			if e.HangupBy != tt.want {
+				t.Errorf("hangup_by = %q, want %q", e.HangupBy, tt.want)
+			}
+		})
 	}
 }

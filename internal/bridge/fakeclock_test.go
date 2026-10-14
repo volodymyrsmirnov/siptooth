@@ -88,3 +88,16 @@ func (c *fakeClock) Advance(d time.Duration) {
 
 // armed is the number of timers and tickers created so far.
 func (c *fakeClock) armed() int { c.mu.Lock(); defer c.mu.Unlock(); return len(c.items) }
+
+// hasTimer reports whether a live one-shot timer is due exactly d from now.
+func (c *fakeClock) hasTimer(d time.Duration) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	want := c.now.Add(d)
+	for _, it := range c.items {
+		if !it.stopped && it.period == 0 && it.next.Equal(want) {
+			return true
+		}
+	}
+	return false
+}

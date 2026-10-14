@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/hfp"
 	"github.com/volodymyrsmirnov/siptooth/internal/hooks"
 	"github.com/volodymyrsmirnov/siptooth/internal/placeholder"
+	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
 
@@ -88,7 +90,21 @@ type activeCall struct {
 	sipStat    int         // last final status of the INVITE
 	sipRsn     string      // its reason phrase
 	errText    string      // detail for call.ended error
-	answerSent bool        // ATA was sent: the phone call is ours (spec 4.1)
+	answerSent bool        // ATA was sent (spec 4.1)
+
+	// Answering and Bridged.
+	callActive     bool      // CallActive observed after our ATA: the phone call is ours
+	ringEnd        time.Time // when callActive was observed; ringing_seconds stops here
+	mediaStartedAt time.Time
+	link           sco.Link
+	acceptCtx      context.Context // SCO accept and dial; cancelled at SCO up or call end
+	acceptCancel   context.CancelFunc
+	silenceStop    chan struct{} // closed when SCO is up: the pump takes over the uplink
+	silenceDone    chan struct{} // closed when the silence ticker goroutine exited
+	bridgedAt      time.Time
+	sipGone        bool // the SIP side already ended: no BYE
+	scoLost        bool // SCO EOF/stall seen, waiting for CallEnded (Bridged)
+	draining       bool // far-end BYE seen, playing out the downlink (Bridged)
 }
 
 // endSpec says how a call ends.
@@ -103,9 +119,13 @@ type endSpec struct {
 	farEndGone bool
 }
 
+// ours reports whether the phone call is siptooth's to hang up (spec 4.1).
+func (call *activeCall) ours() bool { return call.callActive }
+
 // ---- Idle -> Dialing (spec 4.2) ----
 
 func (c *Coordinator) startCall(ctx context.Context) {
+	c.clearLate()
 	now := c.d.Clock.Now()
 	c.nextGen++
 	call := &activeCall{
@@ -282,13 +302,27 @@ func (c *Coordinator) onPrepared(m msg) {
 	c.d.Logger.Info("invite sent", "call_id", call.id, "target", call.target)
 
 	gen := call.gen
+	// Tracked by bg so a result that cannot be posted any more (shutdown) is
+	// still hung up before Run returns.
+	c.bg.Add(1)
 	go func() {
+		defer c.bg.Done()
+		var res sip.DialResult
 		select {
-		case res := <-att.Result():
-			if !c.post(msg{kind: mDial, gen: gen, result: res}) && res.Call != nil {
-				c.byeNow(res.Call, id)
+		case res = <-att.Result():
+			if c.post(msg{kind: mDial, gen: gen, result: res}) {
+				return
 			}
 		case <-c.done:
+			select {
+			case res = <-att.Result():
+			default:
+				return
+			}
+		}
+		if res.Call != nil {
+			c.d.Logger.Warn("late SIP answer after shutdown, hanging up", "call_id", id, "sip_call_id", res.Call.SIPCallID())
+			c.byeNow(res.Call, id)
 		}
 	}()
 }
@@ -348,52 +382,6 @@ func (c *Coordinator) onDialResult(m msg) {
 	}
 }
 
-// ---- Answering ----
-//
-// The answering handlers below are the skeleton Task 15 completes (media
-// start, ATA, CallActive wait, SCO). Today an answered INVITE is held open
-// and only the terminations that need no phone action are handled.
-
-func (c *Coordinator) enterAnswering(call *activeCall, res sip.DialResult) {
-	c.stopTimer(call, timerDial)
-	call.state = stateAnswering
-	call.sipCall = res.Call
-	call.sipStat, call.sipRsn = res.Status, res.Reason
-	c.d.Logger.Info("sip answered", "call_id", call.id, "sip_call_id", res.Call.SIPCallID(), "status", res.Status)
-
-	sc, gen := res.Call, call.gen
-	go func() {
-		select {
-		case cause := <-sc.Ended():
-			c.post(msg{kind: mSIPEnded, gen: gen, cause: cause})
-		case <-call.ctx.Done():
-		case <-c.done:
-		}
-	}()
-}
-
-func (c *Coordinator) onSIPEnded(m msg) {
-	call := c.current(m.gen)
-	if call == nil || call.state != stateAnswering {
-		c.discard(m, "call over")
-		return
-	}
-	// Before CallActive the phone is left alone (spec 4.4).
-	c.finish(call, endSpec{outcome: OutcomeFarEndEnded, hangupBy: HangupFarEnd, farEndGone: true,
-		errText: "sip " + string(m.cause)})
-}
-
-func (c *Coordinator) onTelAnswering(call *activeCall, ev hfp.Event) {
-	switch ev.Kind {
-	case hfp.CallSetupCleared:
-		c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
-	case hfp.CallActive:
-		if !call.answerSent {
-			c.finish(call, endSpec{outcome: OutcomeOwnerAnswered})
-		}
-	}
-}
-
 // ---- Ending (spec 4.6) ----
 
 // finish ends call exactly once: it releases the attempt, the SIP dialog and
@@ -406,12 +394,18 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 	}
 	call.state = stateEnding
 	call.cancel()
+	now := c.d.Clock.Now()
 
 	if call.attempt != nil {
-		call.attempt.Abandon() // returns at once; internal/sip finishes the transaction
+		att := call.attempt
 		call.attempt = nil
+		c.safely("abandon", func() { att.Abandon() }) // returns at once; internal/sip finishes the transaction
 	}
-	if call.sipCall != nil && !e.farEndGone {
+	if call.link != nil {
+		l := call.link
+		c.safely("close sco", func() { _ = l.Close() })
+	}
+	if call.sipCall != nil && !e.farEndGone && !call.sipGone {
 		c.hangupSIP(call.sipCall, call.id)
 	}
 	if e.hangupPhone && c.tel != nil {
@@ -421,13 +415,14 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 	var media *hooks.MediaStats
 	var stats mediaCounters
 	if call.prepared != nil {
-		stats = readCounters(call.prepared.Media)
+		m := call.prepared.Media
+		c.safely("media stats", func() { stats = readCounters(m) })
 		media = &hooks.MediaStats{
 			Sent: stats.Sent, Received: stats.Received, Lost: stats.Lost, Late: stats.Late,
 			Duplicate: stats.Duplicate, Overflow: stats.Overflow,
 			DiscardedSilence: stats.DiscardedSilence, SRTPFail: stats.SRTPFail,
 		}
-		closeMedia(c.d.Logger, call.prepared.Media)
+		c.safely("close media", func() { closeMedia(c.d.Logger, m) })
 	}
 
 	// A call that ended before call.ringing went out still gets one, so every
@@ -435,11 +430,23 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 	c.resolveIdentity(call)
 	c.emitRinging(call)
 
-	ringing := c.d.Clock.Now().Sub(call.ringAt).Seconds()
+	// Ringing stops when the phone call was answered, bridging runs to the end.
+	ringEnd := now
+	if !call.ringEnd.IsZero() {
+		ringEnd = call.ringEnd
+	}
+	ringing := ringEnd.Sub(call.ringAt).Seconds()
+	var bridged *float64
+	bridgedS := 0.0
+	if !call.bridgedAt.IsZero() {
+		bridgedS = now.Sub(call.bridgedAt).Seconds()
+		bridged = &bridgedS
+	}
 	info := c.callInfo(call)
 	info.Outcome, info.HangupBy, info.Error = e.outcome, e.hangupBy, e.errText
 	info.SIPStatus, info.SIPReason = call.sipStat, call.sipRsn
 	info.RingingSeconds = ringing
+	info.BridgedSeconds = bridged
 	info.Media = media
 	c.d.Hooks.Emit("call.ended", info)
 
@@ -449,12 +456,23 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 	}
 	c.d.Logger.Info("call ended",
 		"call_id", call.id, "caller", caller, "outcome", e.outcome, "hangup_by", e.hangupBy,
-		"sip_status", call.sipStat, "ringing_s", ringing, "bridged_s", 0.0,
+		"sip_status", call.sipStat, "ringing_s", ringing, "bridged_s", bridgedS,
 		"codec", info.Codec, "nat_mode", info.NATMode,
 		"lost", stats.Lost, "late", stats.Late, "discarded_silence", stats.DiscardedSilence)
 
 	c.lastOutcome = e.outcome
 	c.cur = nil
+}
+
+// safely runs fn, logging a panic instead of letting it unwind the teardown
+// of a call.
+func (c *Coordinator) safely(what string, fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.d.Logger.Error("panic recovered", "where", what, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+		}
+	}()
+	fn()
 }
 
 // callInfo is the hook payload view of call as far as it is known.
@@ -510,7 +528,7 @@ func (c *Coordinator) hangupSIP(sc sip.Call, callID string) {
 	c.bg.Add(1)
 	go func() {
 		defer c.bg.Done()
-		c.byeNow(sc, callID)
+		c.safely("BYE", func() { c.byeNow(sc, callID) })
 	}()
 }
 
@@ -528,10 +546,12 @@ func (c *Coordinator) hangupPhone(t Telephony, callID string) {
 	c.bg.Add(1)
 	go func() {
 		defer c.bg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-		defer cancel()
-		if err := t.Hangup(ctx); err != nil {
-			c.d.Logger.Warn("AT+CHUP failed", "call_id", callID, "error", err)
-		}
+		c.safely("AT+CHUP", func() {
+			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+			defer cancel()
+			if err := t.Hangup(ctx); err != nil {
+				c.d.Logger.Warn("AT+CHUP failed", "call_id", callID, "error", err)
+			}
+		})
 	}()
 }

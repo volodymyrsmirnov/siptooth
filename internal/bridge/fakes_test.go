@@ -17,6 +17,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/hooks"
 	"github.com/volodymyrsmirnov/siptooth/internal/nat"
 	"github.com/volodymyrsmirnov/siptooth/internal/rtp"
+	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 	"github.com/volodymyrsmirnov/siptooth/internal/sdp"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
@@ -28,6 +29,9 @@ type fakeTel struct {
 	mu     sync.Mutex
 	answer int
 	hangup int
+	// answerErr is what Answer returns; gate, when set, holds Answer until closed.
+	answerErr error
+	gate      chan struct{}
 }
 
 func newFakeTel() *fakeTel { return &fakeTel{events: make(chan hfp.Event, 32)} }
@@ -35,10 +39,15 @@ func newFakeTel() *fakeTel { return &fakeTel{events: make(chan hfp.Event, 32)} }
 func (f *fakeTel) Events() <-chan hfp.Event { return f.events }
 func (f *fakeTel) Answer(context.Context) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.answer++
-	return nil
+	err, gate := f.answerErr, f.gate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	return err
 }
+func (f *fakeTel) setAnswerErr(err error) { f.mu.Lock(); f.answerErr = err; f.mu.Unlock() }
 func (f *fakeTel) Hangup(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -57,35 +66,88 @@ func (f *fakeTel) counts() (answers, hangups int) {
 // --- media ---
 
 type fakeMedia struct {
-	mu     sync.Mutex
-	closed int
-	stats  rtp.Stats
+	mu       sync.Mutex
+	closed   int
+	stats    rtp.Stats
+	started  []sdp.Media
+	keys     [][]byte
+	startErr error
+	silences int
+	updates  []sdp.Media
+	errCh    chan error
+	pl       *rtp.Playout
+	panicOn  bool // Stats panics
+	frames   int
+	writeErr error
 }
 
-func (m *fakeMedia) Start(sdp.Media, []byte) error { return nil }
-func (m *fakeMedia) Update(sdp.Media)              {}
-func (m *fakeMedia) WriteFrame([]int16) error      { return nil }
-func (m *fakeMedia) WriteSilence() error           { return nil }
-func (m *fakeMedia) Playout() *rtp.Playout         { return nil }
-func (m *fakeMedia) Err() <-chan error             { return nil }
-func (m *fakeMedia) Stats() rtp.Stats              { m.mu.Lock(); defer m.mu.Unlock(); return m.stats }
-func (m *fakeMedia) Close() error                  { m.mu.Lock(); m.closed++; m.mu.Unlock(); return nil }
-func (m *fakeMedia) closeCount() int               { m.mu.Lock(); defer m.mu.Unlock(); return m.closed }
+func newFakeMedia() *fakeMedia {
+	return &fakeMedia{errCh: make(chan error, 1), pl: rtp.NewPlayout(rtp.Config{})}
+}
+
+func (m *fakeMedia) Start(r sdp.Media, key []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.started = append(m.started, r)
+	m.keys = append(m.keys, key)
+	return m.startErr
+}
+func (m *fakeMedia) Update(r sdp.Media) { m.mu.Lock(); m.updates = append(m.updates, r); m.mu.Unlock() }
+func (m *fakeMedia) WriteFrame([]int16) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.frames++
+	return m.writeErr
+}
+func (m *fakeMedia) WriteSilence() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.silences++
+	return m.writeErr
+}
+func (m *fakeMedia) Playout() *rtp.Playout { return m.pl }
+func (m *fakeMedia) Err() <-chan error     { return m.errCh }
+func (m *fakeMedia) Stats() rtp.Stats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.panicOn {
+		panic("stats exploded")
+	}
+	return m.stats
+}
+func (m *fakeMedia) Close() error    { m.mu.Lock(); m.closed++; m.mu.Unlock(); return nil }
+func (m *fakeMedia) closeCount() int { m.mu.Lock(); defer m.mu.Unlock(); return m.closed }
+func (m *fakeMedia) silenceCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.silences
+}
+func (m *fakeMedia) frameCount() int { m.mu.Lock(); defer m.mu.Unlock(); return m.frames }
+func (m *fakeMedia) setLastRx(t time.Time) {
+	m.mu.Lock()
+	m.stats.LastRx = t
+	m.mu.Unlock()
+}
+func (m *fakeMedia) updateCount() int { m.mu.Lock(); defer m.mu.Unlock(); return len(m.updates) }
+func (m *fakeMedia) startCount() int  { m.mu.Lock(); defer m.mu.Unlock(); return len(m.started) }
 
 // --- SIP ---
 
 type fakeCall struct {
-	ended  chan sip.EndCause
-	mu     sync.Mutex
-	hangup int
+	updates chan sdp.Media
+	ended   chan sip.EndCause
+	mu      sync.Mutex
+	hangup  int
 }
 
-func newFakeCall() *fakeCall { return &fakeCall{ended: make(chan sip.EndCause, 1)} }
+func newFakeCall() *fakeCall {
+	return &fakeCall{ended: make(chan sip.EndCause, 1), updates: make(chan sdp.Media, 4)}
+}
 
 func (c *fakeCall) Remote() sdp.Media {
 	return sdp.Media{Addr: netip.MustParseAddrPort("203.0.113.9:4000"), SendCodec: g711.PCMU}
 }
-func (c *fakeCall) MediaUpdates() <-chan sdp.Media { return nil }
+func (c *fakeCall) MediaUpdates() <-chan sdp.Media { return c.updates }
 func (c *fakeCall) Ended() <-chan sip.EndCause     { return c.ended }
 func (c *fakeCall) Hangup(context.Context) error {
 	c.mu.Lock()
@@ -123,6 +185,10 @@ type fakeSIP struct {
 	// gate, when set, makes Prepare wait for it (ignoring ctx, like a slow
 	// socket setup that finishes after the call is over).
 	gate chan struct{}
+	// panicFirstStats makes the first media panic in Stats.
+	panicFirstStats bool
+	localKey        []byte
+	mediaStartErr   error
 }
 
 func (s *fakeSIP) Prepare(ctx context.Context, host string) (Prepared, error) {
@@ -136,15 +202,18 @@ func (s *fakeSIP) Prepare(ctx context.Context, host string) (Prepared, error) {
 	if perr != nil {
 		return Prepared{}, perr
 	}
-	m := &fakeMedia{}
+	m := newFakeMedia()
 	s.mu.Lock()
+	m.panicOn = s.panicFirstStats && len(s.medias) == 0
 	s.medias = append(s.medias, m)
 	s.mu.Unlock()
+	m.startErr = s.mediaStartErr
 	return Prepared{
-		Media:   m,
-		Offer:   sdp.Offer{Addr: netip.MustParseAddrPort("192.0.2.10:10000"), Codecs: []g711.Codec{g711.PCMU}},
-		Contact: "sip:siptooth@192.0.2.10:5061;transport=tls",
-		NAT:     nat.Decision{Mode: nat.ModeLocal, Media: netip.MustParseAddrPort("192.0.2.10:10000")},
+		Media:    m,
+		LocalKey: s.localKey,
+		Offer:    sdp.Offer{Addr: netip.MustParseAddrPort("192.0.2.10:10000"), Codecs: []g711.Codec{g711.PCMU}},
+		Contact:  "sip:siptooth@192.0.2.10:5061;transport=tls",
+		NAT:      nat.Decision{Mode: nat.ModeLocal, Media: netip.MustParseAddrPort("192.0.2.10:10000")},
 	}, nil
 }
 
@@ -227,6 +296,60 @@ func (s *syncBuffer) Write(p []byte) (int, error) {
 }
 func (s *syncBuffer) String() string { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
 
+// --- SCO ---
+
+// fakeListener hands out links pushed with offer; Accept honors ctx.
+type fakeListener struct {
+	links   chan sco.Link
+	mu      sync.Mutex
+	accepts int
+}
+
+func newFakeListener() *fakeListener { return &fakeListener{links: make(chan sco.Link, 4)} }
+
+func (l *fakeListener) Accept(ctx context.Context) (sco.Link, error) {
+	l.mu.Lock()
+	l.accepts++
+	l.mu.Unlock()
+	select {
+	case k := <-l.links:
+		return k, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (l *fakeListener) Close() error { return nil }
+func (l *fakeListener) acceptCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.accepts
+}
+
+type fakeDialer struct {
+	links chan sco.Link
+	mu    sync.Mutex
+	dials []string
+}
+
+func newFakeDialer() *fakeDialer { return &fakeDialer{links: make(chan sco.Link, 4)} }
+
+func (d *fakeDialer) Dial(ctx context.Context, adapter, remote string) (sco.Link, error) {
+	d.mu.Lock()
+	d.dials = append(d.dials, adapter+">"+remote)
+	d.mu.Unlock()
+	select {
+	case k := <-d.links:
+		return k, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (d *fakeDialer) dialed() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.dials...)
+}
+
 // --- harness ---
 
 type rig struct {
@@ -234,6 +357,8 @@ type rig struct {
 	c      *Coordinator
 	clock  *fakeClock
 	tel    *fakeTel
+	lis    *fakeListener
+	dialer *fakeDialer
 	sip    *fakeSIP
 	hooks  *fakeHooks
 	log    *syncBuffer
@@ -244,6 +369,7 @@ type rig struct {
 func testConfig() config.Config {
 	cfg := config.Default()
 	cfg.Phone.Number = "+380441234567"
+	cfg.Bluetooth.PhoneAddress = "11:11:11:11:11:11"
 	cfg.SIP.Target = "sip:{number}@sip.example.com;transport=tls"
 	cfg.SIP.Headers = map[string]string{"X-CALL-ID": "{call_id}"}
 	return cfg
@@ -257,10 +383,10 @@ func newRig(t *testing.T, mutate func(*config.Config)) *rig {
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	r := &rig{t: t, clock: newFakeClock(), tel: newFakeTel(), sip: &fakeSIP{}, hooks: &fakeHooks{}, log: &syncBuffer{}}
+	r := &rig{t: t, clock: newFakeClock(), tel: newFakeTel(), lis: newFakeListener(), dialer: newFakeDialer(), sip: &fakeSIP{}, hooks: &fakeHooks{}, log: &syncBuffer{}}
 	n := 0
 	r.c = New(Deps{
-		Config: cfg, SIP: r.sip, Hooks: r.hooks, Clock: r.clock,
+		Config: cfg, SIP: r.sip, Dialer: r.dialer, Hooks: r.hooks, Clock: r.clock,
 		Logger: slog.New(slog.NewTextHandler(io.MultiWriter(r.log), &slog.HandlerOptions{Level: slog.LevelDebug})),
 		NewCallID: func(time.Time) string {
 			n++
@@ -276,7 +402,7 @@ func (r *rig) start() *rig {
 	r.cancel = cancel
 	r.done = make(chan error, 1)
 	go func() { r.done <- r.c.Run(ctx) }()
-	r.c.Attach(r.tel, nil, "AA:BB:CC:DD:EE:FF")
+	r.c.Attach(r.tel, r.lis, "AA:BB:CC:DD:EE:FF")
 	r.c.SetAudioRouting(true)
 	r.waitFor("ready", func() bool { return r.c.Status().Ready })
 	r.t.Cleanup(r.stop)
