@@ -1,7 +1,7 @@
 # Siptooth — Design Specification
 
 **Date:** 2026-10-14
-**Status:** Draft for review (revision 3: review findings merged, see Appendix A; Zadarma cloud PBX replaces the LAN PBX as a qualified target, optional REGISTER added)
+**Status:** Approved; implemented (revision 4, 2026-10-14: implementation decisions folded in, see Appendix A)
 **Predecessor:** allochka (`~/Projects/Personal/allochka`), spec `docs/superpowers/specs/2026-10-04-allochka-design.md`. Allochka is retired once siptooth is proven on real calls.
 
 Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspberry Pi 5 acts as a Bluetooth hands-free unit for the phone, exactly as allochka does. When the phone rings, siptooth places a SIP call to one configured target, answers the phone only once the far end answers, and bridges the audio both ways until either side hangs up. Siptooth has no AI, no conversation logic, no web UI and no call store.
@@ -215,7 +215,7 @@ Termination events during Answering:
 | Event | Before `CallActive` | After `CallActive` (SCO not yet up) |
 | --- | --- | --- |
 | far-end BYE / transport lost | leave the phone (it rings on, `ATA` result is ignored if late); outcome `far_end_ended` | `AT+CHUP`; outcome `far_end_ended` |
-| `hfp.CallSetupCleared` with `call` = 0 | BYE; `caller_abandoned` | — (not emitted while active) |
+| `hfp.CallSetupCleared` with `call` = 0 | ATA definitively failed or not sent: BYE; `caller_abandoned`. ATA pending/ok/ambiguous: recorded only — some phones report `callsetup=0` before `call=1` after `ATA`; a `CallActive` within the 5 s window proceeds, otherwise BYE, `caller_abandoned` (the far end may hear up to ~8 s of silence in that case). A new Ring during this wait ends the old call at once. | — (not emitted while active) |
 | `hfp.CallEnded` | — | BYE; `caller_abandoned` |
 | `hfp.Disconnected` | BYE; `bluetooth_lost` | BYE; `bluetooth_lost` |
 | no `CallActive` within 5 s | BYE; `answer_failed`; phone left alone | — |
@@ -531,7 +531,7 @@ Control socket: HTTP over `~/.siptooth/siptooth.sock`, `GET /status` (JSON) only
 | Bluetooth link lost mid-call | BYE, `bluetooth_lost` |
 | Hook fails / times out / queue full | logged, never affects calls |
 | Panic in a call goroutine | recovered, both sides hung up per the ownership rule, `call.ended` with `error`, daemon keeps running |
-| Invalid config | startup fails listing all errors; systemd restarts with backoff |
+| Invalid config | startup fails listing all errors with exit code 2; the unit's `RestartPreventExitStatus=2` stops restart loops (also used when another daemon already owns the control socket) |
 
 ## 14. Testing
 
@@ -545,7 +545,7 @@ TDD throughout; tests never touch real Bluetooth, real networks beyond loopback,
 - **sip:** a real sipgo UAS on loopback (UDP, TCP, and TLS with a test CA) acting as the trunk: 200; 486; 503; 401 and 407 challenges; stale-nonce second challenge; three challenges → failure; no answer → CANCEL after 1xx; Abandon before any 1xx; 200 crossing CANCEL → ACK + BYE; two forked 200s → second ACKed + BYEd; unacceptable SDP → ACK + BYE; far-end BYE on the same connection; BYE challenged; re-INVITE refresh, address change, hold → 488, offerless; OPTIONS; unsolicited INVITE → 403; Contact from OPTIONS `received`/`rport`; REGISTER with challenge, refresh at half expiry, Contact update on a changed `received`/`rport`, retry after failure, unregister on shutdown, INVITE on the registered Contact → 603; CRLF keepalive; header expansion and escaping; forbidden headers; TLS ServerName per destination (two hostnames with distinct certs).
 - **bridge:** state machine with fake HFP client, fake SIP dialer, in-memory SCO pair, fake clock: every row of the tables in sections 4.3–4.5, `ATA` error classes, owner answering during Dialing and during Answering, generation discards late results, exactly one `call.ended` per call, no `AT+CHUP` for unowned calls or on SCO loss, settle delay, drain before CHUP on far-end BYE.
 - **End-to-end (loopback):** fake AG + in-memory SCO + sipgo UAS that echoes RTP: a tone written on the SCO side comes back on the SCO side; hang-up from either end.
-- **CI:** `make check` = `go vet ./...`, `go test -race ./...`, `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...`.
+- **CI:** `make check` = gofmt, `go vet ./...`, `go test ./...`, `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...`; `make race` runs `go test -race ./...` (cgo enabled for that target only); a Go 1.24 toolchain vet/test is part of the release gate.
 
 ## 15. Rollout
 
@@ -609,5 +609,7 @@ Reviewed by Fable 5.1 (Claude subagent), gpt-6.1-sol and gpt-6-astra (Codex CLI)
 - `pion/stun` dropped for a hand-rolled Binding Request (the unsuffixed module is v0.6.1 with a parser panic; Fable, gpt-6.1-sol); versions pinned (all three).
 - URIs: `sip:` only, explicit port honored, component-aware escaping, CR/LF rejected; `{call_id}` placeholder; provider recipes (all three).
 - Hooks back to allochka's single worker (Fable, gpt-6.1-sol); claims narrowed to two qualified targets (gpt-6-astra).
+
+Revision 4 (implementation): the owner-answer ownership rule was tightened (a definite ATA failure means the call is never siptooth's even if CallActive arrives first; outgoing call setup invalidates any pending answer); CallSetupCleared after ATA waits for CallActive (above); SCO loss latches no-CHUP; the far-end BYE drain bypasses jitter priming; re-INVITE 2xx is retransmitted on every transport (§5.6); `sip.local_port` must be 0 for TCP/TLS and maps to 5060 for UDP; the UDP Contact advertises the real bound port; transient RTP send errors are tolerated for 5 s.
 
 Revision 3 (owner input): the LAN PBX is replaced by the owner's Zadarma cloud PBX as a qualified target next to ElevenLabs direct (both first-class); optional REGISTER (section 5.7) because Zadarma documents only registered extensions or static-IP trunks, which also gives far-end BYEs a flow to arrive on; Zadarma recipe with its documented facts and the M1 qualification list.
