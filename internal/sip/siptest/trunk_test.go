@@ -278,3 +278,154 @@ func TestCallerByeIsAnsweredByDialog(t *testing.T) {
 		t.Error("BYE not recorded")
 	}
 }
+
+// capture records every response the client UA receives, at the transport
+// layer (before transaction matching), so tests see exactly what reached it.
+type capture struct {
+	mu   chan struct{}
+	resp []*gosip.Response
+}
+
+func watchResponses(u *sip.UA) *capture {
+	c := &capture{mu: make(chan struct{}, 1)}
+	u.UserAgent().TransportLayer().OnMessage(func(m gosip.Message) {
+		if r, ok := m.(*gosip.Response); ok {
+			c.mu <- struct{}{}
+			c.resp = append(c.resp, r)
+			<-c.mu
+		}
+	})
+	return c
+}
+
+func (c *capture) snapshot() []*gosip.Response {
+	c.mu <- struct{}{}
+	defer func() { <-c.mu }()
+	return append([]*gosip.Response(nil), c.resp...)
+}
+
+func (c *capture) waitFor(t *testing.T, what string, cond func([]*gosip.Response) bool) []*gosip.Response {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if rs := c.snapshot(); cond(rs) {
+			return rs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s; saw %d responses", what, len(c.snapshot()))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func sendInvite(t *testing.T, u *sip.UA, tr *siptest.Trunk) (*sipgo.DialogClientSession, context.Context, context.CancelFunc) {
+	t.Helper()
+	invite := gosip.NewRequest(gosip.INVITE, gosip.Uri{Scheme: "sip", User: "600", Host: "127.0.0.1", Port: int(tr.Addr().Port())})
+	invite.SetTransport(strings.ToUpper(tr.Transport()))
+	invite.AppendHeader(&gosip.ContactHeader{Address: gosip.Uri{Scheme: "sip", User: "siptooth", Host: "127.0.0.1", Port: 9}})
+	invite.AppendHeader(gosip.NewHeader("Content-Type", "application/sdp"))
+	invite.SetBody([]byte(offerSDP))
+	ctx, cancel := context.WithCancel(context.Background())
+	sess, err := u.Dialogs().WriteInvite(ctx, invite)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	return sess, ctx, cancel
+}
+
+func TestCancelIsRecordedAndCrossingAnswerReachesClient(t *testing.T) {
+	for _, transport := range []string{"tcp", "udp"} {
+		t.Run(transport, func(t *testing.T) {
+			tr := siptest.NewTrunk(t, transport)
+			answered := make(chan error, 1)
+			tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+				tx.Respond(gosip.NewResponseFromRequest(req, 180, "Ringing", nil))
+				<-tr.CancelSeen(req) // hold the answer until the CANCEL arrives
+				answered <- tr.RespondRaw(req, 200, "OK", "late-tag", []byte(answerSDP))
+			})
+			lport := 0
+			if transport == "udp" {
+				lport = freePort(t, "udp")
+			}
+			u := newUA(t, tr, lport)
+			seen := watchResponses(u)
+
+			sess, ctx, cancel := sendInvite(t, u, tr)
+			defer cancel()
+			seen.waitFor(t, "180", func(rs []*gosip.Response) bool {
+				for _, r := range rs {
+					if r.StatusCode == 180 {
+						return true
+					}
+				}
+				return false
+			})
+			go func() { sess.WaitAnswer(ctx, sipgo.AnswerOptions{}) }()
+			cancel() // sipgo sends CANCEL
+
+			if _, ok := tr.WaitRequest("CANCEL", 1, 5*time.Second); !ok {
+				t.Fatal("CANCEL never recorded: sipgo answers it inside the transaction layer")
+			}
+			select {
+			case err := <-answered:
+				if err != nil {
+					t.Fatalf("RespondRaw: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("handler never saw the CANCEL")
+			}
+			seen.waitFor(t, "the crossing 200", func(rs []*gosip.Response) bool {
+				for _, r := range rs {
+					if r.StatusCode == 200 && r.CSeq() != nil && r.CSeq().MethodName == gosip.INVITE {
+						if to := r.To(); to != nil {
+							tag, _ := to.Params.Get("tag")
+							return tag == "late-tag"
+						}
+					}
+				}
+				return false
+			})
+		})
+	}
+}
+
+func TestTwoForkedAnswersReachClient(t *testing.T) {
+	for _, transport := range []string{"tcp", "udp"} {
+		t.Run(transport, func(t *testing.T) {
+			tr := siptest.NewTrunk(t, transport)
+			tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+				if err := tr.RespondRaw(req, 200, "OK", "fork-a", []byte(answerSDP)); err != nil {
+					t.Errorf("fork a: %v", err)
+				}
+				if err := tr.RespondRaw(req, 200, "OK", "fork-b", []byte(answerSDP)); err != nil {
+					t.Errorf("fork b: %v", err)
+				}
+			})
+			lport := 0
+			if transport == "udp" {
+				lport = freePort(t, "udp")
+			}
+			u := newUA(t, tr, lport)
+			seen := watchResponses(u)
+			_, _, cancel := sendInvite(t, u, tr)
+			defer cancel()
+
+			rs := seen.waitFor(t, "two 200s", func(rs []*gosip.Response) bool {
+				tags := map[string]bool{}
+				for _, r := range rs {
+					if r.StatusCode == 200 {
+						tag, _ := r.To().Params.Get("tag")
+						tags[tag] = true
+					}
+				}
+				return tags["fork-a"] && tags["fork-b"]
+			})
+			for _, r := range rs {
+				if r.StatusCode == 200 && r.Contact() == nil {
+					t.Error("2xx without Contact")
+				}
+			}
+		})
+	}
+}

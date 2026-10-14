@@ -22,7 +22,8 @@ var crlfPing = []byte("\r\n\r\n")
 // With no open connection to the next hop there is nothing to keep alive and
 // the tick is skipped. A failed write (including one that hits the 5 s write
 // timeout) or a failed next hop lookup is reported once to onFail (which may
-// be nil) and stops the keepalive.
+// be nil) and stops the keepalive. onFail runs on the keepalive goroutine and
+// must not call Close synchronously (Close waits for that goroutine).
 func (u *UA) StartKeepalive(ctx context.Context, every time.Duration, onFail func(error)) {
 	if every <= 0 {
 		return
@@ -35,9 +36,15 @@ func (u *UA) StartKeepalive(ctx context.Context, every time.Duration, onFail fun
 		return
 	}
 	u.cancels = append(u.cancels, cancel)
+	u.loops.Add(1)
 	u.mu.Unlock()
 
-	go keepaliveLoop(ctx, every, func() error { return u.sendKeepalive(ctx) }, onFail)
+	go u.runKeepalive(ctx, every, onFail)
+}
+
+func (u *UA) runKeepalive(ctx context.Context, every time.Duration, onFail func(error)) {
+	defer u.loops.Done()
+	keepaliveLoop(ctx, every, func() error { return u.sendKeepalive(ctx) }, onFail)
 }
 
 func keepaliveLoop(ctx context.Context, every time.Duration, send func() error, onFail func(error)) {

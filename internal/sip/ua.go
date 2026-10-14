@@ -36,10 +36,10 @@ type Options struct {
 	Username  string
 	Password  string
 	UserAgent string // "siptooth/<version>"
-	// TLSConfig nil means system roots and MinVersion TLS 1.2. ServerName
-	// must stay empty: sipgo then sets it from the host of each connection's
-	// destination, so a follow-up connection to a node Contact verifies
-	// against that node's name.
+	// TLSConfig nil means system roots and MinVersion TLS 1.2. Its ServerName
+	// is always cleared: sipgo then sets it from the host of each
+	// connection's destination, so a follow-up connection to a node Contact
+	// verifies against that node's name.
 	TLSConfig *tls.Config
 	Logger    *slog.Logger
 	// Resolver is used for every DNS lookup (sipgo's and ResolveNextHop's).
@@ -62,6 +62,7 @@ type UA struct {
 	mu       sync.Mutex
 	closed   bool
 	cancels  []context.CancelFunc
+	loops    sync.WaitGroup // running keepalive goroutines
 	nextHop  netip.AddrPort // cache for keepalive
 	haveNext bool
 }
@@ -104,6 +105,7 @@ func NewUA(o Options) (*UA, error) {
 		if tlsConf.MinVersion == 0 {
 			tlsConf.MinVersion = tls.VersionTLS12
 		}
+		tlsConf.ServerName = ""
 	}
 
 	// Spec 5.2: every TCP/TLS write is bounded. sipgo copies WriteTimeout
@@ -132,7 +134,10 @@ func NewUA(o Options) (*UA, error) {
 	if o.Transport == "udp" {
 		copts = append(copts, sipgo.WithClientNAT())
 	}
-	if o.LocalPort > 0 {
+	if o.LocalPort > 0 || o.Transport == "udp" {
+		// Bind the UDP socket (and, with LocalPort > 0, TCP/TLS dials) to the
+		// local address the kernel picks toward the next hop, so Via and
+		// Contact never carry 0.0.0.0. Port 0 means ephemeral.
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		hop, err := u.ResolveNextHop(ctx)
 		cancel()
@@ -179,7 +184,9 @@ func (u *UA) Close() error {
 	for _, c := range cancels {
 		c()
 	}
-	return u.ua.Close()
+	err := u.ua.Close() // also unblocks a keepalive stuck in a write
+	u.loops.Wait()
+	return err
 }
 
 // Client is the sipgo client (WithClientNAT for UDP, bound to LocalPort when set).

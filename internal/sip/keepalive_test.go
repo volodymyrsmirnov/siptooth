@@ -107,3 +107,26 @@ func TestWriteKeepaliveErrorsOnClosedConnection(t *testing.T) {
 		t.Error("writeKeepalive on a dead connection returned nil")
 	}
 }
+
+func TestCloseStopsKeepalive(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp")
+	u := newTestUA(t, tr, nil)
+	u.DiscoverContact(context.Background(), tr.URI("600"))
+	u.StartKeepalive(context.Background(), 20*time.Millisecond, nil)
+	waitFor(t, "a keepalive", 2*time.Second, func() bool { return tr.Keepalives() > 0 })
+
+	done := make(chan struct{})
+	go func() {
+		u.Close()
+		u.loops.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("keepalive goroutine still running after Close")
+	}
+	// A keepalive started on a closed UA is a no-op.
+	u.StartKeepalive(context.Background(), 20*time.Millisecond, nil)
+	u.loops.Wait()
+}

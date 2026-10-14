@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,7 +81,7 @@ func TestResolveNextHop(t *testing.T) {
 		t.Errorf("ResolveNextHop = %v, want %v", got, want)
 	}
 
-	lit, err := NewUA(Options{Transport: "udp", NextHop: "[2001:db8::7]:5060"})
+	lit, err := NewUA(Options{Transport: "tcp", NextHop: "[2001:db8::7]:5060"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,16 +348,7 @@ func TestUAExposesComponents(t *testing.T) {
 	}
 }
 
-func contains(s, sub string) bool { return len(sub) == 0 || indexOf(s, sub) >= 0 }
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
+func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
 func freePort(t *testing.T, transport string) int {
 	t.Helper()
@@ -374,4 +366,39 @@ func freePort(t *testing.T, transport string) int {
 	}
 	defer l.Close()
 	return l.Addr().(*net.TCPAddr).Port
+}
+
+func TestUDPViaNeverCarriesWildcardAddress(t *testing.T) {
+	tr := siptest.NewTrunk(t, "udp")
+	u := newTestUA(t, tr, nil) // LocalPort 0: ephemeral port, but a concrete address
+	u.DiscoverContact(context.Background(), tr.URI("600"))
+	opt, ok := tr.WaitRequest("OPTIONS", 1, time.Second)
+	if !ok {
+		t.Fatal("no OPTIONS")
+	}
+	via := opt.Header("Via")
+	if strings.Contains(via, "0.0.0.0") || !strings.Contains(via, "127.0.0.1:") {
+		t.Errorf("Via = %q, want the local address toward the next hop", via)
+	}
+	_, srcPort, _ := net.SplitHostPort(opt.Source)
+	if !strings.Contains(via, ":"+srcPort) || srcPort == "0" {
+		t.Errorf("Via = %q does not carry the real source port %s", via, srcPort)
+	}
+}
+
+func TestServerNameInTLSConfigIsIgnored(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tls")
+	res := siptest.NewResolver(t, map[string]netip.Addr{siptest.HostNode1: netip.MustParseAddr("127.0.0.1")})
+	u := newTestUA(t, tr, func(o *Options) {
+		o.TLSConfig = tr.ClientTLSConfig()
+		o.TLSConfig.ServerName = "wrong.example" // would break every verification
+		o.NextHop = siptest.HostNode1 + ":" + strconv.Itoa(int(tr.Addr().Port()))
+		o.Resolver = res
+	})
+	if _, ok := u.DiscoverContact(context.Background(), "sip:600@"+siptest.HostNode1+";transport=tls"); !ok {
+		t.Fatal("handshake failed: a caller-supplied ServerName leaked through")
+	}
+	if got := tr.ServerNames(); len(got) != 1 || got[0] != siptest.HostNode1 {
+		t.Errorf("SNI = %v, want the destination host", got)
+	}
 }

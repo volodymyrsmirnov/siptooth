@@ -98,6 +98,7 @@ type Trunk struct {
 	handlers map[string]Handler
 	sni      []string
 	dialogs  map[string]*Dialog
+	cancels  map[string]chan struct{} // by Call-ID of INVITEs seen
 }
 
 // serverMethods are the methods routed through the recorder. Anything else
@@ -122,6 +123,7 @@ func NewTrunk(t testing.TB, transport string) *Trunk {
 		transport:       transport,
 		handlers:        make(map[string]Handler),
 		dialogs:         make(map[string]*Dialog),
+		cancels:         make(map[string]chan struct{}),
 	}
 	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
 
@@ -351,6 +353,10 @@ func (tr *Trunk) route(req *sip.Request, tx sip.ServerTransaction) {
 	method := req.Method.String()
 	user := tr.handler(method)
 
+	if req.Method == sip.INVITE && tx != nil {
+		tr.watchCancel(req, tx)
+	}
+
 	switch req.Method {
 	case sip.ACK:
 		// Confirm the dialog first so Accept/RespondSDP return, then let a
@@ -491,4 +497,79 @@ func (d *Dialog) ReInvite(ctx context.Context, sdp []byte) (*sip.Response, error
 		}
 	}
 	return res, nil
+}
+
+// watchCancel hooks CANCEL for a pending INVITE. sipgo's transaction layer
+// answers such a CANCEL itself (200 for the CANCEL, then 487 for the INVITE)
+// and never calls a handler, so the hook is the only place the trunk sees it.
+// The callback runs inside the transaction FSM: it only records and signals.
+func (tr *Trunk) watchCancel(req *sip.Request, tx sip.ServerTransaction) {
+	ch := make(chan struct{})
+	id := ""
+	if h := req.CallID(); h != nil {
+		id = h.Value()
+	}
+	tr.mu.Lock()
+	tr.cancels[id] = ch
+	tr.mu.Unlock()
+	tx.OnCancel(func(cancel *sip.Request) {
+		tr.record(cancel)
+		select {
+		case <-ch:
+		default:
+			close(ch)
+		}
+	})
+}
+
+// CancelSeen returns a channel closed once a CANCEL for this INVITE has
+// arrived (it is also in the request log as "CANCEL"). Use it in an INVITE
+// handler to hold back the answer until the CANCEL crosses it:
+//
+//	<-tr.CancelSeen(req)
+//	tr.RespondRaw(req, 200, "OK", "late-tag", sdp)
+func (tr *Trunk) CancelSeen(req *sip.Request) <-chan struct{} {
+	id := ""
+	if h := req.CallID(); h != nil {
+		id = h.Value()
+	}
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	ch, ok := tr.cancels[id]
+	if !ok {
+		ch = make(chan struct{}) // INVITE not routed yet; never closes
+	}
+	return ch
+}
+
+// WriteResponse writes res straight to the caller (its connection, or the
+// UDP flow), bypassing the server transaction. Unlike tx.Respond it works
+// after the transaction has answered 487 or 200, so a test can send a late
+// 200 or several 2xx for one INVITE.
+func (tr *Trunk) WriteResponse(res *sip.Response) error {
+	return tr.ua.TransportLayer().WriteMsg(res)
+}
+
+// RespondRaw builds a response to req with toTag as the To tag (any code;
+// empty toTag keeps a fresh generated one), adds our Contact to 2xx and a
+// Content-Type for a body, and sends it with WriteResponse. Call it twice
+// with different tags to simulate forked 2xx answers.
+func (tr *Trunk) RespondRaw(req *sip.Request, code int, reason, toTag string, body []byte, headers ...sip.Header) error {
+	res := sip.NewResponseFromRequest(req, code, reason, body)
+	if toTag != "" {
+		if to := res.To(); to != nil {
+			to.Params.Add("tag", toTag)
+		}
+	}
+	for _, h := range headers {
+		res.AppendHeader(h)
+	}
+	if code >= 200 && code < 300 && res.Contact() == nil {
+		c := tr.contact
+		res.AppendHeader(&c)
+	}
+	if len(body) > 0 && res.GetHeader("Content-Type") == nil {
+		res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	}
+	return tr.WriteResponse(res)
 }
