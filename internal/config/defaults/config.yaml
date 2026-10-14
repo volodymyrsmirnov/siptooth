@@ -40,7 +40,7 @@ nat:
   rtp_port_max: 20000
 
 calls:
-  caller_id_wait_ms: 1000      # 0..3000
+  caller_id_wait_ms: 2500      # 0..3000; the Motorola sends +CLIP ~1.05 s after callsetup
   sco_settle_ms: 800           # 0..5000
   media_timeout_seconds: 10    # 5..300
   max_duration_seconds: 0      # 0 = no limit, else 60..86400

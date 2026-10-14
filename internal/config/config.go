@@ -107,7 +107,7 @@ func Default() Config {
 		Media: Media{Codecs: []string{"PCMU", "PCMA"}, JitterMs: 60, SilenceRMS: 200},
 		NAT: NAT{Mode: "auto", StunServers: []string{"stun.l.google.com:19302", "stun.cloudflare.com:3478"},
 			RTPPortMin: 10000, RTPPortMax: 20000},
-		Calls:   Calls{CallerIDWaitMs: 1000, SCOSettleMs: 800, MediaTimeoutSeconds: 10},
+		Calls:   Calls{CallerIDWaitMs: 2500, SCOSettleMs: 800, MediaTimeoutSeconds: 10},
 		Control: Control{Socket: "siptooth.sock"},
 	}
 }

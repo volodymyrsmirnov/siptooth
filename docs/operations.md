@@ -70,7 +70,7 @@ All in `~/.siptooth/config.yaml`; restart after changing (`systemctl --user rest
 | `calls.media_timeout_seconds` (5..300) | 10 | How long without RTP before siptooth hangs up. See "Far-end hang-up delayed". Raise it for a trunk that stops sending during silence. |
 | `calls.sco_settle_ms` (0..5000) | 800 | Pause after the SCO link comes up before audio is bridged. Raise it if the first words of calls are lost or garbled. |
 | `sip.dial_timeout_seconds` (5..120) | 30 | How long the SIP side may ring before siptooth gives up and lets the phone ring. Keep it shorter than the carrier's voicemail timeout. |
-| `calls.caller_id_wait_ms` (0..3000) | 1000 | How long to wait for the caller number after the first ring. Raise it if `caller=withheld` appears for calls that should show a number; `0` dials at once. |
+| `calls.caller_id_wait_ms` (0..3000) | 2500 | How long to wait for the caller number after the first ring. Raise it if `caller=withheld` appears for calls that should show a number; `0` dials at once. |
 | `bluetooth.power_cycle_minutes` | 60 | Idle power cycle of the controller (see below). |
 
 ## NAT modes

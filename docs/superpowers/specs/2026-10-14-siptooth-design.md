@@ -172,7 +172,7 @@ Every call, whatever path it takes, passes through Ending, which emits exactly o
 On `hfp.Ring` while Bluetooth is ready and no call is in progress:
 
 1. Create a call ID (`20261014T094331Z-b5fa`, as in allochka), log `call ringing`.
-2. Wait up to `calls.caller_id_wait_ms` (default 1000) for `hfp.CallerID` if it has not arrived. None by then: the caller is withheld (section 4.6).
+2. Wait up to `calls.caller_id_wait_ms` (default 2500; hardware: the phone sends `+CLIP` with the first `RING`, about 1.05 s after `callsetup`) for `hfp.CallerID` if it has not arrived. None by then: the caller is withheld (section 4.6).
 3. Emit hook `call.ringing`.
 4. Open the RTP socket and pick the advertised addresses (section 7). STUN failure is not fatal (section 7.2).
 5. Build the SDP offer and the INVITE (section 5) and `Start` the attempt. A dial timer of `sip.dial_timeout_seconds` (default 30) starts.
@@ -456,7 +456,7 @@ nat:
   rtp_port_max: 20000
 
 calls:
-  caller_id_wait_ms: 1000      # 0..3000
+  caller_id_wait_ms: 2500      # 0..3000; the Motorola sends +CLIP ~1.05 s after callsetup
   sco_settle_ms: 800           # 0..5000
   media_timeout_seconds: 10    # 5..300
   max_duration_seconds: 0      # 0 = no limit, else 60..86400

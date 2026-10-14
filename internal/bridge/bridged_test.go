@@ -462,7 +462,7 @@ func TestWithheldCaller(t *testing.T) {
 	r := newRig(t, nil).start()
 	r.tel.send(hfp.Ring, "")
 	r.waitArmed(1)
-	r.clock.Advance(time.Second) // no +CLIP
+	r.clock.Advance(time.Duration(r.cfg.Calls.CallerIDWaitMs) * time.Millisecond) // no +CLIP
 	r.waitFor("INVITE", func() bool { return r.sip.starts() == 1 })
 	fc := newFakeCall()
 	r.sip.attempt(0).send(sip.DialResult{Call: fc, Status: 200, Reason: "OK"})

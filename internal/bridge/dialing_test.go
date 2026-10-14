@@ -78,7 +78,8 @@ func TestCallerIDWaitExpires(t *testing.T) {
 	r := newRig(t, nil).start()
 	r.tel.send(hfp.Ring, "")
 	r.waitArmed(1)
-	r.clock.Advance(999 * time.Millisecond)
+	wait := time.Duration(r.cfg.Calls.CallerIDWaitMs) * time.Millisecond
+	r.clock.Advance(wait - time.Millisecond)
 	r.settle()
 	if r.sip.starts() != 0 {
 		t.Fatal("INVITE before the wait expired")

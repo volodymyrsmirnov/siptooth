@@ -426,6 +426,7 @@ type rig struct {
 	log    *syncBuffer
 	cancel context.CancelFunc
 	done   chan error
+	cfg    config.Config
 }
 
 func testConfig() config.Config {
@@ -445,7 +446,7 @@ func newRig(t *testing.T, mutate func(*config.Config)) *rig {
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	r := &rig{t: t, clock: newFakeClock(), tel: newFakeTel(), lis: newFakeListener(), dialer: newFakeDialer(), sip: &fakeSIP{}, hooks: &fakeHooks{}, log: &syncBuffer{}}
+	r := &rig{t: t, clock: newFakeClock(), tel: newFakeTel(), lis: newFakeListener(), dialer: newFakeDialer(), sip: &fakeSIP{}, hooks: &fakeHooks{}, log: &syncBuffer{}, cfg: cfg}
 	n := 0
 	r.c = New(Deps{
 		Config: cfg, SIP: r.sip, Dialer: r.dialer, Hooks: r.hooks, Clock: r.clock,
