@@ -48,6 +48,8 @@ type Playout struct {
 	readPos  int64 // next sample to play
 	writeEnd int64 // one past the highest buffered sample
 	catching bool
+	primed   bool // depth reached the jitter target since the last drain
+	played   bool // a Read has consumed buffered audio; the origin is fixed from then on
 
 	c playoutCounters
 }
@@ -83,8 +85,9 @@ func (p *Playout) SetStartup(on bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.startup = on
-	if on {
-		p.catching = false
+	p.catching = false
+	if !on {
+		p.primed = false // re-prime to the jitter target after startup
 	}
 	p.enforceLimit()
 }
@@ -113,7 +116,7 @@ func (p *Playout) counters() playoutCounters {
 	return p.c
 }
 
-func (p *Playout) idx(off int64) int64 { return off % p.size }
+func (p *Playout) idx(off int64) int64 { return ((off % p.size) + p.size) % p.size }
 
 // clearRange zeroes [from, to) in the ring.
 func (p *Playout) clearRange(from, to int64) {
@@ -134,7 +137,8 @@ func (p *Playout) enforceLimit() {
 }
 
 // Push places pcm at the position given by its RTP timestamp. An SSRC change
-// starts a new epoch that continues after the audio already buffered.
+// starts a new epoch that continues after the audio already buffered (spec 6.3:
+// buffered speech is never overwritten).
 func (p *Playout) Push(ts uint32, ssrc uint32, pcm []int16) {
 	if len(pcm) == 0 {
 		return
@@ -153,6 +157,13 @@ func (p *Playout) Push(ts uint32, ssrc uint32, pcm []int16) {
 		off = p.refOff
 	}
 	p.refTS, p.refOff = ts, off
+
+	// Until playback begins, an earlier timestamp arriving after a later one
+	// (reordering at the start of the stream) moves the origin down instead
+	// of being dropped: spec 6.3, nothing in the startup buffer is lost.
+	if !p.played && off < p.readPos {
+		p.readPos = off
+	}
 
 	end := off + int64(len(pcm))
 	if end <= p.readPos {
@@ -195,16 +206,44 @@ func (p *Playout) rangeFilled(from, to int64) bool {
 }
 
 // Read fills out with the next samples. Missing audio (underrun or a
-// timestamp gap) is silence. The playout point never moves past the newest
-// received sample, so late-arriving audio is not discarded after an underrun.
+// timestamp gap) is silence.
 func (p *Playout) Read(out []int16) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.catchUp()
+	if !p.startup {
+		if !p.primed {
+			if p.played {
+				// Elapsed silence in front of the first buffered audio is not owed.
+				for p.readPos < p.writeEnd && !p.filled[p.idx(p.readPos)] {
+					p.readPos++
+				}
+			}
+			if p.depth() < int64(p.cfg.JitterMs)*samplesPerMilli {
+				clear(out) // priming: wait for the jitter target
+				return
+			}
+			p.primed = true
+		}
+		p.catchUp()
+	}
+	if !p.played && p.readPos < p.writeEnd {
+		p.played = true
+	}
+	// In steady state the playout clock keeps running through underruns and
+	// timestamp gaps, so elapsed silence is never replayed later and packets
+	// arriving past their deadline are late. Startup mode keeps everything and
+	// stays put at the end of the buffered audio.
+	advance := p.played && !p.startup
 	for k := range out {
 		if p.readPos >= p.writeEnd {
 			out[k] = 0
+			if !p.startup {
+				p.primed = false // drained: prime again before resuming
+			}
+			if advance {
+				p.readPos++
+			}
 			continue
 		}
 		i := p.idx(p.readPos)

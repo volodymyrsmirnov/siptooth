@@ -24,6 +24,7 @@ import (
 const (
 	frameSamples = 160
 	maxPacket    = 2048
+	writeTimeout = 100 * time.Millisecond
 )
 
 // Session is one call's RTP socket.
@@ -34,15 +35,22 @@ type Session struct {
 	errCh      chan error
 	readerDone chan struct{}
 	startedCh  chan struct{} // closed by Start
+	barrierCh  chan struct{} // closed when the reader sees Start's marker
 	stopKACh   chan struct{} // closed at Start or Close
 
-	mu       sync.Mutex
-	started  bool
-	closed   bool
-	kaOnce   sync.Once
-	kaDone   chan struct{}
-	pending  map[[12]byte]chan []byte
-	lastSTUN netip.AddrPort
+	sendMu      sync.Mutex // serialises packet construction, seq/ts and the socket write
+	closeDone   chan struct{}
+	closeErr    error
+	mu          sync.Mutex
+	started     bool
+	starting    bool
+	barrier     []byte
+	barrierOnce sync.Once
+	closed      bool
+	kaOnce      sync.Once
+	kaDone      chan struct{}
+	pending     map[[12]byte]chan []byte
+	lastSTUN    netip.AddrPort
 
 	remote  netip.AddrPort // SDP address
 	latched netip.AddrPort
@@ -53,14 +61,14 @@ type Session struct {
 	recvCtx *srtp.Context
 	remKey  []byte
 
-	ssrc     uint32
+	ssrc     uint32 // send state below is guarded by sendMu
 	seq      uint16
 	ts       uint32
 	sentAny  bool
 	pl       *Playout
 	st       Stats
 	hiSeq    uint16
-	seqMask  uint64
+	missing  map[uint16]struct{}
 	haveSeq  bool
 	ssrcRecv uint32
 	lastAcc  time.Time
@@ -99,7 +107,9 @@ func Listen(bind netip.Addr, portMin, portMax int) (*Session, error) {
 		errCh:      make(chan error, 1),
 		readerDone: make(chan struct{}),
 		startedCh:  make(chan struct{}),
+		barrierCh:  make(chan struct{}),
 		stopKACh:   make(chan struct{}),
+		closeDone:  make(chan struct{}),
 		pending:    map[[12]byte]chan []byte{},
 		ssrc:       rand.Uint32(),
 		seq:        uint16(rand.Uint32()),
@@ -126,26 +136,53 @@ func (s *Session) Playout() *Playout {
 // 30-byte key we offered (used to send); m.RemoteKey is used to receive. The
 // playout buffer starts in startup mode.
 func (s *Session) Start(m sdp.Media, localKey []byte, cfg Config) error {
+	var sendCtx, recvCtx *srtp.Context
+	if m.SRTP {
+		var err error
+		if sendCtx, err = newSendContext(localKey); err != nil {
+			return err
+		}
+		if recvCtx, err = newRecvContext(m.RemoteKey); err != nil {
+			return err
+		}
+	}
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
 		return errors.New("rtp: session closed")
 	}
-	if s.started {
+	if s.started || s.starting {
 		s.mu.Unlock()
 		return errors.New("rtp: already started")
 	}
+	s.starting = true
+	var token [16]byte
+	copy(token[:], "siptooth-barrier")
+	for i := 8; i < 16; i++ {
+		token[i] = byte(rand.Uint32())
+	}
+	s.barrier = token[:]
+	s.mu.Unlock()
+
+	// Datagrams queued in the socket before this point must not be accepted.
+	// The reader drops everything until Start activates; the socket queue is
+	// FIFO, so once the reader has seen a marker sent to ourselves now, every
+	// earlier datagram has been read and dropped.
+	if _, err := s.conn.WriteToUDPAddrPort(token[:], s.selfAddr()); err == nil {
+		select {
+		case <-s.barrierCh:
+		case <-time.After(time.Second): // marker lost: best effort
+		}
+	}
+
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return errors.New("rtp: session closed")
+	}
 	if m.SRTP {
-		var err error
-		if s.sendCtx, err = newSendContext(localKey); err != nil {
-			s.mu.Unlock()
-			return err
-		}
-		if s.recvCtx, err = newRecvContext(m.RemoteKey); err != nil {
-			s.sendCtx = nil
-			s.mu.Unlock()
-			return err
-		}
+		s.sendCtx, s.recvCtx = sendCtx, recvCtx
 		s.remKey = append([]byte(nil), m.RemoteKey...)
 	}
 	s.srtpOn = m.SRTP
@@ -158,6 +195,18 @@ func (s *Session) Start(m sdp.Media, localKey []byte, cfg Config) error {
 
 	s.stopKeepalive()
 	return nil
+}
+
+// selfAddr is the address a datagram can be sent to to reach our own socket.
+func (s *Session) selfAddr() netip.AddrPort {
+	a := s.local
+	if a.Addr().IsUnspecified() {
+		if a.Addr().Is4() {
+			return netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), a.Port())
+		}
+		return netip.AddrPortFrom(netip.IPv6Loopback(), a.Port())
+	}
+	return a
 }
 
 func (s *Session) applyMedia(m sdp.Media) {
@@ -193,59 +242,71 @@ func (s *Session) WriteFrame(pcm []int16) error {
 	if len(pcm) != frameSamples {
 		return fmt.Errorf("rtp: frame must be %d samples, got %d", frameSamples, len(pcm))
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.send(g711.Codec(s.sendPT).Encode(pcm))
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.sendLocked(func(c g711.Codec) []byte { return c.Encode(pcm) })
 }
 
 // WriteSilence sends one 20 ms silence packet with the send codec.
 func (s *Session) WriteSilence() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	payload := make([]byte, frameSamples)
-	b := g711.Codec(s.sendPT).SilenceByte()
-	for i := range payload {
-		payload[i] = b
-	}
-	return s.send(payload)
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.sendLocked(func(c g711.Codec) []byte {
+		payload := make([]byte, frameSamples)
+		b := c.SilenceByte()
+		for i := range payload {
+			payload[i] = b
+		}
+		return payload
+	})
 }
 
-// send transmits one packet; s.mu must be held.
-func (s *Session) send(payload []byte) error {
+// sendLocked transmits one packet; s.sendMu must be held. s.mu is held only to
+// snapshot state, never across the socket write, so Close cannot block on a
+// stuck write.
+func (s *Session) sendLocked(payload func(g711.Codec) []byte) error {
+	s.mu.Lock()
 	if !s.started || s.closed {
+		s.mu.Unlock()
 		return errors.New("rtp: session not running")
 	}
 	dst := s.remote
 	if s.latched.IsValid() {
 		dst = s.latched
 	}
+	pt, srtpOn, ctx := s.sendPT, s.srtpOn, s.sendCtx
+	s.mu.Unlock()
+
 	pkt := pionrtp.Packet{
 		Header: pionrtp.Header{
 			Version:        2,
 			Marker:         !s.sentAny,
-			PayloadType:    s.sendPT,
+			PayloadType:    pt,
 			SequenceNumber: s.seq,
 			Timestamp:      s.ts,
 			SSRC:           s.ssrc,
 		},
-		Payload: payload,
+		Payload: payload(g711.Codec(pt)),
 	}
 	raw, err := pkt.Marshal()
 	if err != nil {
 		return fmt.Errorf("rtp: marshal: %w", err)
 	}
-	if s.srtpOn {
-		if raw, err = s.sendCtx.EncryptRTP(nil, raw, nil); err != nil {
+	if srtpOn {
+		if raw, err = ctx.EncryptRTP(nil, raw, nil); err != nil {
 			return fmt.Errorf("rtp: srtp encrypt: %w", err)
 		}
 	}
+	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if _, err := s.conn.WriteToUDPAddrPort(raw, dst); err != nil {
 		return fmt.Errorf("rtp: send: %w", err)
 	}
 	s.sentAny = true
 	s.seq++
 	s.ts += frameSamples
+	s.mu.Lock()
 	s.st.Sent++
+	s.mu.Unlock()
 	return nil
 }
 
@@ -261,19 +322,23 @@ func (s *Session) Stats() Stats {
 	return st
 }
 
-// Close stops the reader and keepalive and closes the socket. Idempotent.
+// Close stops the reader and keepalive and closes the socket. Idempotent;
+// every caller returns only after cleanup has completed.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return nil
+		<-s.closeDone
+		return s.closeErr
 	}
 	s.closed = true
 	s.mu.Unlock()
+	// Close the socket first so blocked reads and writes return, then join.
+	s.closeErr = s.conn.Close()
 	s.stopKeepalive()
-	err := s.conn.Close()
 	<-s.readerDone
-	return err
+	close(s.closeDone)
+	return s.closeErr
 }
 
 func (s *Session) readLoop() {
@@ -299,6 +364,10 @@ func (s *Session) handle(b []byte, src netip.AddrPort) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.started {
+		if s.barrier != nil && string(b) == string(s.barrier) {
+			s.barrierOnce.Do(func() { close(s.barrierCh) })
+			return
+		}
 		if stun.IsSTUN(b) && len(b) >= 20 {
 			var id [12]byte
 			copy(id[:], b[8:20])
@@ -357,32 +426,34 @@ func (s *Session) handle(b []byte, src netip.AddrPort) {
 	}
 }
 
-// trackSeq counts sequence gaps as lost until a reordered packet fills them.
+// trackSeq counts sequence gaps as lost. Only sequence numbers recorded as
+// missing within the last 64 of the current SSRC are un-counted when a
+// reordered packet fills them.
 func (s *Session) trackSeq(ssrc uint32, seq uint16) {
 	if !s.haveSeq || ssrc != s.ssrcRecv {
-		s.haveSeq, s.ssrcRecv, s.hiSeq, s.seqMask = true, ssrc, seq, 1
+		s.haveSeq, s.ssrcRecv, s.hiSeq = true, ssrc, seq
+		s.missing = map[uint16]struct{}{}
 		return
 	}
 	d := int(int16(seq - s.hiSeq))
-	switch {
-	case d > 0:
+	if d > 0 {
 		if d < 1000 {
 			s.st.Lost += uint64(d - 1)
-		}
-		if d >= 64 {
-			s.seqMask = 1
-		} else {
-			s.seqMask = s.seqMask<<uint(d) | 1
-		}
-		s.hiSeq = seq
-	default:
-		i := uint(-d)
-		if i < 64 && s.seqMask&(1<<i) == 0 {
-			s.seqMask |= 1 << i
-			if s.st.Lost > 0 {
-				s.st.Lost--
+			for m := s.hiSeq + 1; m != seq; m++ {
+				s.missing[m] = struct{}{}
 			}
 		}
+		s.hiSeq = seq
+		for m := range s.missing {
+			if s.hiSeq-m >= 64 {
+				delete(s.missing, m)
+			}
+		}
+		return
+	}
+	if _, ok := s.missing[seq]; ok {
+		delete(s.missing, seq)
+		s.st.Lost--
 	}
 }
 
@@ -428,6 +499,7 @@ func (s *Session) stunOnce(dst *net.UDPAddr, timeout time.Duration) (netip.AddrP
 		s.mu.Unlock()
 	}()
 
+	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	if _, err := s.conn.WriteToUDP(msg, dst); err != nil {
 		return netip.AddrPort{}, fmt.Errorf("stun: send to %s: %w", dst, err)
 	}
@@ -494,7 +566,7 @@ func (s *Session) StartSTUNKeepalive(server string, every time.Duration, onChang
 				continue
 			}
 			if prev.IsValid() && ap != prev && onChange != nil {
-				onChange(ap)
+				go onChange(ap) // never block the goroutine Start/Close join
 			}
 		}
 	}()

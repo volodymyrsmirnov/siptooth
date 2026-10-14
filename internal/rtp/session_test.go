@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -144,9 +145,10 @@ func TestQueuedEarlyRTPNotCounted(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		send(t, p, s.LocalAddr(), rtpPacket(0, uint16(i), uint32(i*160), ulaw(160)))
 	}
-	time.Sleep(50 * time.Millisecond)
+	// Start immediately: datagrams already queued in the socket must be
+	// discarded by Start itself, with no reliance on timing.
 	s.Start(media(addrOf(p)), nil, Config{})
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
 	if st := s.Stats(); st.Received != 0 || st.Latched.IsValid() {
 		t.Fatalf("early RTP leaked: %+v", st)
 	}
@@ -567,7 +569,9 @@ func TestConcurrentUse(t *testing.T) {
 			a.WriteFrame(pcm)
 		}
 	}()
+	readerDone := make(chan struct{})
 	go func() {
+		defer close(readerDone)
 		out := make([]int16, 30)
 		for i := 0; i < 500; i++ {
 			b.Playout().Read(out)
@@ -575,5 +579,62 @@ func TestConcurrentUse(t *testing.T) {
 		}
 	}()
 	<-done
+	<-readerDone
 	waitFor(t, "recv", func() bool { return b.Stats().Received > 50 })
+}
+
+func TestLostOnlyExplicitlyMissing(t *testing.T) {
+	s := listen(t)
+	p := peer(t)
+	s.Start(media(addrOf(p)), nil, Config{})
+	for _, seq := range []uint16{100, 102, 99} {
+		send(t, p, s.LocalAddr(), rtpPacket(0, seq, uint32(seq)*160, ulaw(160)))
+	}
+	waitFor(t, "3", func() bool { return s.Stats().Received == 3 })
+	if l := s.Stats().Lost; l != 1 {
+		t.Fatalf("lost = %d, want 1 (seq 101 still missing)", l)
+	}
+}
+
+func TestKeepaliveCallbackMayClose(t *testing.T) {
+	s := listen(t)
+	m1 := netip.MustParseAddrPort("203.0.113.5:4444")
+	m2 := netip.MustParseAddrPort("203.0.113.5:5555")
+	var mu sync.Mutex
+	cur := m1
+	srv, _ := stunServer(t, func() netip.AddrPort { mu.Lock(); defer mu.Unlock(); return cur })
+	if _, err := s.QuerySTUN(addrOf(srv).String(), time.Second, 1); err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	s.StartSTUNKeepalive(addrOf(srv).String(), 20*time.Millisecond, func(netip.AddrPort) {
+		s.Close()
+		close(closed)
+	})
+	mu.Lock()
+	cur = m2
+	mu.Unlock()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deadlock: callback calling Close never returned")
+	}
+}
+
+func TestConcurrentCloseWaits(t *testing.T) {
+	s := listen(t)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.Close()
+			select {
+			case <-s.readerDone:
+			default:
+				t.Error("Close returned before cleanup finished")
+			}
+		}()
+	}
+	wg.Wait()
 }

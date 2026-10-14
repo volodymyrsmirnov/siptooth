@@ -255,9 +255,97 @@ func TestPlayoutUnderrunThenResume(t *testing.T) {
 	}
 	p.Push(0, 1, ramp(0, 160))
 	readN(p, 160)
-	readN(p, 50) // underrun
+	readN(p, 50)                   // underrun
+	p.Push(210, 1, ramp(210, 160)) // the clock ran 50 samples through the underrun
+	if got := readN(p, 160); !equal(got, ramp(210, 160)) {
+		t.Fatal("audio after underrun was lost")
+	}
+}
+
+func TestStartupReorderBeforeOrigin(t *testing.T) {
+	p := NewPlayout(Config{})
+	p.SetStartup(true)
+	p.Push(320, 1, ramp(320, 160))
+	p.Push(160, 1, ramp(160, 160))
+	p.Push(0, 1, ramp(0, 160))
+	if got := readN(p, 480); !equal(got, ramp(0, 480)) {
+		t.Fatal("earlier packets arriving after the first were lost")
+	}
+	if c := p.counters(); c.late != 0 {
+		t.Fatalf("late = %d", c.late)
+	}
+}
+
+func TestUnderrunAdvancesClock(t *testing.T) {
+	p := NewPlayout(Config{SilenceRMS: 0})
+	p.Push(0, 1, ramp(0, 160))
+	readN(p, 160)
+	readN(p, 800)                  // 100 ms of nothing: the clock keeps running
+	p.Push(800, 1, ramp(800, 160)) // missed its slot entirely
+	if c := p.counters(); c.late != 1 {
+		t.Fatalf("late = %d, want 1", c.late)
+	}
+	p.Push(960, 1, ramp(960, 160))
+	if got := readN(p, 160); !equal(got, ramp(960, 160)) {
+		t.Fatal("elapsed silence was replayed after the underrun")
+	}
+}
+
+func TestStartupUnderrunKeepsEverything(t *testing.T) {
+	p := NewPlayout(Config{})
+	p.SetStartup(true)
+	p.Push(0, 1, ramp(0, 160))
+	readN(p, 160)
+	readN(p, 800)
 	p.Push(160, 1, ramp(160, 160))
 	if got := readN(p, 160); !equal(got, ramp(160, 160)) {
-		t.Fatal("audio after underrun was lost")
+		t.Fatal("startup mode dropped audio after an underrun")
+	}
+}
+
+func TestPrimingToJitterTarget(t *testing.T) {
+	p := NewPlayout(Config{JitterMs: 60}) // 480 samples
+	zero := make([]int16, 160)
+	p.Push(0, 1, ramp(0, 160))
+	if got := readN(p, 160); !equal(got, zero) {
+		t.Fatal("played at 20 ms depth")
+	}
+	p.Push(160, 1, ramp(160, 160))
+	if got := readN(p, 160); !equal(got, zero) {
+		t.Fatal("played at 40 ms depth")
+	}
+	p.Push(320, 1, ramp(320, 160))
+	if got := readN(p, 480); !equal(got, ramp(0, 480)) {
+		t.Fatal("did not play once the target was reached")
+	}
+	readN(p, 160) // drain: underrun, clock advances to 640
+	p.Push(640, 1, ramp(640, 160))
+	if got := readN(p, 160); !equal(got, zero) {
+		t.Fatal("did not re-prime after a drain")
+	}
+	p.Push(800, 1, ramp(800, 160))
+	p.Push(960, 1, ramp(960, 160))
+	if got := readN(p, 160); !equal(got, ramp(640, 160)) {
+		t.Fatal("did not resume after re-priming")
+	}
+}
+
+func TestPrimingAfterStartup(t *testing.T) {
+	p := NewPlayout(Config{JitterMs: 60})
+	p.SetStartup(true)
+	p.Push(0, 1, ramp(0, 160))
+	p.SetStartup(false)
+	if got := readN(p, 160); !equal(got, make([]int16, 160)) {
+		t.Fatal("played before reaching the jitter target after startup")
+	}
+}
+
+func TestSSRCChangeAfterRead(t *testing.T) {
+	p := NewPlayout(Config{})
+	p.Push(0, 1, ramp(0, 320))
+	readN(p, 160) // readPos != writeEnd
+	p.Push(5_000_000, 2, ramp(320, 160))
+	if got := readN(p, 320); !equal(got, ramp(160, 320)) {
+		t.Fatal("new SSRC must continue after the unplayed audio")
 	}
 }
