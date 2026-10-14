@@ -308,7 +308,7 @@ The same sipgo `UserAgent` hosts the client and a `sipgo.Server` (handlers `OnBy
   - with SDP whose audio stream offers at least one of our payload types, `sendrecv`, and the same profile and crypto as established: `200 OK` with our SDP (same codecs, o= version incremented). A changed connection address or port is applied through `rtp.Update` after the ACK. A different codec choice than the one in use is not applied; our answer lists only the codec in use, which must be in the re-offer.
   - offerless re-INVITE: `200 OK` carrying our current SDP as an offer; the SDP in the ACK is validated as above and an address change is applied.
   - anything else (`sendonly`/`recvonly`/`inactive` hold, codec set without ours, profile or key change): `488 Not Acceptable Here`; existing media continues.
-  - over UDP the wrapper retransmits the `2xx` (T1 doubling to T2) until the ACK arrives or 32 s pass (then BYE, `signaling_lost`).
+  - on every transport the wrapper retransmits the `2xx` (T1 doubling to T2) until the ACK arrives or 32 s pass (then BYE, `signaling_lost`), per RFC 3261 §13.3.1.4 (a proxy may have a UDP leg).
 - `UPDATE`, `INFO`, `NOTIFY`, `REFER`, `MESSAGE`, `PRACK` → `501 Not Implemented`.
 - Requests that match no dialog (including new INVITEs) → `481` (in-dialog) or `403` (dialog-creating). Siptooth never answers a new incoming SIP call.
 
