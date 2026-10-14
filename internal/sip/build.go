@@ -3,6 +3,7 @@ package sip
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	gosip "github.com/emiago/sipgo/sip"
@@ -53,8 +54,16 @@ func buildInvite(req DialRequest, transport, nextHop, userAgent string) (*gosip.
 	invite.AppendHeader(&gosip.ContactHeader{Address: contact})
 	invite.AppendHeader(gosip.NewHeader("Allow", allowMethods))
 	invite.AppendHeader(gosip.NewHeader("User-Agent", userAgent))
+	names := make([]string, 0, len(req.Headers))
 	for name, value := range req.Headers {
-		invite.AppendHeader(gosip.NewHeader(name, value))
+		if strings.ContainsAny(name+value, "\r\n\x00") || name == "" {
+			return nil, fmt.Errorf("sip: header %q has CR, LF or NUL", name)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		invite.AppendHeader(gosip.NewHeader(name, req.Headers[name]))
 	}
 	ct := gosip.ContentTypeHeader("application/sdp")
 	invite.AppendHeader(&ct)

@@ -400,12 +400,13 @@ func TestDialAbandonBefore1xx(t *testing.T) {
 		t.Run(tp, func(t *testing.T) {
 			tr := siptest.NewTrunk(t, tp)
 			const delay = 120 * time.Millisecond // below sipgo's own 100 Trying at 200 ms
-			var sent180 atomic.Int64
+			var sent180, cancelAt atomic.Int64
 			tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
 				time.Sleep(delay)
 				sent180.Store(time.Now().UnixNano())
 				tx.Respond(gosip.NewResponseFromRequest(req, 180, "Ringing", nil))
 				<-tr.CancelSeen(req)
+				cancelAt.Store(time.Now().UnixNano())
 			})
 			u := newTestUA(t, tr, nil)
 			a := start(t, u, dialRequest(tr, nil))
@@ -416,21 +417,80 @@ func TestDialAbandonBefore1xx(t *testing.T) {
 			if r := result(t, a, 50*time.Millisecond); r.Cause != FailAbandoned {
 				t.Fatalf("result = %+v", r)
 			}
-			time.Sleep(delay / 2)
-			if n := len(tr.RequestsFor("CANCEL")); n != 0 {
-				t.Fatalf("CANCEL sent before any 1xx (RFC 3261 9.1)")
-			}
-			cancelReq, ok := tr.WaitRequest("CANCEL", 1, 5*time.Second)
-			if !ok {
+			if _, ok := tr.WaitRequest("CANCEL", 1, 5*time.Second); !ok {
 				t.Fatal("CANCEL never sent after the 180")
 			}
-			_ = cancelReq
-			if sent180.Load() == 0 {
-				t.Error("CANCEL arrived before the 180 was sent")
+			eventually(t, "the handler to see the CANCEL", func() bool { return cancelAt.Load() != 0 })
+			if cancelAt.Load() < sent180.Load() {
+				t.Error("CANCEL arrived before the 180 was sent (RFC 3261 9.1)")
 			}
 			closeBounded(t, u)
 		})
 	}
+}
+
+func TestDialAbandonAfterChallengeWaitsForRetry1xx(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp")
+	var invites atomic.Int32
+	var sent180, cancelAt atomic.Int64
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		if invites.Add(1) == 1 {
+			tx.Respond(gosip.NewResponseFromRequest(req, 100, "Trying", nil))
+			time.Sleep(50 * time.Millisecond)
+			siptest.Challenge(req, tx, false, testRealm, "n1", false)
+			return
+		}
+		time.Sleep(120 * time.Millisecond) // below sipgo's own 100 Trying
+		sent180.Store(time.Now().UnixNano())
+		tx.Respond(gosip.NewResponseFromRequest(req, 180, "Ringing", nil))
+		<-tr.CancelSeen(req)
+		cancelAt.Store(time.Now().UnixNano())
+	})
+	u := newTestUA(t, tr, withCredentials)
+	a := start(t, u, dialRequest(tr, nil))
+	if _, ok := tr.WaitRequest("INVITE", 2, 5*time.Second); !ok {
+		t.Fatal("no authenticated retry")
+	}
+	a.Abandon() // the retry has had no 1xx yet; the 100 of the first INVITE must not count
+	if r := result(t, a, 50*time.Millisecond); r.Cause != FailAbandoned {
+		t.Fatalf("result = %+v", r)
+	}
+	if _, ok := tr.WaitRequest("CANCEL", 1, 5*time.Second); !ok {
+		t.Fatal("no CANCEL")
+	}
+	eventually(t, "the CANCEL to reach the handler", func() bool { return cancelAt.Load() != 0 })
+	if sent180.Load() == 0 || cancelAt.Load() < sent180.Load() {
+		t.Error("CANCEL of the retried INVITE preceded its first 1xx")
+	}
+	closeBounded(t, u)
+}
+
+func TestDialAbandonedAtChallengeDoesNotRetry(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp")
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		siptest.Challenge(req, tx, false, testRealm, "n1", false)
+	})
+	u := newTestUA(t, tr, withCredentials)
+	var a Attempt
+	var once sync.Once
+	started := make(chan struct{})
+	a = start(t, u, dialRequest(tr, func(r *DialRequest) {
+		r.OnResponse = func(status int, _ string) {
+			if status == 401 {
+				<-started
+				once.Do(func() { a.Abandon() })
+			}
+		}
+	}))
+	close(started)
+	if r := result(t, a, 5*time.Second); r.Cause != FailAbandoned {
+		t.Fatalf("result = %+v", r)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := len(tr.RequestsFor("INVITE")); n != 1 {
+		t.Errorf("%d INVITEs, want 1: an abandoned attempt retried", n)
+	}
+	closeBounded(t, u)
 }
 
 func TestDialAbandonWhileConnecting(t *testing.T) {
@@ -711,6 +771,9 @@ func TestStartValidatesRequest(t *testing.T) {
 		"no contact":    func(r *DialRequest) { r.Contact = "" },
 		"bad from":      func(r *DialRequest) { r.From = "" },
 		"bad transport": func(r *DialRequest) { r.Transport = "sctp" },
+		"header value injection": func(r *DialRequest) {
+			r.Headers = map[string]string{"X-A": "v\r\nEvil: 1"}
+		},
 	} {
 		if _, err := u.Start(dialRequest(tr, mod)); err == nil {
 			t.Errorf("%s: Start succeeded", name)
@@ -972,7 +1035,7 @@ func TestAbandonReturnsImmediately(t *testing.T) {
 				t.Errorf("took %v", d)
 			}
 			// No 1xx ever came, so no CANCEL is allowed yet.
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond) // well below sipgo's own 100 Trying at 200 ms
 			if n := len(tr.RequestsFor("CANCEL")); n != 0 {
 				t.Errorf("%d CANCELs without a provisional response", n)
 			}
@@ -988,7 +1051,8 @@ func TestResultIsSingleUnderConcurrentAbandon(t *testing.T) {
 	u := newTestUA(t, tr, nil)
 	for i := 0; i < 20; i++ {
 		a := start(t, u, dialRequest(tr, nil))
-		go a.Abandon()
+		delay := time.Duration(i%5) * time.Millisecond
+		go func() { time.Sleep(delay); a.Abandon() }()
 		first := result(t, a, 5*time.Second)
 		noSecondResult(t, a)
 		if first.Call != nil {
@@ -999,10 +1063,13 @@ func TestResultIsSingleUnderConcurrentAbandon(t *testing.T) {
 	}
 	closeBounded(t, u)
 	// Every dialog the trunk accepted was ended: ACKs and BYEs balance.
-	acks, byes := len(tr.RequestsFor("ACK")), len(tr.RequestsFor("BYE"))
-	if acks != byes {
-		t.Errorf("%d ACKs but %d BYEs: a dialog was left up", acks, byes)
-	}
+	eventually(t, "ACKs and BYEs to balance", func() bool {
+		acks, byes := len(tr.RequestsFor("ACK")), len(tr.RequestsFor("BYE"))
+		if acks != byes {
+			t.Logf("acks=%d byes=%d", acks, byes)
+		}
+		return acks == byes
+	})
 }
 
 func TestDialLateFork(t *testing.T) {
@@ -1036,4 +1103,102 @@ func TestDialLateFork(t *testing.T) {
 		return false
 	})
 	closeBounded(t, u)
+}
+
+func TestCallUsesEffectiveTransportForKeepalive(t *testing.T) {
+	old := callKeepaliveEvery
+	callKeepaliveEvery = 100 * time.Millisecond
+	t.Cleanup(func() { callKeepaliveEvery = old })
+
+	tr := siptest.NewTrunk(t, "tcp")
+	accepted := make(chan *gosip.Request, 1)
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		if _, err := tr.Accept(req, tx, answerBody()); err == nil {
+			accepted <- req
+		}
+	})
+	// The UA is configured for UDP; this one call goes over TCP.
+	u := newTestUA(t, tr, func(o *Options) { o.Transport = "udp" })
+	r := result(t, start(t, u, dialRequest(tr, func(d *DialRequest) {
+		d.Transport = "tcp"
+		d.NextHop = tr.HostPort()
+	})), 5*time.Second)
+	if r.Call == nil {
+		t.Fatalf("result = %+v", r)
+	}
+	eventually(t, "keepalive pings on the TCP connection", func() bool { return tr.Keepalives() >= 2 })
+	if !tr.CloseConnection(<-accepted) {
+		t.Fatal("no connection to close")
+	}
+	select {
+	case c := <-r.Call.Ended():
+		if c != TransportLost {
+			t.Errorf("Ended = %q", c)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no TransportLost")
+	}
+}
+
+// routedAnswer returns the headers of a 2xx from a far end behind two
+// record-routing proxies and a Contact that differs from the target.
+func routedAnswer(tr *siptest.Trunk) (contact string, rr []string, hdrs []gosip.Header) {
+	base := fmt.Sprintf("%s;transport=%s", tr.HostPort(), tr.Transport())
+	contact = "sip:peer@" + base
+	rr = []string{"<sip:rr1@" + base + ";lr>", "<sip:rr2@" + base + ";lr>"}
+	hdrs = []gosip.Header{
+		gosip.NewHeader("Contact", "<"+contact+">"),
+		gosip.NewHeader("Record-Route", rr[0]),
+		gosip.NewHeader("Record-Route", rr[1]),
+	}
+	return
+}
+
+// checkRouted asserts a request was addressed to the 2xx Contact and carries
+// the Record-Route set reversed (UAC, RFC 3261 12.1.2).
+func checkRouted(t *testing.T, what string, r siptest.Request, contact string, rr []string) {
+	t.Helper()
+	if !strings.Contains(r.RequestURI, "peer@") {
+		t.Errorf("%s Request-URI = %q, want the 2xx Contact %s", what, r.RequestURI, contact)
+	}
+	routes := r.HeaderAll("Route")
+	if len(routes) != 2 || !strings.Contains(routes[0], "rr2@") || !strings.Contains(routes[1], "rr1@") {
+		t.Errorf("%s Route = %q, want rr2 then rr1", what, routes)
+	}
+}
+
+func TestDialDialogRequestsUseContactAndRecordRoute(t *testing.T) {
+	for _, tp := range []string{"udp", "tcp"} {
+		t.Run(tp, func(t *testing.T) {
+			tr := siptest.NewTrunk(t, tp)
+			tr.OnBye(byeOK)
+			contact, rr, hdrs := routedAnswer(tr)
+			tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+				tr.RespondRaw(req, 200, "OK", "fork-a", answerBody(), hdrs...)
+				time.Sleep(300 * time.Millisecond)
+				tr.RespondRaw(req, 200, "OK", "fork-b", answerBody(), hdrs...)
+			})
+			u := newTestUA(t, tr, nil)
+			r := result(t, start(t, u, dialRequest(tr, nil)), 5*time.Second)
+			if r.Call == nil {
+				t.Fatalf("result = %+v", r)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// Wait for the fork's cleanup first, then hang up the main call.
+			eventually(t, "fork BYE", func() bool { return len(tr.RequestsFor("BYE")) >= 1 })
+			if err := r.Call.Hangup(ctx); err != nil {
+				t.Fatalf("Hangup: %v", err)
+			}
+			eventually(t, "two ACKs and two BYEs", func() bool {
+				return len(tr.RequestsFor("ACK")) >= 2 && len(tr.RequestsFor("BYE")) >= 2
+			})
+			for _, q := range tr.RequestsFor("ACK") {
+				checkRouted(t, "ACK "+q.Header("To"), q, contact, rr)
+			}
+			for _, q := range tr.RequestsFor("BYE") {
+				checkRouted(t, "BYE "+q.Header("To"), q, contact, rr)
+			}
+		})
+	}
 }

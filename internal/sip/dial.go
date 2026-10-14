@@ -67,6 +67,8 @@ type Attempt interface {
 	Abandon()
 }
 
+var errAbandonedAtChallenge = errors.New("sip: abandoned before the authenticated retry")
+
 // bye/ACK cleanup after an unwanted 2xx is bounded by this (spec 5.3).
 const cleanupTimeout = 5 * time.Second
 
@@ -125,6 +127,24 @@ func (u *UA) Start(req DialRequest) (Attempt, error) {
 		return nil, errors.New("sip: user agent closed")
 	}
 	return a, nil
+}
+
+// forgetLater drops the attempt from the registry after registryLinger. The
+// timer is tracked so Close can stop it.
+func (u *UA) forgetLater(callID string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.closed {
+		return
+	}
+	var t *time.Timer
+	t = time.AfterFunc(registryLinger, func() {
+		u.mu.Lock()
+		delete(u.timers, t)
+		delete(u.attempts, callID)
+		u.mu.Unlock()
+	})
+	u.timers[t] = struct{}{}
 }
 
 func (u *UA) forget(callID string) {
@@ -213,7 +233,7 @@ func (a *attempt) run() {
 	defer a.setupCancel()
 	defer a.waitCancel()
 	// A late 2xx of a fork still needs routing for one transaction lifetime.
-	defer func() { time.AfterFunc(registryLinger, func() { u.forget(a.callID) }) }()
+	defer u.forgetLater(a.callID)
 
 	LogMessage(u.log, "send", a.invite)
 	sess, err := u.dialogs.WriteInvite(a.setupCtx, a.invite)
@@ -247,13 +267,24 @@ func (a *attempt) onResponse(res *gosip.Response) error {
 	if f := a.req.OnResponse; f != nil {
 		f(res.StatusCode, res.Reason)
 	}
-	if res.IsProvisional() {
+	switch {
+	case res.IsProvisional():
 		a.mu.Lock()
 		a.seen1xx = true
 		if a.abandoned {
 			a.waitCancel() // the first 1xx after Abandon: CANCEL now
 		}
 		a.mu.Unlock()
+	case isChallenge(res) && a.hasCredentials():
+		// sipgo re-sends the INVITE as a new transaction. Provisionals of
+		// the old one do not allow a CANCEL of the new one (RFC 3261 9.1),
+		// and an abandoned attempt must not retry at all.
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if a.abandoned {
+			return errAbandonedAtChallenge
+		}
+		a.seen1xx = false
 	}
 	return nil
 }
@@ -294,7 +325,7 @@ func (a *attempt) answered(sess *sipgo.DialogClientSession, res *gosip.Response,
 	a.cleanup(a.decide(toTag(res)))
 
 	status, reason := res.StatusCode, res.Reason
-	c := newCall(a.u, sess, a.req.Offer)
+	c := newCall(a.u, sess, a.req.Offer, strings.ToLower(a.invite.Transport()))
 
 	if werr != nil || a.isAbandoned() {
 		// Crossed a CANCEL, or abandoned: nobody wants this dialog.
@@ -312,7 +343,7 @@ func (a *attempt) answered(sess *sipgo.DialogClientSession, res *gosip.Response,
 	}
 	if err := sess.Ack(a.u.bgCtx); err != nil {
 		a.publish(DialResult{Cause: FailError, Status: status, Reason: "ack_failed", Err: fmt.Errorf("sip: send ACK: %w", err)})
-		a.byeOnly(c)
+		a.byeDirect(c, sess)
 		return
 	}
 	c.setAnswer(media, status, reason, res)
@@ -331,9 +362,23 @@ func (a *attempt) answered(sess *sipgo.DialogClientSession, res *gosip.Response,
 func (a *attempt) ackAndBye(sess *sipgo.DialogClientSession, c *call) {
 	if err := sess.Ack(a.u.bgCtx); err != nil {
 		a.u.log.Debug("ACK for discarded answer failed", "error", err)
+		a.byeDirect(c, sess)
 		return
 	}
 	a.byeOnly(c)
+}
+
+// byeDirect ends a dialog whose ACK could not be written: sipgo's WriteBye
+// refuses to run unless the dialog is Confirmed, so the BYE is built here.
+func (a *attempt) byeDirect(c *call, sess *sipgo.DialogClientSession) {
+	c.hangingUp.Store(true)
+	c.finish()
+	ctx, cancel := context.WithTimeout(a.u.bgCtx, cleanupTimeout)
+	defer cancel()
+	bye := buildBye(a.invite, sess.InviteResponse, true, a.u.opts.UserAgent)
+	if err := a.u.sendBye(ctx, bye); err != nil {
+		a.u.log.Debug("BYE without ACK failed", "error", err)
+	}
 }
 
 func (a *attempt) byeOnly(c *call) {

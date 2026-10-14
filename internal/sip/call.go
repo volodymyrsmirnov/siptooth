@@ -39,9 +39,11 @@ type Call interface {
 }
 
 type call struct {
-	u     *UA
-	sess  *sipgo.DialogClientSession
-	offer sdp.Offer
+	u         *UA
+	sess      *sipgo.DialogClientSession
+	offer     sdp.Offer
+	transport string // effective transport of this call, lower case
+	byeSeen   atomic.Bool
 
 	mu     sync.Mutex
 	media  sdp.Media
@@ -60,11 +62,12 @@ type call struct {
 	hangErr   error
 }
 
-func newCall(u *UA, sess *sipgo.DialogClientSession, offer sdp.Offer) *call {
+func newCall(u *UA, sess *sipgo.DialogClientSession, offer sdp.Offer, transport string) *call {
 	c := &call{
 		u:            u,
 		sess:         sess,
 		offer:        offer,
+		transport:    transport,
 		mediaUpdates: make(chan sdp.Media, 4),
 		ended:        make(chan EndCause, 1),
 		hangDone:     make(chan struct{}),
@@ -72,10 +75,20 @@ func newCall(u *UA, sess *sipgo.DialogClientSession, offer sdp.Offer) *call {
 	c.ctx, c.stop = context.WithCancel(u.bgCtx)
 	// A BYE read by the server handler ends the dialog from outside.
 	sess.OnState(func(s gosip.DialogState) {
-		if s == gosip.DialogStateEnded && !c.hangingUp.Load() {
+		if s != gosip.DialogStateEnded || c.hangingUp.Load() {
+			return
+		}
+		// sipgo also ends a dialog on local failures (ACK write error,
+		// retransmitted ACK failing): only a received BYE is RemoteBye.
+		if c.byeSeen.Load() {
 			c.end(RemoteBye)
+		} else {
+			c.end(TransportLost)
 		}
 	})
+	u.mu.Lock()
+	u.calls[sess] = c
+	u.mu.Unlock()
 	return c
 }
 
@@ -103,6 +116,7 @@ func (c *call) LastStatus() (int, string) {
 
 // end reports cause once and stops the keepalive.
 func (c *call) end(cause EndCause) {
+	c.finish()
 	select {
 	case c.ended <- cause:
 	default:
@@ -110,11 +124,19 @@ func (c *call) end(cause EndCause) {
 	c.stop()
 }
 
+// finish stops the keepalive and drops the call from the UA's BYE routing.
+func (c *call) finish() {
+	c.stop()
+	c.u.mu.Lock()
+	delete(c.u.calls, c.sess)
+	c.u.mu.Unlock()
+}
+
 // start begins the signaling keepalive for connection-oriented transports
 // (spec 5.5): a failed ping means the connection the far end would use for
 // in-dialog requests is gone.
 func (c *call) start() {
-	if c.u.transport == "udp" || c.u.callKeepalive <= 0 {
+	if c.transport == "udp" || c.u.callKeepalive <= 0 {
 		return
 	}
 	c.mu.Lock()
@@ -122,7 +144,7 @@ func (c *call) start() {
 	c.mu.Unlock()
 	c.u.spawn(func() {
 		keepaliveLoop(c.ctx, c.u.callKeepalive,
-			func() error { return c.u.pingConnection(hop) },
+			func() error { return c.u.pingConnection(c.transport, hop) },
 			func(error) { c.end(TransportLost) })
 	})
 }
@@ -132,14 +154,14 @@ var errConnectionGone = errors.New("sip: signaling connection is gone")
 // pingConnection writes a CRLF ping on the pooled connection to remote. A
 // call's connection missing from the pool counts as a failure, unlike the
 // idle keepalive of StartKeepalive.
-func (u *UA) pingConnection(remote string) error {
-	conn, err := u.ua.TransportLayer().GetConnection(u.transport, remote)
+func (u *UA) pingConnection(transport, remote string) error {
+	conn, err := u.ua.TransportLayer().GetConnection(transport, remote)
 	if err != nil || conn == nil {
 		return errConnectionGone
 	}
 	defer conn.TryClose()
 	var raddr netip.AddrPort
-	if u.transport == "udp" {
+	if transport == "udp" {
 		raddr, _ = netip.ParseAddrPort(remote)
 	}
 	return writeKeepalive(conn, raddr)
@@ -163,7 +185,7 @@ func (c *call) Hangup(ctx context.Context) error {
 
 func (c *call) bye(ctx context.Context) error {
 	c.hangingUp.Store(true)
-	c.stop()
+	c.finish()
 	if c.sess.LoadState() == gosip.DialogStateEnded {
 		return nil // the far end already hung up
 	}
@@ -190,6 +212,14 @@ func (c *call) bye(ctx context.Context) error {
 // a dialog siptooth created (spec 5.6) and ACK. Everything else is Task 11's.
 func (u *UA) installHandlers() {
 	u.server.OnBye(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		if sess, err := u.dialogs.MatchRequestDialog(req); err == nil {
+			u.mu.Lock()
+			c := u.calls[sess]
+			u.mu.Unlock()
+			if c != nil {
+				c.byeSeen.Store(true)
+			}
+		}
 		err := u.dialogs.ReadBye(req, tx)
 		if err == nil {
 			return

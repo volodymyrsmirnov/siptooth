@@ -70,9 +70,11 @@ type UA struct {
 	mu       sync.Mutex
 	closed   bool
 	cancels  []context.CancelFunc
-	loops    sync.WaitGroup      // running keepalive and cleanup goroutines
-	attempts map[string]*attempt // INVITE attempts by Call-ID (see dial.go)
-	nextHop  netip.AddrPort      // cache for keepalive
+	loops    sync.WaitGroup           // running keepalive and cleanup goroutines
+	attempts map[string]*attempt      // INVITE attempts by Call-ID (see dial.go)
+	timers   map[*time.Timer]struct{} // registry linger timers, stopped by Close
+	calls    map[*sipgo.DialogClientSession]*call
+	nextHop  netip.AddrPort // cache for keepalive
 	haveNext bool
 }
 
@@ -141,6 +143,8 @@ func NewUA(o Options) (*UA, error) {
 		opts: o, transport: o.Transport, log: log, resolver: resolver, ua: sua,
 		callKeepalive: callKeepaliveEvery,
 		attempts:      make(map[string]*attempt),
+		timers:        make(map[*time.Timer]struct{}),
+		calls:         make(map[*sipgo.DialogClientSession]*call),
 	}
 	u.bgCtx, u.bgCancel = context.WithCancel(context.Background())
 
@@ -218,6 +222,10 @@ func (u *UA) Close() error {
 	u.bgCancel()
 	cancels := u.cancels
 	u.cancels = nil
+	for t := range u.timers {
+		t.Stop()
+	}
+	u.timers = nil
 	u.mu.Unlock()
 	for _, c := range cancels {
 		c()
