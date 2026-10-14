@@ -46,6 +46,7 @@ func (c *Coordinator) onTelBridged(call *activeCall, ev hfp.Event) {
 	if ev.Kind != hfp.CallEnded {
 		return
 	}
+	call.cellularEnded = true
 	if call.draining {
 		// The far end hung up first; the phone call is over as well.
 		c.finish(call, endSpec{outcome: OutcomeCompleted, hangupBy: HangupFarEnd, farEndGone: true})

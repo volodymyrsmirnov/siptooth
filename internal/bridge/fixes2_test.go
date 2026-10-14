@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/hfp"
+	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
 
@@ -77,6 +78,9 @@ func TestRingEndsCallWaitingAfterSetupCleared(t *testing.T) {
 	r.tel.send(hfp.Ring, "")
 	r.tel.send(hfp.CallerID, "+380509999999")
 	r.waitFor("second INVITE", func() bool { return r.sip.starts() == 2 })
+	if from := r.sip.req(1).From; !strings.Contains(from, "380509999999") {
+		t.Errorf("second call From = %q, want the new caller ID", from)
+	}
 	ended := r.hooks.named("call.ended")
 	if len(ended) != 1 || ended[0].ID != "call-1" || ended[0].Outcome != OutcomeCallerAbandoned || ended[0].HangupBy != HangupCaller {
 		t.Fatalf("ended = %+v", ended)
@@ -104,4 +108,40 @@ func TestPumpPanicIsMediaError(t *testing.T) {
 		t.Errorf("ended = %+v", e)
 	}
 	r.wantHangups(fc, 1, 1)
+}
+
+// The cellular call is confirmed over: a late ATA result must not send CHUP,
+// which could hit a later outgoing call of the owner.
+func TestNoLateWindowAfterCallEnded(t *testing.T) {
+	r := newRig(t, noMediaTimeout)
+	r.tel.gate, r.tel.ignoreCtx = make(chan struct{}), true
+	release := sync.OnceFunc(func() { close(r.tel.gate) })
+	t.Cleanup(release)
+	r.start()
+	fc, _ := r.bridge()
+	r.tel.send(hfp.CallEnded, "")
+	e := r.waitEnded()
+	if e.Outcome != OutcomeCompleted {
+		t.Fatalf("ended = %+v", e)
+	}
+	release() // the ATA completes late
+	r.settle()
+	r.wantHangups(fc, 1, 0)
+}
+
+// A CLIP never ends a call.
+func TestCLIPAfterSetupClearedAndCallActiveContinues(t *testing.T) {
+	r := newRig(t, noMediaTimeout).start()
+	fc := r.answer()
+	r.tel.send(hfp.CallSetupCleared, "")
+	r.callActive()
+	r.tel.send(hfp.CallerID, "+380501111111")
+	r.settle()
+	if r.c.Status().State != "answering" {
+		t.Fatalf("state %s", r.c.Status().State)
+	}
+	a, _ := sco.NewPipe(60)
+	r.lis.links <- a
+	r.waitState("bridged")
+	r.wantHangups(fc, 0, 0)
 }

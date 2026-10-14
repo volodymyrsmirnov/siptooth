@@ -444,7 +444,7 @@ func (c *Coordinator) onTel(ctx context.Context, ev hfp.Event) {
 	case hfp.Disconnected:
 		c.dropPhone()
 	case hfp.Ring:
-		if call := c.cur; call != nil && call.state == stateAnswering && call.setupCleared {
+		if call := c.cur; call != nil && call.state == stateAnswering && call.setupCleared && !call.callActive {
 			// The old call only waits out its CallActive window; a new ring
 			// means that call is over, and a later CallActive is the new one's.
 			c.d.Logger.Info("new ring ends the abandoned call", "call_id", call.id)

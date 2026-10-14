@@ -188,11 +188,6 @@ func (c *Coordinator) onAnswerResult(m msg) {
 
 func (c *Coordinator) onTelAnswering(call *activeCall, ev hfp.Event) {
 	switch ev.Kind {
-	case hfp.CallerID:
-		if call.setupCleared {
-			// +CLIP of a new ring: the old call is over.
-			c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
-		}
 	case hfp.CallActive:
 		if call.callActive {
 			return
@@ -210,6 +205,7 @@ func (c *Coordinator) onTelAnswering(call *activeCall, ev hfp.Event) {
 		// CallActive window decides.
 		call.setupCleared = true
 	case hfp.CallEnded:
+		call.cellularEnded = true
 		c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
 	}
 }
