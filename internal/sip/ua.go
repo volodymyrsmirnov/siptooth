@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/sipgo"
@@ -66,6 +67,15 @@ type UA struct {
 	bgCancel context.CancelFunc
 	// callKeepalive is the CRLF ping interval of an established TCP/TLS call.
 	callKeepalive time.Duration
+	// idleKeepalive is the registration's CRLF interval between calls.
+	idleKeepalive time.Duration
+	// regRetry is the wait before a failed REGISTER is retried.
+	regRetry time.Duration
+	// reinviteT1/T2/AckTimeout drive the 2xx retransmission of a re-INVITE
+	// over UDP (RFC 3261 13.3.1.4); only tests change them.
+	reinviteT1, reinviteT2, reinviteAckTimeout time.Duration
+	// reg is the active registration, if any (see register.go).
+	reg atomic.Pointer[Registration]
 
 	mu       sync.Mutex
 	closed   bool
@@ -142,9 +152,15 @@ func NewUA(o Options) (*UA, error) {
 	u := &UA{
 		opts: o, transport: o.Transport, log: log, resolver: resolver, ua: sua,
 		callKeepalive: callKeepaliveEvery,
-		attempts:      make(map[string]*attempt),
-		timers:        make(map[*time.Timer]struct{}),
-		calls:         make(map[*sipgo.DialogClientSession]*call),
+		idleKeepalive: idleKeepaliveEvery,
+		regRetry:      registerRetryEvery,
+		reinviteT1:    500 * time.Millisecond,
+		reinviteT2:    4 * time.Second,
+
+		reinviteAckTimeout: 32 * time.Second,
+		attempts:           make(map[string]*attempt),
+		timers:             make(map[*time.Timer]struct{}),
+		calls:              make(map[*sipgo.DialogClientSession]*call),
 	}
 	u.bgCtx, u.bgCancel = context.WithCancel(context.Background())
 

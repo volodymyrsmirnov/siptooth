@@ -92,6 +92,8 @@ type Trunk struct {
 	closers   []io.Closer
 
 	keepalives atomic.Int64
+	rawMu      sync.Mutex
+	rawMsgs    []string
 
 	mu       sync.Mutex
 	requests []Request
@@ -273,8 +275,43 @@ func (tr *Trunk) Keepalives() int { return int(tr.keepalives.Load()) }
 func (tr *Trunk) readFilter(_ sip.TransportReadProps, data []byte) ([]byte, error) {
 	if len(data) > 0 && len(bytes.Trim(data, "\r\n")) == 0 {
 		tr.keepalives.Add(1)
+	} else if bytes.HasPrefix(data, []byte("SIP/2.0 ")) {
+		tr.rawMu.Lock()
+		tr.rawMsgs = append(tr.rawMsgs, string(data))
+		tr.rawMu.Unlock()
 	}
 	return data, nil
+}
+
+// RawResponses returns every response datagram or stream chunk the trunk
+// read, in order, as received (so retransmitted 2xx show up as copies).
+func (tr *Trunk) RawResponses() []string {
+	tr.rawMu.Lock()
+	defer tr.rawMu.Unlock()
+	return append([]string(nil), tr.rawMsgs...)
+}
+
+// SendRequest sends an out-of-dialog request with the given method to uri and
+// returns the final response. The trunk's own UDP socket is the source, so
+// over UDP the target sees the same address as for every other trunk request.
+func (tr *Trunk) SendRequest(ctx context.Context, method, uri string, body []byte, headers ...sip.Header) (*sip.Response, error) {
+	var target sip.Uri
+	if err := sip.ParseUri(uri, &target); err != nil {
+		return nil, err
+	}
+	req := sip.NewRequest(sip.RequestMethod(method), target)
+	req.SetTransport(strings.ToUpper(tr.transport))
+	from := &sip.FromHeader{Address: sip.Uri{Scheme: "sip", User: "trunk", Host: "127.0.0.1"}}
+	from.Params.Add("tag", sip.GenerateTagN(8))
+	req.AppendHeader(from)
+	for _, h := range headers {
+		req.AppendHeader(h)
+	}
+	if len(body) > 0 {
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		req.SetBody(body)
+	}
+	return tr.client.Do(ctx, req)
 }
 
 // On registers h for method (any method name, upper case). It replaces a
@@ -474,6 +511,91 @@ func (d *Dialog) Bye(ctx context.Context) error { return d.sess.Bye(ctx) }
 // for the final response and ACKs it when it is a 2xx. The response is
 // returned so tests can inspect the answer SDP.
 func (d *Dialog) ReInvite(ctx context.Context, sdp []byte) (*sip.Response, error) {
+	return d.reInvite(ctx, sdp, true, nil)
+}
+
+// ReInviteNoAck sends a re-INVITE and returns its final response without
+// sending the ACK, so the caller must retransmit the 2xx.
+func (d *Dialog) ReInviteNoAck(ctx context.Context, sdp []byte) (*sip.Response, error) {
+	return d.reInvite(ctx, sdp, false, nil)
+}
+
+// ReInviteOfferless sends an offerless re-INVITE and ACKs the 2xx with ackSDP
+// (the answer to the caller's offer).
+func (d *Dialog) ReInviteOfferless(ctx context.Context, ackSDP []byte) (*sip.Response, error) {
+	return d.reInvite(ctx, nil, true, ackSDP)
+}
+
+// Ack sends the ACK for the last re-INVITE sent with ReInviteNoAck,
+// optionally with an SDP body.
+func (d *Dialog) Ack(sdp []byte) error {
+	inv := d.sess.InviteRequest
+	contact := inv.Contact()
+	if contact == nil {
+		return errors.New("siptest: INVITE has no Contact")
+	}
+	ack := sip.NewRequest(sip.ACK, contact.Address)
+	ack.SetTransport(inv.Transport())
+	if len(sdp) > 0 {
+		ack.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		ack.SetBody(sdp)
+	}
+	return d.sess.WriteRequest(ack)
+}
+
+// Trunk is the trunk this dialog belongs to.
+func (d *Dialog) Trunk() *Trunk { return d.tr }
+
+// ReInviteCSeq sends a re-INVITE with an explicit CSeq (sipgo would pick the
+// next one) and ACKs a 2xx.
+func (d *Dialog) ReInviteCSeq(ctx context.Context, cseq uint32, sdp []byte) (*sip.Response, error) {
+	inv := d.sess.InviteRequest
+	contact := inv.Contact()
+	if contact == nil {
+		return nil, errors.New("siptest: INVITE has no Contact")
+	}
+	req := sip.NewRequest(sip.INVITE, contact.Address)
+	req.SetTransport(inv.Transport())
+	from := d.sess.InviteResponse.To().AsFrom()
+	req.AppendHeader(&from)
+	to := inv.From().AsTo()
+	req.AppendHeader(&to)
+	req.AppendHeader(sip.HeaderClone(inv.CallID()))
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: cseq, MethodName: sip.INVITE})
+	maxFwd := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&maxFwd)
+	c := d.tr.contact
+	req.AppendHeader(&c)
+	if sdp != nil {
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		req.SetBody(sdp)
+	}
+	if d.tr.ReuseConnection {
+		req.SetDestination(inv.Source())
+	}
+	res, err := d.tr.client.Do(ctx, req, sipgo.ClientRequestAddVia)
+	if err != nil {
+		return nil, err
+	}
+	if res.IsSuccess() {
+		ack := sip.NewRequest(sip.ACK, contact.Address)
+		ack.SetTransport(inv.Transport())
+		ack.AppendHeader(&from)
+		ack.AppendHeader(&to)
+		ack.AppendHeader(sip.HeaderClone(inv.CallID()))
+		ack.AppendHeader(&sip.CSeqHeader{SeqNo: cseq, MethodName: sip.ACK})
+		ack.AppendHeader(&maxFwd)
+		if d.tr.ReuseConnection {
+			ack.SetDestination(inv.Source())
+		}
+		if err := d.tr.client.WriteRequest(ack, sipgo.ClientRequestAddVia); err != nil {
+			return res, fmt.Errorf("siptest: send ACK: %w", err)
+		}
+	}
+	return res, nil
+}
+
+func (d *Dialog) reInvite(ctx context.Context, sdp []byte, ack bool, ackSDP []byte) (*sip.Response, error) {
 	inv := d.sess.InviteRequest
 	contact := inv.Contact()
 	if contact == nil {
@@ -489,10 +611,14 @@ func (d *Dialog) ReInvite(ctx context.Context, sdp []byte) (*sip.Response, error
 	if err != nil {
 		return nil, err
 	}
-	if res.IsSuccess() {
-		ack := sip.NewRequest(sip.ACK, contact.Address)
-		ack.SetTransport(inv.Transport())
-		if err := d.sess.WriteRequest(ack); err != nil {
+	if res.IsSuccess() && ack {
+		ackReq := sip.NewRequest(sip.ACK, contact.Address)
+		ackReq.SetTransport(inv.Transport())
+		if len(ackSDP) > 0 {
+			ackReq.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			ackReq.SetBody(ackSDP)
+		}
+		if err := d.sess.WriteRequest(ackReq); err != nil {
 			return res, fmt.Errorf("siptest: send ACK: %w", err)
 		}
 	}

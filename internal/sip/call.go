@@ -46,10 +46,15 @@ type call struct {
 	byeSeen   atomic.Bool
 
 	mu     sync.Mutex
-	media  sdp.Media
+	media  sdp.Media // current remote media; offer.Version counts our answers (server.go)
 	status int
 	reason string
 	hop    string // remote address of the connection that carried the 2xx
+
+	// In-dialog re-INVITE state (server.go).
+	remoteCSeq uint32 // highest CSeq of a far-end re-INVITE
+	haveCSeq   bool
+	pendingAck *reinvitePending
 
 	mediaUpdates chan sdp.Media
 	ended        chan EndCause
@@ -206,31 +211,4 @@ func (c *call) bye(ctx context.Context) error {
 		return err
 	}
 	return u.byeResult(ctx, bye, res)
-}
-
-// installHandlers registers the far-end requests this layer answers: BYE for
-// a dialog siptooth created (spec 5.6) and ACK. Everything else is Task 11's.
-func (u *UA) installHandlers() {
-	u.server.OnBye(func(req *gosip.Request, tx gosip.ServerTransaction) {
-		if sess, err := u.dialogs.MatchRequestDialog(req); err == nil {
-			u.mu.Lock()
-			c := u.calls[sess]
-			u.mu.Unlock()
-			if c != nil {
-				c.byeSeen.Store(true)
-			}
-		}
-		err := u.dialogs.ReadBye(req, tx)
-		if err == nil {
-			return
-		}
-		if errors.Is(err, sipgo.ErrDialogDoesNotExists) || errors.Is(err, sipgo.ErrDialogOutsideDialog) {
-			if rerr := tx.Respond(gosip.NewResponseFromRequest(req, gosip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)); rerr != nil {
-				u.log.Debug("481 for unknown BYE failed", "error", rerr)
-			}
-			return
-		}
-		u.log.Debug("BYE handling failed", "error", err)
-	})
-	u.server.OnAck(func(*gosip.Request, gosip.ServerTransaction) {})
 }
