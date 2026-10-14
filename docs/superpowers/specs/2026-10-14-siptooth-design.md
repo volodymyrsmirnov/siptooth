@@ -1,10 +1,10 @@
 # Siptooth — Design Specification
 
 **Date:** 2026-10-14
-**Status:** Draft for review
+**Status:** Draft for review (revision 2: findings from Fable 5.1, gpt-6.1-sol and gpt-6-astra merged; see Appendix A)
 **Predecessor:** allochka (`~/Projects/Personal/allochka`), spec `docs/superpowers/specs/2026-10-04-allochka-design.md`. Allochka is retired once siptooth is proven on real calls.
 
-Siptooth turns an Android phone that stays at home into a SIP trunk endpoint. A Raspberry Pi 5 acts as a Bluetooth hands-free unit for the phone, exactly as allochka does. When the phone rings, siptooth places a SIP call to a configured target (a PBX, a SIP trunk, or an AI voice platform such as ElevenLabs Agents), answers the phone only once the far end answers, and bridges the audio both ways until either side hangs up. Siptooth has no AI, no conversation logic, no web UI and no call store.
+Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspberry Pi 5 acts as a Bluetooth hands-free unit for the phone, exactly as allochka does. When the phone rings, siptooth places a SIP call to one configured target, answers the phone only once the far end answers, and bridges the audio both ways until either side hangs up. Siptooth has no AI, no conversation logic, no web UI and no call store.
 
 ## 1. Goals, non-goals, success criteria
 
@@ -12,23 +12,23 @@ Siptooth turns an Android phone that stays at home into a SIP trunk endpoint. A 
 
 - Keep allochka's proven Bluetooth layer: BlueZ over D-Bus, HFP hands-free AT protocol, SCO audio, in-app pairing, adapter power cycling, `doctor`, `install`.
 - Forward every incoming call on the phone to one configured SIP target, with caller ID passed through.
-- Work from a home network behind NAT (STUN required).
-- Work with any standards-based SIP trunk or PBX; ElevenLabs Agents SIP trunking and the owner's existing PBX are the two targets tested for v1.
-- Shell hooks on call lifecycle events, so later work (for example a script that accepts OpenAI SIP calls) can attach without changing siptooth.
+- Work from a home network behind NAT, toward targets on the internet (STUN) and on the LAN.
+- Two **qualified** v1 targets: the owner's existing PBX (Asterisk/PJSIP-class, on the LAN) and ElevenLabs Agents SIP trunking. Other standards-based trunks are best effort; siptooth is a deliberately small UAC, not a general-purpose softphone.
+- Shell hooks on call lifecycle events, so later work (for example a separate service that accepts OpenAI SIP calls) can attach without changing siptooth.
 
 **Non-goals (v1)**
 
-- OpenAI Realtime SIP (needs a public webhook and an `accept` API call per call; a later, separate component).
-- Calls from SIP to the phone (outbound calls through the phone), SIP registration, receiving unsolicited INVITEs.
+- OpenAI Realtime SIP (needs a public webhook and an `accept` call per call; a later, separate component).
+- Calls from SIP to the phone, SIP REGISTER, answering unsolicited INVITEs, accepting inbound TCP/TLS connections.
 - Call waiting, hold, transfer (REFER), conferencing, multiple phones, multiple targets or routing rules.
 - Recording, call store, transcripts, web UI, metrics endpoint.
-- Wideband (mSBC / G.722), Opus, ICE, TURN, DTLS-SRTP, RTCP, RFC 4733 DTMF events.
+- Wideband (mSBC / G.722), Opus, ICE, TURN, DTLS-SRTP, RTCP, RFC 4733 DTMF events, SIP UPDATE, codec or key renegotiation mid-call.
 - Live config reload (restart to apply).
 
 **Success criteria**
 
-1. A call to the phone reaches the configured PBX extension with two-way audio, caller ID visible on the PBX, and hang-up propagating in both directions.
-2. The same works against an ElevenLabs agent: the agent greets the caller and the caller hears the whole greeting.
+1. A call to the phone reaches the configured PBX extension with two-way audio, caller ID visible on the PBX, and hang-up propagating in both directions within 2 s.
+2. The same works against an ElevenLabs agent: the agent greets the caller, the caller hears the whole greeting, and an agent-side hang-up reaches the caller within 2 s (or within `calls.media_timeout_seconds` if M1 shows ElevenLabs cannot reach siptooth's connection; section 5.5).
 3. When the SIP target is unreachable, rejects, or does not answer, the phone keeps ringing as if siptooth were not there (the caller never hears silence or an error from siptooth).
 4. Runs unattended for a week behind a home NAT without a restart.
 
@@ -39,15 +39,16 @@ Siptooth turns an Android phone that stays at home into a SIP trunk endpoint. A 
 | Language / build | Go, single binary `siptooth`, `CGO_ENABLED=0`, module `github.com/volodymyrsmirnov/siptooth`, `go 1.24` directive (Raspberry Pi OS trixie ships Go 1.24), built on the Pi. |
 | Code origin | New repository. Allochka's hardware packages are copied in (not shared as a module) and trimmed; allochka is retired afterwards, so the copies never need to stay in sync. |
 | Bluetooth | Unchanged from allochka: BlueZ 5.82 via D-Bus, app-owned HFP AT protocol over RFCOMM, CVSD narrowband SCO (16-bit PCM, 8 kHz), Broadcom routing check, periodic adapter power cycle. |
-| SIP signaling | `github.com/emiago/sipgo` (pure Go; UDP, TCP, TLS; digest auth). Siptooth is a user agent client only: one outgoing INVITE per incoming phone call. No REGISTER. |
-| Media | Own small RTP layer: one UDP socket per call, G.711 PCMU or PCMA, 20 ms packets, packet structs from `github.com/pion/rtp`. Optional SRTP (SDES, `AES_CM_128_HMAC_SHA1_80`) via `github.com/pion/srtp/v3`. |
-| NAT | STUN (`github.com/pion/stun`) on the RTP socket before every INVITE; the mapped address goes into the SDP. Static `public_ip` override and a configurable RTP port range for port forwarding. Symmetric RTP (send from the port we receive on). |
-| Answer policy | SIP first: on ring, dial immediately; answer the phone (`ATA`) only after the far end sends `200 OK`. Any SIP failure leaves the phone ringing. No answer delay. |
-| Audio path | No resampling: SCO PCM16 8 kHz ↔ G.711 8 kHz. No echo gate, no processing. |
-| Observability | Structured logs to the journal (`log/slog`, text handler). Shell hooks on `call.ringing`, `call.connected`, `call.ended`, `system.error`. No call store. |
+| SIP signaling | `github.com/emiago/sipgo` **v1.6.0** (pure Go; UDP, TCP, TLS; digest auth), wrapped by `internal/sip`, which owns the INVITE transaction outcome (section 5.3). UAC only: one INVITE per incoming phone call. No REGISTER. |
+| Media | Own small RTP layer on one UDP socket per call: G.711 PCMU/PCMA, 20 ms transmit packets, packet structs from `github.com/pion/rtp` **v1.10.5**. Optional SDES-SRTP (`AES_CM_128_HMAC_SHA1_80`) via `github.com/pion/srtp/v3` **v3.1.3**. |
+| STUN | Hand-rolled Binding Request/Response (RFC 5389, XOR-MAPPED-ADDRESS only, about 100 lines in `internal/stun`) on the RTP socket. No STUN module. |
+| NAT | Per call, the advertised address depends on the destination: LAN targets get the local interface address, internet targets the STUN-mapped (or configured public) address. Symmetric RTP with latching. TCP/TLS signaling connection kept open with keepalives for the whole dialog. |
+| Answer policy | SIP first: on ring, dial immediately; answer the phone (`ATA`) only after the far end's `2xx`. Any SIP failure leaves the phone ringing. No answer delay. |
+| Audio path | No resampling: SCO PCM16 8 kHz ↔ G.711 8 kHz. No echo gate, no processing. Startup audio buffered losslessly; latency recovered by dropping silence only. |
+| Observability | `log/slog` to the journal. Shell hooks on `call.ringing`, `call.connected`, `call.ended`, `system.error`. No call store. |
 | Config | YAML at `~/.siptooth/config.yaml`, validated at startup; secrets in `~/.siptooth/env` (0600). Restart to reload. |
 | Service | systemd **user** unit, runs as the current user (in group `bluetooth`), everything under `~/.siptooth/`. |
-| Dependencies | `godbus/dbus/v5`, `golang.org/x/sys`, `gopkg.in/yaml.v3` (from allochka) plus `emiago/sipgo`, `pion/rtp`, `pion/srtp/v3`, `pion/stun`. No others without the owner's approval. `coder/websocket` is dropped. |
+| Dependencies | Direct: `godbus/dbus/v5`, `golang.org/x/sys`, `gopkg.in/yaml.v3` (from allochka), `emiago/sipgo` v1.6.0, `pion/rtp` v1.10.5, `pion/srtp/v3` v3.1.3, pinned. Their transitive modules are accepted. No other direct dependency without the owner's approval. `coder/websocket` is dropped. The resolved graph must build with Go 1.24 (`make check`). |
 | Calls | One at a time. Call waiting is never answered (allochka's HFP latch). |
 
 ## 3. Architecture
@@ -61,12 +62,12 @@ Caller ──PSTN──▶ Android phone (HFP Audio Gateway)
  │                    │      ▲                                        │
  │  sco ─────────▶ media pump ◀── G.711 ──▶ rtp ────(S)RTP/UDP──────▶ │
  │                    │                      ▲                        │
- │                    ├─▶ hooks (sh -c)     stun (public mapping)     │
+ │                    ├─▶ hooks (sh -c)     stun (mapping, keepalive) │
  │                    └─▶ control (Unix socket, status for the CLI)   │
  └────────────────────────────────────────────────────────────────────┘
 ```
 
-One daemon owns the HFP profile, the SCO socket, and the SIP user agent. CLI subcommands talk to it over the control socket (`status`) or run standalone (`pair`, `doctor`, `install`, `sip test`, `hooks test`, `config check`).
+One daemon owns the HFP profile, the SCO socket and the SIP user agent. CLI subcommands talk to it over the control socket (`status`) or run standalone (`pair`, `doctor`, `install`, `sip test`, `hooks test`, `config check`).
 
 ### 3.1 Repository layout
 
@@ -80,20 +81,20 @@ internal/
   daemon/     # copied + trimmed: composition root, Bluetooth session glue, power cycle
   doctor/     # copied + trimmed: setup checks; new SIP/STUN/TLS reachability checks
   host/       # copied: command runner, systemd user unit template
-  hooks/      # copied + trimmed: runner (sh, timeout, process group, bounded output); new payloads
+  hooks/      # copied + trimmed: single-worker dispatcher, runner (sh, timeout, process group); new payloads
   control/    # copied + trimmed: HTTP over Unix socket, status only
   cli/        # copied + trimmed: run, pair, doctor, install, status, config, hooks, sip test, version
   config/     # new schema, same loading/validation style
   g711/       # μ-law (copied from allochka audio) + A-law (new)
-  sdp/        # new: build offer, parse answer (one audio stream)
-  rtp/        # new: socket, packetize/depacketize, SRTP wrap, jitter buffer
-  stun/       # new: binding request on the RTP socket
-  sip/        # new: sipgo wrapper: Dial, Cancel, Bye, in-dialog request handling
+  sdp/        # new: build offer, parse/validate answer and re-offers (one audio stream)
+  rtp/        # new: socket, latching, packetize/depacketize, SRTP, startup + jitter buffer
+  stun/       # new: Binding Request encode, response decode, address selection
+  sip/        # new: sipgo wrapper: Dial (INVITE ownership), Hangup, in-dialog server, keepalive
   bridge/     # new: call coordinator state machine + media pump
   defaults/   # embedded example config.yaml
   buildinfo/  # copied
 config/hooks/ # example hook scripts
-docs/         # setup.md, operations.md, hooks.md, providers.md
+docs/         # setup.md, operations.md, hooks.md, providers.md (PBX and ElevenLabs recipes)
 ```
 
 Dropped from allochka: `realtime`, `prompt`, `library`, `summary`, `web`, `store`, `export`, `probe`, `audio` (except μ-law), `call` (replaced by `bridge`).
@@ -106,7 +107,7 @@ Linux-only code stays behind `//go:build linux` with `_other.go` stubs, so `go t
 // hfp (unchanged from allochka)
 type Client interface {
     Events() <-chan Event   // Connected, Ring, CallerID, CallActive, CallEnded, CallSetupCleared, Disconnected
-    Answer(ctx) error       // ATA, 3 s deadline
+    Answer(ctx) error       // ATA, 3 s deadline; ErrNotSent / ErrTimeout / ERROR distinguished (section 4.4)
     Hangup(ctx) error       // AT+CHUP, 3 s deadline
     Close() error
 }
@@ -118,28 +119,31 @@ type Dialer interface { Dial(ctx, adapter, remote string) (Link, error) }
 
 // sip
 type Dialer interface {
-    // Dial sends the INVITE and returns once a final response arrives, ctx ends (CANCEL sent),
-    // or the transport fails. On 2xx the ACK has been sent and the Call is established.
-    Dial(ctx context.Context, req DialRequest) (Call, error)   // error carries *Rejected{Status, Reason} or a transport error
+    // Start sends the INVITE and returns immediately. Results arrive on Attempt.Result.
+    Start(req DialRequest) (Attempt, error)
 }
-type DialRequest struct { Target, From, DisplayName string; Headers map[string]string; Offer sdp.Offer }
+type Attempt interface {
+    Result() <-chan DialResult      // exactly one value: Answered(Call) or Failed(cause, status, reason)
+    Abandon()                       // CANCEL now or after the first 1xx; any 2xx that still arrives is ACKed and BYEd
+}
+type DialRequest struct { Target, From, DisplayName, Contact string; Headers map[string]string; Offer sdp.Session }
 type Call interface {
-    Answer() sdp.Answer             // the negotiated remote media
-    Updates() <-chan sdp.Answer     // re-INVITE/UPDATE with changed remote media
-    Done() <-chan struct{}          // far end sent BYE or the dialog died
-    Hangup(ctx context.Context) error   // BYE
+    Remote() sdp.Media                          // negotiated remote media
+    MediaUpdates() <-chan sdp.Media             // accepted re-INVITE address changes (section 5.6)
+    Ended() <-chan EndCause                     // RemoteBye | TransportLost
+    Hangup(ctx context.Context) error           // BYE, authenticated if challenged; bounded by ctx
     SIPCallID() string
 }
 
 // rtp
 type Session interface {
-    LocalAddr() netip.AddrPort                 // bound address
-    PublicAddr() netip.AddrPort                // STUN-mapped or configured public address
-    Start(remote netip.AddrPort, codec g711.Codec, keys *srtp.Keys) error
-    SetRemote(remote netip.AddrPort)           // re-INVITE
-    WriteFrame(pcm []int16) error              // exactly 160 samples (20 ms)
-    ReadInto(jb *JitterBuffer)                 // receive loop feeds the jitter buffer
-    Stats() Stats                              // packets sent/received/lost/late, last packet time
+    PublicAddr() netip.AddrPort                 // advertised address (section 7)
+    Start(remote sdp.Media, keys *SRTPKeys) error   // enables send + latching; early packets before Start are dropped
+    Update(remote sdp.Media)                    // re-INVITE address change
+    WriteFrame(pcm []int16) error               // exactly 160 samples (20 ms)
+    Playout() *Playout                          // startup buffer + jitter buffer (section 6.3)
+    Stats() Stats                               // sent, received, lost, late, duplicate, discarded_silence, srtp_fail, last_rx
+    Err() <-chan error                          // fatal socket errors
     Close() error
 }
 
@@ -154,63 +158,97 @@ type Dispatcher interface { Emit(event string, payload any) }   // asynchronous,
 ### 4.1 States
 
 ```
-Idle ──Ring──▶ Dialing ──200 OK──▶ Answering ──SCO up──▶ Bridged ──hang-up──▶ Ending ──▶ Idle
-                 │                    │                                   ▲
-                 └─ failure ──▶ Idle   └─ failure ──▶ Ending ─────────────┘
+Idle ──Ring──▶ Dialing ──2xx──▶ Answering ──SCO up──▶ Bridged ──end──▶ Ending ──▶ Idle
+                  │                 │                                    ▲
+                  └──── failure ────┴────────────────────────────────────┘
 ```
 
-**Idle → Dialing.** On `hfp.Ring` while Bluetooth is ready and no call is in progress:
+Every call, whatever path it takes, passes through Ending, which emits exactly one `call.ended`. Each call carries a generation number; late results (an AT response, a SIP result, a timer) that belong to an earlier generation or arrive after Ending started are logged and discarded.
 
-1. Create a call ID (`20261014T094331Z-b5fa`, as in allochka), log `call.ringing`.
-2. Wait up to `calls.caller_id_wait_ms` (default 1000) for `hfp.CallerID` if it has not arrived yet. No caller ID by then: the caller is withheld.
+**Ownership rule (from allochka):** siptooth sends `AT+CHUP` only for a phone call it answered itself (`ATA` sent and `CallActive` observed after it). A call the owner answered on the handset is never touched.
+
+### 4.2 Idle → Dialing
+
+On `hfp.Ring` while Bluetooth is ready and no call is in progress:
+
+1. Create a call ID (`20261014T094331Z-b5fa`, as in allochka), log `call ringing`.
+2. Wait up to `calls.caller_id_wait_ms` (default 1000) for `hfp.CallerID` if it has not arrived. None by then: the caller is withheld (section 4.6).
 3. Emit hook `call.ringing`.
-4. Open the RTP socket (section 6.1) and run STUN (section 7). A STUN failure is not fatal: siptooth uses `nat.public_ip` if set, otherwise the local address, and logs a warning.
-5. Build the SDP offer and the INVITE (section 5) and dial with a context bounded by `sip.dial_timeout_seconds` (default 30).
+4. Open the RTP socket and pick the advertised addresses (section 7). STUN failure is not fatal (section 7.2).
+5. Build the SDP offer and the INVITE (section 5) and `Start` the attempt. A dial timer of `sip.dial_timeout_seconds` (default 30) starts.
 
-If Bluetooth is not ready when the phone rings, siptooth does nothing: the phone rings normally. One log line, no hook.
+If Bluetooth is not ready when the phone rings, siptooth does nothing: the phone rings normally. One log line, no hook, no `call.ended`.
 
-**Dialing.** Events and outcomes:
+### 4.3 Dialing
+
+While dialing, a STUN Binding Request is re-sent from the RTP socket every 10 s to keep the NAT mapping alive through the ring (internet targets only; section 7.2).
 
 | Event | Action | Outcome |
 | --- | --- | --- |
-| 1xx | log (status, reason) | — |
-| 2xx with acceptable SDP | ACK (sipgo), go to Answering | — |
-| 2xx with unacceptable SDP (no common codec, SRTP mismatch, no audio stream, port 0) | ACK, BYE, phone keeps ringing | `sip_media_failed` |
-| 3xx–6xx final | phone keeps ringing | `sip_rejected` (status code recorded) |
-| dial timeout | CANCEL, phone keeps ringing | `sip_timeout` |
-| DNS / connect / TLS / auth failure | phone keeps ringing | `sip_error` |
-| `hfp.CallSetupCleared` (caller gave up, or owner rejected on the handset) | CANCEL | `caller_abandoned` |
-| `hfp.CallActive` (the owner answered on the handset; siptooth has not sent `ATA` yet) | CANCEL, never touch the call | `owner_answered` |
-| `hfp.Disconnected` | CANCEL | `bluetooth_lost` |
+| 1xx | log status; any early-media RTP is dropped | — |
+| `Answered` with acceptable SDP (validated in `internal/sip` before reporting, section 6.4) | go to Answering | — |
+| `Failed`: SDP answer unacceptable (the wrapper ACKs and BYEs) | phone keeps ringing | `sip_media_failed` |
+| `Failed`: final 3xx–6xx | phone keeps ringing | `sip_rejected` (status recorded; 3xx not followed) |
+| `Failed`: DNS, connect, TLS, auth | phone keeps ringing | `sip_error` (detail recorded) |
+| dial timer fires | `Abandon` | `sip_timeout` |
+| `hfp.CallSetupCleared` (caller gave up, or owner rejected) | `Abandon` | `caller_abandoned` |
+| `hfp.CallActive` (siptooth has not sent `ATA`: the owner answered on the handset) | `Abandon`, never touch the phone call | `owner_answered` |
+| `hfp.Disconnected` | `Abandon` | `bluetooth_lost` |
+| SIGTERM | `Abandon` | `shutdown` |
 
-A `2xx` that crosses an already sent CANCEL is ACKed and immediately BYEd (RFC 3261 §9.1); the outcome stays the one that caused the CANCEL. Redirects (3xx) are not followed.
+`Abandon` returns at once; the bridge goes to Ending without waiting for the INVITE transaction, which `internal/sip` finishes in the background (section 5.3).
 
-**Answering.** Right after the ACK:
+### 4.4 Answering
 
-1. Start the RTP session toward the remote address from the SDP answer. Siptooth sends 20 ms silence packets every 20 ms from now on (keeps the NAT mapping open and satisfies endpoints that expect media). Received audio goes into the jitter buffer (section 6.3) and waits there.
-2. Send `ATA`. `ATA` error or timeout: let the next indicator decide, as allochka does; no `CallActive` within 5 s → BYE the SIP call; outcome `answer_failed`; the phone is left ringing (or ends if the caller gave up).
-3. On `CallActive`, accept the SCO link (the in-band ringing backlog is drained, as in allochka); no SCO within 2 s → dial SCO; no SCO within 5 s of `CallActive` → `AT+CHUP` and BYE; outcome `answer_failed`.
+Right after `Answered`:
+
+1. `rtp.Start`: siptooth sends 20 ms silence packets every 20 ms from now on (PCMU `0xFF`, PCMA `0xD5` payloads), which keeps the NAT mapping open and lets the far end latch. Received audio goes into the startup buffer (section 6.3).
+2. Send `ATA` asynchronously. Its result, as in allochka (`internal/call/coordinator.go` around line 853):
+   - `OK` → wait for `CallActive` up to 5 s.
+   - `ErrTimeout` after the command was sent → ambiguous; wait for `CallActive` up to 5 s and let the indicator decide.
+   - `ERROR`, `ErrNotSent`, `ErrClosed` → definite failure: BYE, outcome `answer_failed`, the phone is left alone (still ringing, or ending).
+3. `CallActive` (after `ATA` was sent) → the call is siptooth's. Accept the SCO link (the in-band ringing backlog is drained first, as in allochka; up to `maxDrainFrames` 8192, enough for a 30 s ring). No SCO within 2 s → dial SCO. No SCO within 5 s of `CallActive` → `AT+CHUP` + BYE, outcome `answer_failed`.
 4. SCO up → Bridged. Emit hook `call.connected`.
 
-**Bridged.** The media pump (section 6.2) runs. The call ends on the first of:
+Termination events during Answering:
+
+| Event | Before `CallActive` | After `CallActive` (SCO not yet up) |
+| --- | --- | --- |
+| far-end BYE / transport lost | leave the phone (it rings on, `ATA` result is ignored if late); outcome `far_end_ended` | `AT+CHUP`; outcome `far_end_ended` |
+| `hfp.CallSetupCleared` with `call` = 0 | BYE; `caller_abandoned` | — (not emitted while active) |
+| `hfp.CallEnded` | — | BYE; `caller_abandoned` |
+| `hfp.Disconnected` | BYE; `bluetooth_lost` | BYE; `bluetooth_lost` |
+| no `CallActive` within 5 s | BYE; `answer_failed`; phone left alone | — |
+| SIGTERM | BYE; `shutdown` | BYE + `AT+CHUP`; `shutdown` |
+
+If `ATA` was sent and the call then ended on the SIP side before `CallActive`, a `CallActive` that still arrives within 5 s means siptooth's `ATA` answered the phone call: siptooth sends `AT+CHUP` so the caller is not left in silence (the call is siptooth's by the ownership rule).
+
+### 4.5 Bridged
+
+The media pump (section 6.2) runs. The call ends on the first of:
 
 | Trigger | Action | `hangup_by` | Outcome |
 | --- | --- | --- | --- |
-| `hfp.CallEnded` or SCO EOF | BYE | `caller` | `completed` |
-| SIP BYE from far end (`Call.Done`) | `AT+CHUP` | `far_end` | `completed` |
-| No RTP received for `calls.media_timeout_seconds` (default 30) | BYE, `AT+CHUP` | `siptooth` | `media_timeout` |
-| `calls.max_duration_seconds` reached (default 0 = no limit) | BYE, `AT+CHUP` | `siptooth` | `max_duration` |
+| `hfp.CallEnded` | BYE | `caller` | `completed` |
+| far-end BYE (`Ended` = `RemoteBye`) | play out buffered downlink audio (at most 3 s), then `AT+CHUP` | `far_end` | `completed` |
+| SIP transport lost (`Ended` = `TransportLost`) | `AT+CHUP` | `siptooth` | `signaling_lost` |
+| no RTP received for `calls.media_timeout_seconds` (default 10) | BYE, `AT+CHUP` | `siptooth` | `media_timeout` |
+| SCO EOF, or no SCO read for 5 s, and no `CallEnded` within 1.5 s | BYE only, **no `AT+CHUP`** (the owner may have moved audio to the handset; the cellular call continues there) | `siptooth` | `audio_lost` |
+| `calls.max_duration_seconds` reached (default 0 = off) | BYE, `AT+CHUP` | `siptooth` | `max_duration` |
 | `hfp.Disconnected` | BYE | `siptooth` | `bluetooth_lost` |
-| Daemon shutdown (SIGTERM) | BYE, `AT+CHUP` | `siptooth` | `shutdown` |
+| fatal RTP socket error | BYE, `AT+CHUP` | `siptooth` | `media_error` |
+| SIGTERM | BYE, `AT+CHUP` | `siptooth` | `shutdown` |
 
-SCO EOF alone is not trusted as a hang-up for the first 2 s after it, matching allochka: handsets often drop SCO just before reporting the end of the call. If `CallEnded` does not follow within 2 s, siptooth hangs up both sides with outcome `completed`, `hangup_by: caller`.
+The SCO-loss grace (1.5 s) and the no-CHUP rule are allochka's (`scoLossGrace`, coordinator.go:71 and :1096).
 
-**Ending.** Close RTP and SCO, wait at most 3 s for BYE/CHUP responses, log the call summary line, emit hook `call.ended`, return to Idle. Every call path ends with exactly one `call.ended` (including failures in Dialing), so hooks can count missed forwards.
+### 4.6 Ending
 
-### 4.2 Caller ID handling
+Close RTP and SCO; BYE and `AT+CHUP` each run with their own 3 s bound (BYE in the background via `internal/sip`, never blocking Idle). Log the summary line, emit `call.ended`, return to Idle. A ring that arrives while the previous call's background SIP cleanup is still running starts a new call normally.
+
+### 4.7 Caller ID handling
 
 - `+CLIP` number, trimmed. Type 145 (international) without a leading `+` gets one. Characters other than `+0123456789*#` are removed.
-- Empty after cleaning, or no `+CLIP` within the wait: withheld. Placeholder `{caller}` then expands to `sip.anonymous_user` (default `anonymous`) and the hook payload has `"caller": null, "caller_withheld": true`.
+- Empty after cleaning, or no `+CLIP` within the wait: withheld. `{caller}` then expands to `sip.anonymous_user` (default `anonymous`); the hook payload has `"caller": null, "caller_withheld": true`.
 
 ## 5. SIP signaling
 
@@ -218,61 +256,90 @@ SCO EOF alone is not trusted as a hang-up for the first 2 s after it, matching a
 
 Template strings (`sip.target`, `sip.from`, `sip.display_name`, values of `sip.headers`) may contain:
 
-- `{caller}`: cleaned caller number (section 4.2), or `sip.anonymous_user`.
+- `{caller}`: cleaned caller number (section 4.7), or `sip.anonymous_user`.
 - `{number}`: the phone's own number from `phone.number` (static config; HFP `AT+CNUM` is unreliable on Android and not used).
+- `{call_id}`: siptooth's call ID (for correlation, e.g. `X-CALL-ID`).
 
-Unknown placeholders fail config validation. Expanded values contain only `+0-9*#` or the configured anonymous user (validated as a SIP user token), so no escaping is needed.
+Unknown placeholders fail config validation. Expansion is component-aware: in a URI user part, characters outside RFC 3261 `user` unreserved/escaped set are percent-encoded (`#` → `%23`); in a display name the value is quoted; in header values CR, LF and NUL are rejected at validation and cannot appear after expansion.
 
 ### 5.2 The INVITE
 
-- **Request-URI and To:** `sip.target`, e.g. `sip:{number}@sip.rtc.elevenlabs.io;transport=tls` or `sip:600@pbx.home.arpa`.
-- **Transport:** `sip.transport` (`udp` | `tcp` | `tls`, default `tls`); it must match `;transport=` in the target when that parameter is present (validation). Destination host and port come from `sip.proxy` (`host:port`) when set, otherwise from the target URI host with the transport default port (5060 UDP/TCP, 5061 TLS). DNS: A/AAAA only; NAPTR/SRV are not resolved (set `sip.proxy` for SRV-only domains).
+- **Request-URI and To:** `sip.target`, a `sip:` URI (not `sips:`; use `;transport=tls`), e.g. `sip:{number}@sip.rtc.elevenlabs.io;transport=tls` or `sip:600@192.168.1.10`.
+- **Transport:** `sip.transport` (`udp` | `tcp` | `tls`, default `tls`); must agree with a `;transport=` parameter in the target. Next hop: `sip.proxy` (`host:port`) when set, otherwise the target host and its explicit port, otherwise the transport default (5060 / 5061). DNS: A/AAAA via sipgo (IPv4 preferred); no NAPTR/SRV (use `sip.proxy` for SRV-only domains).
 - **From:** `sip.from` (default `sip:{caller}@<target host>`) with `sip.display_name` (default `{caller}`), new tag per call.
-- **Contact:** `sip:siptooth@<public ip>:<local sip port>;transport=<t>`. Public IP from STUN (section 7) or `nat.public_ip`.
-- **Extra headers:** `sip.headers` map, values expanded. Example for ElevenLabs: `X-Caller-ID: {caller}`. `Call-ID`, `CSeq`, `Via`, `Max-Forwards`, `Contact`, `From`, `To`, `Content-*` cannot be overridden (validation).
+- **Contact:** `sip:siptooth@<signaling address>;transport=<t>`, signaling address per section 7.3.
+- **Allow:** `INVITE, ACK, CANCEL, BYE, OPTIONS`. No `Supported: timer`, no `100rel`.
+- **Extra headers:** `sip.headers` map with expanded values. `Call-ID`, `CSeq`, `Via`, `Max-Forwards`, `Contact`, `From`, `To`, `Route`, `Record-Route`, `Allow`, `Supported`, `Require`, `Authorization`, `Proxy-Authorization`, `Content-*` cannot be set (validation; names compared case-insensitively). `X-CALL-ID` is not SIP `Call-ID` and is allowed.
 - **User-Agent:** `siptooth/<version>`.
 - **Body:** SDP offer (section 6.4).
-- **TLS:** system roots, server name = proxy host or target host, certificate verification always on, TLS 1.2 minimum.
+- **TLS:** system roots, TLS 1.2 minimum, verification always on. The TLS `ServerName` is **not** fixed in config: sipgo derives it from the host of each connection's destination URI (`sip/transport_tls.go`), so a follow-up connection to ElevenLabs' node Contact `<ip>.hosts.rtc.elevenlabs.io` verifies against `*.hosts.rtc.elevenlabs.io`. sipgo's `DialogUA.RewriteContact` stays off.
+- **Write timeout:** every TCP/TLS write is bounded by 5 s (connection write deadline set by the wrapper), so teardown is bounded even on a stuck connection.
 
-### 5.3 Authentication
+### 5.3 INVITE transaction ownership (`internal/sip`)
 
-On `401`/`407`, sipgo resends the INVITE with digest credentials: username `sip.username`, password from `SIPTOOTH_SIP_PASSWORD` (env file or environment). No username configured: a 401/407 is a final failure (`sip_error`, `auth_required`). A second challenge after credentials were sent is `sip_error`, `auth_failed`.
+sipgo v1.6.0's `DialogClientSession.WaitAnswer` does not guarantee the cleanup siptooth needs (verified in `dialog_client.go`): on context cancel it CANCELs and may return `ctx.Err()` or `"non provisional response received during CANCEL"` while a crossing `2xx` sits in `InviteResponse` un-ACKed; cancelling waits for a 1xx (up to Timer B) and then up to 64·T1 for the 487. The wrapper therefore:
 
-### 5.4 In-dialog requests from the far end
+- runs the whole INVITE lifecycle in its own goroutine per attempt, using a context that `Abandon` does not cancel directly;
+- on `Abandon` before any 1xx: records the intent and sends CANCEL as soon as the first 1xx arrives (RFC 3261 §9.1); if a final response arrives first, it handles that instead;
+- whenever a `2xx` is received for an attempt that is abandoned, already answered by another fork, or whose SDP fails validation: ACKs that dialog (per To-tag) and then BYEs it;
+- after `WaitAnswer`/`inviteCancel` return for any reason, checks `InviteResponse` and applies the rule above if it is a `2xx`;
+- reports exactly one `DialResult`; for an abandoned attempt the result is discarded by the bridge (generation check).
 
-The SIP user agent listens on the same transport it dialed with (for TCP/TLS: the outbound connection stays open for the whole dialog and in-dialog requests are accepted on it; for UDP: the local SIP port).
+Accepted `2xx`: ACK via `Ack()` immediately; ACK retransmission on `2xx` retransmits (UDP) is handled per dialog.
 
-- `BYE` → `200 OK`, ends the call.
-- `re-INVITE` / `UPDATE` with SDP → apply a changed remote RTP address; a changed codec within the offered set is applied; anything else (hold `a=sendonly`/`inactive`, unsupported codec) is answered with our current SDP and ignored. Answer `200 OK` with the current local SDP (version incremented).
-- `OPTIONS` → `200 OK`.
-- `INFO`, `NOTIFY`, `REFER`, `MESSAGE` → `501 Not Implemented`.
-- Requests that match no dialog (unsolicited INVITEs included) → `481` / `403`. Siptooth never answers a new incoming SIP call.
+### 5.4 Authentication
 
-Session timers are not advertised (no `Supported: timer`); refresh re-INVITEs from the far end are answered as above.
+`sip.username` set: digest credentials from `SIPTOOTH_SIP_PASSWORD` are passed to sipgo (`AnswerOptions{Username, Password}`), which answers up to 2 challenges (`maxAuthAttempts = 2`, covering a stale nonce or a proxy plus UAS challenge); a third challenge is `sip_error` / `auth_failed`. MD5 and SHA-256 with `qop=auth` (via `icholy/digest`). Without `sip.username`, a 401/407 is `sip_error` / `auth_required`. A BYE that is challenged is re-sent once with credentials. Credentials and `Authorization` headers never appear in logs.
+
+### 5.5 Connection lifetime and far-end requests
+
+The same sipgo `UserAgent` hosts the client and a `sipgo.Server` (handlers `OnBye`, `OnAck`, `OnInvite`, `OnOptions`, `OnNoRoute`), so requests arriving on a connection siptooth opened are dispatched. Siptooth never listens for new inbound TCP/TLS connections.
+
+- **TCP/TLS:** the connection used for the INVITE stays open until Ending, with an RFC 5626 CRLF keepalive (`\r\n\r\n`) every 25 s to hold the NAT mapping. Siptooth's own BYE/ACK go to the dialog's remote target (the `2xx` Contact, honoring Record-Route), opening a new connection if needed (sipgo default; ElevenLabs requires the node Contact, not the shared host, or the BYE gets 481).
+- **UDP:** sipgo `WithClientNAT()` (adds `rport`), local SIP port `sip.local_port` (default 5060 for UDP, ephemeral for TCP/TLS), CRLF keepalive every 25 s during a dialog.
+- **Far-end requests are only reachable if the far end reuses siptooth's connection or flow.** Siptooth helps by advertising the address the far end actually sees (section 7.3). For the PBX the providers recipe configures connection reuse (`rewrite_contact=yes`, `force_rport=yes`, `rtp_symmetric=yes`, `direct_media=no` on the PJSIP endpoint). For ElevenLabs, whether its BYE reuses the open connection is a qualification item of milestone M1 (`siptooth sip test --wait-remote-hangup`, section 11). If it does not, an agent-side hang-up is detected by RTP loss: ElevenLabs (LiveKit) sends a packet every 20 ms including silence, so `calls.media_timeout_seconds` (default 10) bounds the delay.
+
+### 5.6 In-dialog requests from the far end
+
+- `BYE` → `200 OK` (via `DialogClientCache.ReadBye`), ends the call.
+- `ACK` → absorbed (no response).
+- `OPTIONS` → `200 OK` with `Allow`.
+- `re-INVITE` (tracked against the dialog: remote CSeq must increase, otherwise `500`):
+  - with SDP whose audio stream offers at least one of our payload types, `sendrecv`, and the same profile and crypto as established: `200 OK` with our SDP (same codecs, o= version incremented). A changed connection address or port is applied through `rtp.Update` after the ACK. A different codec choice than the one in use is not applied; our answer lists only the codec in use, which must be in the re-offer.
+  - offerless re-INVITE: `200 OK` carrying our current SDP as an offer; the SDP in the ACK is validated as above and an address change is applied.
+  - anything else (`sendonly`/`recvonly`/`inactive` hold, codec set without ours, profile or key change): `488 Not Acceptable Here`; existing media continues.
+  - over UDP the wrapper retransmits the `2xx` (T1 doubling to T2) until the ACK arrives or 32 s pass (then BYE, `signaling_lost`).
+- `UPDATE`, `INFO`, `NOTIFY`, `REFER`, `MESSAGE`, `PRACK` → `501 Not Implemented`.
+- Requests that match no dialog (including new INVITEs) → `481` (in-dialog) or `403` (dialog-creating). Siptooth never answers a new incoming SIP call.
 
 ## 6. Media
 
-### 6.1 RTP socket
+### 6.1 RTP socket and latching
 
-- One UDP socket per call, bound to `nat.rtp_bind` (default `0.0.0.0`) on an even port chosen randomly in `nat.rtp_port_min`–`nat.rtp_port_max` (default 10000–20000; retries on `EADDRINUSE`). RTCP is neither sent nor received; port+1 is not bound.
-- Outgoing packets: version 2, random SSRC and initial sequence number per call, timestamp advances 160 per packet, marker bit on the first packet, payload type 0 (PCMU) or 8 (PCMA), 160 payload bytes.
-- Packets are sent from the bound socket to the remote address (symmetric RTP). Siptooth does not latch onto a different source address; NAT traversal relies on the far end latching onto siptooth's (common for trunks behind NAT-aware edges).
-- Incoming packets: accepted only from the SDP remote IP (any port, to tolerate far-end NAT), version 2, negotiated payload type. Other payload types (comfort noise 13, telephone-event) are counted and dropped. SSRC changes reset the jitter buffer's sequence tracking.
-- STUN responses arriving on the socket during the call (first byte `0x00`/`0x01`) are ignored by the RTP reader.
+- One UDP socket per call, bound to the local address chosen in section 7.1, on an even port picked randomly in `nat.rtp_port_min`–`nat.rtp_port_max` (default 10000–20000; retry on `EADDRINUSE`). RTCP is neither sent nor received.
+- Outgoing packets: version 2, random SSRC and initial sequence number, timestamp advances 160 per packet (startup ticker, pump and stall fallback share one counter, so sequence and timestamp stay monotonic), marker on the first packet, 160 payload bytes.
+- **Early media:** packets that arrive before `Start` (183 early media, STUN noise) are dropped and not counted.
+- **Latching:** after `Start`, packets are sent to the SDP address. The first packet from any source that passes validation (version 2, a negotiated payload type, and SRTP authentication when enabled) latches the remote address; from then on siptooth sends to the latched source and accepts packets only from it. A re-INVITE address change resets the latch to the new SDP address.
+- **Payload types:** every G.711 type present in both offer and answer is decoded on receive (PCMU 0, PCMA 8), whatever the peer switches to. The transmit codec is the first type in the answer's list that we offered. Other types (comfort noise 13, telephone-event) are counted and dropped.
+- **SSRC change:** resets playout sequence/timestamp tracking (the new stream continues at the current playout point).
+- STUN responses (first byte `0x00`/`0x01`) are routed to the STUN code before `Start`, ignored after.
 
 ### 6.2 Media pump (SCO ↔ RTP)
 
 Pacing is read-driven, as in allochka: the SCO controller is the clock.
 
-- **Uplink (phone → SIP):** each SCO read (MTU bytes, typically 60–64 bytes = 30–32 samples) is appended to an accumulator; every time it holds 160 samples, one 20 ms frame is G.711-encoded and sent. RTP timestamps follow the SCO sample count, so the far end sees the phone's clock.
-- **Downlink (SIP → phone):** after each SCO read, the pump writes the same number of bytes taken from the jitter buffer's PCM output (silence on underrun).
-- **Stall fallback:** no SCO read for 100 ms → a ticker writes silence to SCO at the frame cadence and keeps sending RTP silence at 20 ms, so neither side times out (copied behaviour).
-- **Before SCO is up** (Answering): a 20 ms ticker sends RTP silence; nothing is read from the jitter buffer.
+- **Uplink (phone → SIP):** each SCO read (MTU bytes, typically 60–64 bytes = 30–32 samples) is appended to an accumulator; every 160 samples one frame is G.711-encoded and sent.
+- **Downlink (SIP → phone):** after each SCO read the pump writes the same number of bytes taken from the playout (section 6.3); silence on underrun.
+- **Stall fallback (allochka `bridge.go`):** no SCO read for 100 ms → a ticker writes playout audio (silence only when empty) to SCO at the frame cadence, and the uplink sends RTP silence every 20 ms. No SCO read for 5 s → `audio_lost` path (section 4.5).
+- **Settle delay:** for `calls.sco_settle_ms` (default 800, allochka's hardware-derived `greeting_delay_ms`) after SCO is up, the pump writes silence to SCO and keeps buffering downlink audio, so the first word is not lost to a settling link.
+- **Before SCO is up** (Answering): the 20 ms ticker sends RTP silence; downlink audio accumulates in the startup buffer.
 
-### 6.3 Jitter buffer and catch-up
+### 6.3 Playout: startup buffer, jitter buffer, catch-up
 
-- Packets are ordered by sequence number (16-bit wrap handled). Target depth `media.jitter_ms` (default 60), hard cap 2 s (oldest frames dropped when exceeded, counted as `overflow`). Packets older than the playout point are dropped (`late`). Gaps play as silence (`lost`).
-- **Catch-up.** Audio received while answering (the 0.5–2 s between `200 OK` and SCO up — the ElevenLabs agent starts its greeting immediately) and clock drift between the phone's SCO clock and the far end's RTP clock both grow the buffer. Whenever depth exceeds target + 40 ms, frames whose RMS is below `media.silence_rms` (default 200 on the 16-bit scale) are discarded instead of played until the depth is back at target. Speech is never discarded, so the greeting is heard in full and the added latency drains during the first natural pauses.
+- **Timestamp-based:** playout position is derived from RTP timestamps (32-bit wrap handled) and payload sample counts, not sequence numbers alone, so variable packet sizes (10–60 ms) and silence-suppression gaps play correctly. Duplicates are dropped; late packets (before the playout point) dropped and counted; gaps play as silence.
+- **Startup buffer:** from `Start` until SCO is up plus the settle delay, every received sample is kept, with no cap below the worst case answering time (`ATA` 3 s + `CallActive` 5 s + SCO 5 s + settle; the buffer holds 20 s, 320 KB). Nothing in it is dropped.
+- **Steady state:** target depth `media.jitter_ms` (default 60). Hard cap 20 s (oldest dropped and counted as `overflow` only beyond that; not reachable in a normal call).
+- **Catch-up:** whenever depth exceeds target + 40 ms, 20 ms blocks whose RMS is below `media.silence_rms` (default 200 on the 16-bit scale) are skipped instead of played, until the depth is back at target. Speech is never skipped, so the agent's greeting is heard in full and the extra latency drains in its first pauses. `silence_rms: 0` disables catch-up.
 
 ### 6.4 SDP
 
@@ -280,42 +347,58 @@ Pacing is read-driven, as in allochka: the SCO controller is the clock.
 
 ```
 v=0
-o=siptooth <sess-id> <version> IN IP4 <public ip>
+o=siptooth <sess-id> <version> IN IP4 <media address>
 s=siptooth
-c=IN IP4 <public ip>
+c=IN IP4 <media address>
 t=0 0
-m=audio <public port> RTP/AVP 0 8          (RTP/SAVP when sip.srtp is true; order from media.codecs)
+m=audio <media port> RTP/AVP 0 8          (RTP/SAVP when sip.srtp is true; order from media.codecs)
 a=rtpmap:0 PCMU/8000
 a=rtpmap:8 PCMA/8000
 a=ptime:20
 a=sendrecv
-a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64 key||salt>    (only with srtp)
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64 30 bytes>    (only with srtp)
 ```
 
-**Answer** parsing: the first `m=audio` with a non-zero port; connection address from media-level `c=` or session-level `c=`; IPv4 only (IPv6 answer → `sip_media_failed`); the first payload type in the answer's format list that is in our offer is the codec; with SRTP, the answer must use `RTP/SAVP` and carry an `a=crypto` line with suite `AES_CM_128_HMAC_SHA1_80` and a valid inline key, otherwise `sip_media_failed`. Without SRTP, an answer that uses `RTP/SAVP` is also `sip_media_failed`.
+**Answer validation** (in `internal/sip`, before `Answered` is reported): the first `m=audio` line is the answer to our stream; port non-zero; profile exactly `RTP/AVP` (or `RTP/SAVP` with SRTP); direction `sendrecv` (or absent, which means `sendrecv`); at least one payload type we offered; IPv4 connection address from the media-level or session-level `c=`. With SRTP, exactly one `a=crypto` with tag `1`, suite `AES_CM_128_HMAC_SHA1_80`, 30-byte key‖salt after base64; a lifetime parameter is accepted and ignored, an MKI or session parameters are rejected. Any failure → `sip_media_failed`.
 
-### 6.5 SRTP
+### 6.5 SRTP (SDES)
 
-`sip.srtp: true` is allowed only with `sip.transport: tls` (keys travel in the SDP). Siptooth generates a fresh 30-byte master key+salt per call, uses `pion/srtp/v3` contexts for both directions with `ProtectionProfileAes128CmHmacSha1_80`. Decryption failures are counted and the packet dropped.
+`sip.srtp: true` is allowed only with `sip.transport: tls`. Per call siptooth generates a fresh 30-byte master key‖salt from `crypto/rand`. The send context uses our offered key, the receive context the key from the answer (`srtp.CreateContext(key16, salt14, ProtectionProfileAes128CmHmacSha1_80, srtp.SRTPReplayProtection(64))`). Authentication or replay failures are counted and dropped. Key material is redacted (`inline:<redacted>`) in every log line, error and CLI output that includes SDP.
 
-## 7. NAT and STUN
+## 7. NAT and addressing
 
-- Before every INVITE, siptooth sends a STUN Binding Request from the RTP socket to each of `nat.stun_servers` in order (default `stun.l.google.com:19302`, `stun.cloudflare.com:3478`), 500 ms timeout, 2 attempts per server, first success wins. The XOR-MAPPED-ADDRESS gives the public IP and port advertised in SDP `c=`/`m=`.
-- The same public IP is used in the SIP Contact (section 5.2). For UDP signaling siptooth assumes port-preserving NAT for the SIP port and relies on `rport` (RFC 3581, sipgo default) for responses; TCP/TLS is recommended and the default.
-- `nat.public_ip` set: STUN is still run for the port when `nat.rtp_port_forwarded` is false; when true, siptooth advertises `public_ip` and the local port as is (for a router port-forward of the RTP range) and skips STUN.
-- STUN failure on every server: warning log, `system.error` hook with code `stun_failed` (at most once per hour), and the call proceeds with the best address known (`public_ip` or local). On a NAT that STUN cannot traverse (symmetric NAT), the documented fix is the port-forward setup above.
-- `siptooth doctor` runs a STUN probe from two sockets and reports whether the mapping looks port-preserving / endpoint-independent (warns on symmetric NAT).
+### 7.1 Local address
+
+The local address is the source address the kernel picks for the next hop (a connected-UDP-socket probe to the resolved SIP destination, no packet sent), never `0.0.0.0`. The RTP socket binds to it. `nat.rtp_bind` overrides.
+
+### 7.2 Media address (`nat.mode`)
+
+- `auto` (default): if the resolved SIP next hop is a private, loopback, link-local or CGNAT-shared (100.64/10) address, use `local`; otherwise `stun`.
+- `local`: advertise the local address and port. For the LAN PBX (no hairpin through the router needed).
+- `stun`: send a Binding Request from the RTP socket to each of `nat.stun_servers` in order (default `stun.l.google.com:19302`, `stun.cloudflare.com:3478`), 500 ms timeout, 2 attempts per server, last successful server tried first; advertise the XOR-MAPPED-ADDRESS. While Dialing, re-send a Binding Request every 10 s to the same server (keepalive; a changed mapping is logged as a warning). All servers failing: warning, rate-limited `system.error` `stun_failed` (once per hour), advertise `nat.public_ip` if set, else the local address.
+- `public_ip`: advertise `nat.public_ip` with the local port (for a router port-forward of the RTP range), no STUN.
+
+The mapping describes traffic to the STUN server; with an address-dependent NAT it may differ toward the trunk. Siptooth relies on the far end latching onto its source (LiveKit and Asterisk with `rtp_symmetric=yes` both do), which also covers that case. CGNAT without latching on the far end is unsupported.
+
+### 7.3 Signaling address (Contact)
+
+- `local` mode: local address and the local SIP port.
+- otherwise: before each INVITE over TCP/TLS (or UDP), siptooth sends an `OPTIONS` to the next hop on the connection the INVITE will use, and reads `received`/`rport` from the top `Via` of the response (any status code). That address — the far end's view of siptooth's flow — becomes the Contact host and port, which makes a far end that reuses connections by remote address find the open connection. No usable `received`/`rport`: the media address IP with the local SIP port. The OPTIONS costs one round trip (≤ 1 s budget; timeout → fallback).
+
+### 7.4 Diagnostics
+
+`siptooth doctor` reports: local address toward the target, chosen mode, the STUN mapping from one socket toward two different STUN servers (same mapped port → "endpoint-independent mapping observed", different → "address-dependent mapping: needs a latching far end"), and the OPTIONS `received`/`rport` toward the target. It reports observations, not a NAT type.
 
 ## 8. Bluetooth layer (copied)
 
 Copied from allochka with these changes only:
 
 - Names: adapter alias `siptooth`, D-Bus object paths `/com/siptooth/hfp` and `/com/siptooth/agent`, profile name `Siptooth`.
-- `bluetooth.answer_delay_seconds` removed; the coordinator no longer calls `Answer` on ring, `bridge` does after SIP answers.
+- `calls.answer_delay_seconds` removed; nothing calls `Answer` on ring any more: `bridge` does after the SIP `2xx`.
 - Probe mode (`internal/probe`) removed; `siptooth sip test` (section 11) covers the SIP side, and the Bluetooth side is already qualified by allochka on this hardware.
-- Everything else is kept unchanged, including hard-won fixes: call-waiting latch, SLC retries, profile re-registration, routing retries, bus reconnect, idle-only power cycle (`bluetooth.power_cycle_minutes`, default 60), in-band ringing backlog drain, read-driven SCO pacing with the stall fallback.
+- Everything else unchanged, including the hard-won fixes: ring dedup and call-waiting latch, `CallActive` while ringing means the owner answered, `CallSetupCleared` only with `call` = 0, SLC retries, profile re-registration, routing retries, bus reconnect, idle-only power cycle (`bluetooth.power_cycle_minutes`, default 60), in-band ringing backlog drain, read-driven SCO pacing with the stall fallback, 3 s AT deadlines, 2 s SCO dial fallback.
 
-Allochka and siptooth both register the HFP hands-free profile and cannot run at the same time. The existing BlueZ bond with the phone is reused: `bluetooth.phone_address` is copied from allochka's config, no re-pairing needed.
+Allochka and siptooth both register the HFP hands-free profile and cannot run at the same time (`doctor` reports a running allochka service as a conflict). The existing BlueZ bond with the phone is reused: `bluetooth.phone_address` is copied from allochka's config, no re-pairing needed.
 
 ## 9. Configuration
 
@@ -331,15 +414,16 @@ phone:
   number: ""                   # the phone's own number, E.164 (e.g. +380441234567); required if {number} is used
 
 sip:
-  target: "sip:{number}@sip.rtc.elevenlabs.io;transport=tls"   # required
+  target: "sip:{number}@sip.rtc.elevenlabs.io;transport=tls"   # required, sip: URI
   transport: tls               # udp | tcp | tls
-  proxy: ""                    # optional host:port; default: target host + transport default port
+  proxy: ""                    # optional host:port next hop
+  local_port: 0                # 0: 5060 for udp, ephemeral for tcp/tls
   from: ""                     # default "sip:{caller}@<target host>"
   display_name: "{caller}"
   anonymous_user: anonymous    # {caller} when the number is withheld
   username: ""                 # digest username; password: SIPTOOTH_SIP_PASSWORD in ~/.siptooth/env
-  headers:                     # optional extra INVITE headers, values may use placeholders
-    X-Caller-ID: "{caller}"
+  headers: {}                  # extra INVITE headers, values may use placeholders
+                               # ElevenLabs: {X-CALLER-ID: "{caller}", X-CALL-ID: "{call_id}"}
   srtp: false                  # SDES SRTP; requires transport tls
   dial_timeout_seconds: 30     # 5..120
 
@@ -349,50 +433,49 @@ media:
   silence_rms: 200             # catch-up threshold, 0..5000 (0 disables catch-up)
 
 nat:
+  mode: auto                   # auto | local | stun | public_ip
   stun_servers: ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
-  public_ip: ""                # optional static public IPv4
-  rtp_port_forwarded: false    # true: advertise public_ip + local port, skip STUN
-  rtp_bind: 0.0.0.0
+  public_ip: ""                # required for mode public_ip; fallback for stun
+  rtp_bind: ""                 # default: local address toward the next hop
   rtp_port_min: 10000
   rtp_port_max: 20000
 
 calls:
   caller_id_wait_ms: 1000      # 0..3000
-  media_timeout_seconds: 30    # 5..300
+  sco_settle_ms: 800           # 0..5000
+  media_timeout_seconds: 10    # 5..300
   max_duration_seconds: 0      # 0 = no limit, else 60..86400
 
 control:
   socket: siptooth.sock
 
-# hooks:
+hooks: []
 #   - id: notify
 #     events: [call.ended]
 #     command: "/home/pi/.siptooth/hooks/notify.sh"
 #     timeout_seconds: 10
 ```
 
-Validation (startup fails on any error, `siptooth config check` prints all of them): required fields present; MAC format; placeholders known; `{number}` used ⇒ `phone.number` set; target is a `sip:`/`sips:` URI; transport consistent with target; `srtp` ⇒ `tls`; `rtp_port_forwarded` ⇒ `public_ip`; port range even-aligned and min < max; `username` set ⇒ `SIPTOOTH_SIP_PASSWORD` present; forbidden header names; hook events known; numeric ranges as noted. Unknown keys are errors (`yaml.v3` `KnownFields`).
+Validation (startup fails on any error; `siptooth config check` prints all of them): required fields; MAC format; known placeholders; `{number}` ⇒ `phone.number`; target parses as a `sip:` URI after a trial expansion; transport agrees with `;transport=`; `srtp` ⇒ `tls`; `mode: public_ip` ⇒ `public_ip`; `public_ip` is an IPv4 address; RTP range even-aligned, min < max, within 1024–65534; `username` ⇒ `SIPTOOTH_SIP_PASSWORD` present; forbidden header names and CR/LF/NUL in header names or values; hook events known; numeric ranges as noted. Unknown keys are errors (`yaml.v3` `KnownFields`).
 
 ## 10. Hooks
 
-Same runner as allochka: `/bin/sh -c COMMAND`, JSON payload on stdin, `timeout_seconds` (default 10, max 300) then SIGTERM/SIGKILL of the process group, stdout/stderr captured up to 8 KiB and logged, one attempt, no retries. Environment: the daemon's environment minus `SIPTOOTH_SIP_PASSWORD`, plus `SIPTOOTH_EVENT`, `SIPTOOTH_CALL_ID`, `SIPTOOTH_CALLER` (empty when withheld).
-
-Hooks run asynchronously and never delay the call: `Emit` enqueues to a bounded queue (64 events) served by up to 4 concurrent runners; a full queue drops the event with a warning log. Each hook's events run in emission order for that call.
+Allochka's dispatcher and runner: one worker goroutine, bounded queue of 100 events, hooks run sequentially in emission order (so per-call order is preserved); `/bin/sh -c COMMAND`, JSON payload on stdin, `timeout_seconds` (default 10, max 300) then SIGTERM/SIGKILL of the process group, stdout/stderr captured up to 8 KiB and logged; one attempt, no retries. A full queue drops the event with a warning (and a rate-limited `system.error` `hook_queue_full` log line; not dispatched as a hook). Environment: the daemon's environment minus `SIPTOOTH_SIP_PASSWORD`, plus `SIPTOOTH_EVENT`, `SIPTOOTH_CALL_ID`, `SIPTOOTH_CALLER` (empty when withheld). `Emit` never blocks the call.
 
 **Events and payloads** (`schema_version: 1`):
 
 ```json
-{ "schema_version": 1, "event": "call.ringing", "occurred_at": "2026-10-14T09:43:31Z",
+{ "schema_version": 1, "event": "call.ringing", "occurred_at": "2026-10-14T09:43:31Z", "test": false,
   "call": { "id": "20261014T094331Z-b5fa", "caller": "+380501234567", "caller_withheld": false,
             "number": "+380441234567", "target": "sip:+380441234567@sip.rtc.elevenlabs.io;transport=tls" } }
 ```
 
-- `call.ringing`: before the INVITE (fields above). Intended for side processes that must prepare for the call (for example a future OpenAI-accept service correlating by caller).
-- `call.connected`: audio bridged; adds `sip_call_id`, `codec`, `srtp`, `remote_media` (ip:port), `public_media` (ip:port), `connected_at`.
-- `call.ended`: always exactly once per call; adds `outcome` (`completed`, `sip_rejected`, `sip_timeout`, `sip_error`, `sip_media_failed`, `caller_abandoned`, `owner_answered`, `answer_failed`, `media_timeout`, `max_duration`, `bluetooth_lost`, `shutdown`), `hangup_by` (`caller`, `far_end`, `siptooth`, or null), `sip_status` and `sip_reason` (last final response, null if none), `error` (string or null), `ringing_seconds`, `bridged_seconds` (null if never bridged), `media` (`{"sent","received","lost","late","overflow","discarded_silence"}`).
-- `system.error`: `{"error":{"code","detail"}}`, codes `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed`, `hook_queue_full`. Same once-per-outage rules as allochka.
+- `call.ringing`: before the INVITE (fields above). For side processes that prepare for the call (for example a future OpenAI-accept service correlating by `X-CALL-ID`).
+- `call.connected`: audio bridged; adds `sip_call_id`, `codec`, `srtp`, `remote_media` (latched ip:port, or SDP address before latching), `advertised_media` (ip:port), `nat_mode`, `connected_at`.
+- `call.ended`: exactly once per call; adds `outcome` (`completed`, `sip_rejected`, `sip_timeout`, `sip_error`, `sip_media_failed`, `caller_abandoned`, `owner_answered`, `answer_failed`, `far_end_ended`, `signaling_lost`, `media_timeout`, `audio_lost`, `media_error`, `max_duration`, `bluetooth_lost`, `shutdown`), `hangup_by` (`caller`, `far_end`, `siptooth`, or null), `sip_status` and `sip_reason` (last final response to the INVITE, null if none), `error` (string or null), `ringing_seconds`, `bridged_seconds` (null if never bridged), `media` (`{"sent","received","lost","late","duplicate","overflow","discarded_silence","srtp_fail"}`).
+- `system.error`: `{"error":{"code","detail"}}`, codes `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed`. Same once-per-outage rules as allochka.
 
-The target in payloads is the expanded URI; credentials never appear in payloads or logs.
+The `target` in payloads is the expanded URI; credentials and SRTP keys never appear in payloads or logs.
 
 `siptooth hooks test --event <name>` runs matching hooks with a sample payload (`"test": true`) without the daemon.
 
@@ -402,63 +485,94 @@ The target in payloads is the expanded URI; credentials never appear in payloads
 | --- | --- |
 | `siptooth run` | the daemon (systemd runs this) |
 | `siptooth pair` | interactive pairing (copied; daemon must be stopped) |
-| `siptooth doctor [--fix]` | setup checks: config valid, env file mode, group `bluetooth`, BlueZ, adapter, conflicting HFP handlers (PipeWire, bluealsa, **allochka service**), linger, DNS of the SIP host, TCP/TLS connect + certificate check to the proxy, STUN probe and NAT type. `--fix` creates `~/.siptooth/`, default config, env file. Never runs sudo. |
+| `siptooth doctor [--fix]` | setup checks: config valid, env file mode, group `bluetooth`, BlueZ, adapter, conflicting HFP handlers (PipeWire, bluealsa, a running allochka service), linger, DNS of the next hop, TCP/TLS connect and certificate check, NAT observations (section 7.4). `--fix` creates `~/.siptooth/`, default config, env file. Never runs sudo. |
 | `siptooth install` | writes and enables the systemd user unit (copied) |
 | `siptooth status` | daemon state via control socket: Bluetooth ready, phone connected, current call (state, caller, duration), last call outcome |
-| `siptooth config check` | validate and print effective config (password redacted) |
+| `siptooth config check` | validate and print the effective config (password redacted) |
 | `siptooth hooks test --event E` | run hooks with a sample payload |
-| `siptooth sip test [--caller N] [--seconds 20] [--tone]` | places a real SIP call to the target without Bluetooth (placeholders expanded with `--caller`, default `+10000000000`), runs STUN, prints the mapped address, every SIP response, the negotiated codec/SRTP, then for `--seconds` sends silence (or a 1 kHz tone at -20 dBFS with `--tone`) and reports packets received, loss, max gap, and received audio level; hangs up. Exit 0 only when the call was answered and audio packets were received. Works while the daemon runs (separate SIP and RTP ports). |
+| `siptooth sip test [--caller N] [--seconds 20] [--tone] [--wait-remote-hangup]` | a real SIP call to the target without Bluetooth: prints the NAT decision and mapping, the OPTIONS `received`/`rport`, every SIP response, the negotiated codec and SRTP state; then for `--seconds` sends silence (or a 1 kHz tone at −20 dBFS with `--tone`) and reports packets received, loss, max inter-packet gap, latched source, received audio level. With `--wait-remote-hangup` it does not hang up and instead reports whether the far end's BYE arrived (and on which connection), or whether only RTP stopped. Exit 0 only when answered and audio packets were received. Runs while the daemon runs (separate SIP and RTP ports). |
 | `siptooth version` | build info |
 
-Control socket: HTTP over `~/.siptooth/siptooth.sock`, one endpoint `GET /status` (JSON). No admin actions.
+Control socket: HTTP over `~/.siptooth/siptooth.sock`, `GET /status` (JSON) only.
 
 ## 12. Logging
 
-`log/slog` text handler to stderr (journal). Level from `SIPTOOTH_LOG_LEVEL` (`info` default, `debug` logs every SIP message's first line and SDP bodies, never `Authorization` headers). Every call-scoped line carries `call_id`. One summary line per call at `info`: `msg="call ended" call_id=… caller=… outcome=… hangup_by=… sip_status=… ringing_s=… bridged_s=… codec=… lost=… late=… discarded_silence=…`.
+`log/slog` text handler to stderr (journal). Level from `SIPTOOTH_LOG_LEVEL` (`info` default). `debug` logs each SIP message's start line and SDP bodies with `a=crypto` keys and `Authorization`/`Proxy-Authorization` values redacted. Every call-scoped line carries `call_id`. One summary line per call at `info`: `msg="call ended" call_id=… caller=… outcome=… hangup_by=… sip_status=… ringing_s=… bridged_s=… codec=… nat_mode=… lost=… late=… discarded_silence=…`.
 
 ## 13. Error handling summary
 
 | Failure | Behaviour |
 | --- | --- |
 | SIP target unreachable, rejects, times out, auth fails | phone keeps ringing; `call.ended` with the reason |
-| SDP answer unusable | ACK + BYE, phone keeps ringing |
-| `ATA` fails / no `CallActive` / no SCO | BYE (and `AT+CHUP` once active); `answer_failed` |
-| STUN fails | proceed with fallback address, warning, `system.error` (rate-limited) |
-| Far end stops sending RTP | `media_timeout` after 30 s, hang up both |
+| SDP answer unusable | ACK + BYE by the wrapper, phone keeps ringing |
+| `2xx` after CANCEL, or a second fork's `2xx` | ACK + BYE that dialog |
+| `ATA` explicit error | BYE at once; phone left alone |
+| `ATA` timeout, no `CallActive` in 5 s | BYE; phone left alone |
+| No SCO after `CallActive` | `AT+CHUP` + BYE |
+| SCO lost mid-call | BYE only; the owner's cellular call is left alone |
+| STUN fails | fallback address, warning, rate-limited `system.error` |
+| Far end stops sending RTP | `media_timeout` after 10 s, hang up both |
+| Far end BYE unreachable through NAT | covered by `media_timeout` |
 | Bluetooth link lost mid-call | BYE, `bluetooth_lost` |
-| Hook fails / times out | logged, never affects calls |
-| Panic in a call goroutine | recovered, both sides hung up, `call.ended` with `error`, daemon keeps running |
-| Invalid config | startup fails with all errors listed; systemd restarts with backoff |
+| Hook fails / times out / queue full | logged, never affects calls |
+| Panic in a call goroutine | recovered, both sides hung up per the ownership rule, `call.ended` with `error`, daemon keeps running |
+| Invalid config | startup fails listing all errors; systemd restarts with backoff |
 
 ## 14. Testing
 
 TDD throughout; tests never touch real Bluetooth, real networks beyond loopback, or real system services.
 
-- **Copied packages** keep their existing tests (hfp AT traces, bluez helpers, sco framing, daemon, doctor, hooks runner).
-- **g711:** μ-law tests copied; A-law against ITU G.711 vectors; round-trip error bounds.
-- **sdp:** offer golden files; answer parsing table (codec choice, session vs media `c=`, port 0, SAVP/crypto combinations, IPv6 rejection, malformed input).
-- **rtp:** packetization, sequence wrap, jitter buffer ordering/late/loss/overflow, catch-up discards only silence, SRTP round trip with pion contexts, symmetric send/receive on loopback.
-- **stun:** binding against a loopback `pion/stun` server; timeout and fallback ordering; demux with RTP on one socket.
-- **sip:** a real sipgo UAS on loopback (UDP and TCP; TLS with a test CA) acting as the trunk: 200, 486, 503, 407 challenge then 200, wrong password, no answer (CANCEL), 200 after CANCEL (ACK+BYE), far-end BYE, re-INVITE with new address, OPTIONS, unsolicited INVITE rejected; asserts on headers (placeholders, From, Contact, extra headers, no forbidden overrides).
-- **bridge:** state machine with fake HFP client, fake SIP dialer, in-memory SCO pair, fake clock: every row of the tables in section 4.1, caller ID wait, withheld caller, owner answering on the handset, call waiting ignored, exactly one `call.ended` per call, audio frames flow both ways with correct pacing.
+- **Copied packages** keep their tests (hfp AT traces, bluez helpers, sco framing incl. a 30 s-ring drain case, daemon, doctor, hooks dispatcher and runner).
+- **g711:** μ-law tests copied; A-law against ITU G.711 vectors; round-trip error bounds; silence bytes.
+- **sdp:** offer golden files (with and without SRTP); answer validation table (codec choice, both codecs kept for receive, session vs media `c=`, port 0, direction attributes, profile mismatch both ways, crypto tag/suite/length/MKI/lifetime, IPv6 rejection, malformed input); re-offer classification (refresh, address change, hold, codec change, key change); redaction.
+- **stun:** encode/decode against RFC 5769 test vectors; loopback server; timeout, ordering, last-good-first, keepalive cadence; demux with RTP on one socket.
+- **rtp:** packetization, shared seq/timestamp counter across startup/pump/stall, early-media drop, latching (first valid source, rejection of others after latch, reset on update), mixed PCMU/PCMA receive, timestamp-based playout with 10/20/30/60 ms packets, wrap of seq and timestamp, duplicates, gaps, startup buffer keeps everything for 13 s, catch-up skips only silence, SRTP round trip with replay rejection.
+- **sip:** a real sipgo UAS on loopback (UDP, TCP, and TLS with a test CA) acting as the trunk: 200; 486; 503; 401 and 407 challenges; stale-nonce second challenge; three challenges → failure; no answer → CANCEL after 1xx; Abandon before any 1xx; 200 crossing CANCEL → ACK + BYE; two forked 200s → second ACKed + BYEd; unacceptable SDP → ACK + BYE; far-end BYE on the same connection; BYE challenged; re-INVITE refresh, address change, hold → 488, offerless; OPTIONS; unsolicited INVITE → 403; Contact from OPTIONS `received`/`rport`; CRLF keepalive; header expansion and escaping; forbidden headers; TLS ServerName per destination (two hostnames with distinct certs).
+- **bridge:** state machine with fake HFP client, fake SIP dialer, in-memory SCO pair, fake clock: every row of the tables in sections 4.3–4.5, `ATA` error classes, owner answering during Dialing and during Answering, generation discards late results, exactly one `call.ended` per call, no `AT+CHUP` for unowned calls or on SCO loss, settle delay, drain before CHUP on far-end BYE.
 - **End-to-end (loopback):** fake AG + in-memory SCO + sipgo UAS that echoes RTP: a tone written on the SCO side comes back on the SCO side; hang-up from either end.
 - **CI:** `make check` = `go vet ./...`, `go test -race ./...`, `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...`.
 
 ## 15. Rollout
 
-1. **M1 — SIP from the Pi without Bluetooth:** `siptooth sip test --tone` against the owner's PBX (call an echo or record extension), then against ElevenLabs. Confirms DNS, TLS, auth, STUN, NAT, codec, SRTP.
-2. **M2 — real call to the PBX:** stop allochka (`systemctl --user disable --now allochka`), install siptooth with allochka's `phone_address`, call the phone, verify the success criteria 1 and 3.
-3. **M3 — ElevenLabs:** point `sip.target` at the agent number, verify criterion 2 (full greeting heard).
-4. **M4 — soak:** a week of normal use (criterion 4). Then allochka is archived.
+1. **M1 — SIP from the Pi without Bluetooth.** `siptooth sip test --tone` against the PBX (an echo or record extension), then against ElevenLabs with `--wait-remote-hangup` (end the conversation from the agent side). Confirms DNS, TLS, auth, NAT mode, latching, codec, SRTP, and whether the far end's BYE reaches siptooth. Record the result in `docs/providers.md`.
+2. **M2 — real call to the PBX.** Stop allochka (`systemctl --user disable --now allochka`), install siptooth with allochka's `phone_address`, call the phone; verify criteria 1 and 3.
+3. **M3 — ElevenLabs.** Point `sip.target` at the agent number; verify criterion 2 (full greeting heard, hang-up propagation).
+4. **M4 — soak.** A week of normal use (criterion 4). Then allochka is archived.
 
 Each hardware step is run by the owner, one command at a time.
 
+### 15.1 Provider recipes (content of `docs/providers.md`)
+
+**ElevenLabs.** Import the phone number as a SIP trunk number with exactly the string siptooth puts in the Request-URI user part (including the leading `+`); assign the agent; inbound transport TLS (TCP acceptable, UDP is experimental on their side); inbound authentication: digest username/password (their IP allowlist does not suit a dynamic home IP); media encryption `Disabled` with `srtp: false`, or `Allowed`/`Required` with `srtp: true`. Config: `target: "sip:{number}@sip.rtc.elevenlabs.io;transport=tls"`, `headers: {X-CALLER-ID: "{caller}", X-CALL-ID: "{call_id}"}`.
+
+**Asterisk/PJSIP (owner's PBX on the LAN).** An endpoint for siptooth with `identify_by=auth_username` (or `ip`) so a From user carrying the caller number still matches; `auth` with the username/password; `rewrite_contact=yes`, `force_rport=yes`, `rtp_symmetric=yes`, `direct_media=no`; `allow=ulaw,alaw`; context routing the request user (for example extension `600`) where wanted. Config: `target: "sip:600@<pbx ip>"`, `transport: udp` or `tcp`, `nat.mode: auto` (resolves to `local`). Other PBXs: the equivalent settings (connection reuse, symmetric RTP, identify by auth username or source IP).
+
 ## 16. Risks and open questions
 
-- **Line echo.** The phone network returns an echo of the far end's own voice (allochka needed an echo gate against OpenAI). ElevenLabs and most PBX endpoints have their own echo handling, so siptooth ships without one; if M3 shows the agent interrupting itself, allochka's echo gate can be ported as an option.
-- **NAT variants.** Symmetric NAT or a far end that does not latch onto siptooth's source address breaks audio; mitigated by the port-forward mode and the doctor NAT check.
-- **No RTCP.** Some media servers time out calls without RTCP; none of the v1 targets is known to. Adding RTCP sender reports later is contained in `rtp`.
-- **TLS in-dialog requests.** Some trunks open a new connection to the Contact for BYE instead of reusing the existing one; behind NAT that BYE is lost. The `media_timeout` ends such calls within 30 s; `hangup_by` will show `siptooth`.
-- **Answer gap.** The far end is connected 0.5–2 s before the caller hears anything; the catch-up buffer keeps the greeting intact, but the far end's VAD may hear silence first. Acceptable for v1.
-- **Narrowband only.** CVSD 8 kHz is the audio ceiling; mSBC/G.722 wideband is a later iteration.
-- **OpenAI path (later).** OpenAI's SIP endpoint needs TLS + SRTP (supported here) plus a public webhook and an `accept` call per call. That belongs in a separate service; siptooth's `call.ringing` hook can notify it.
+- **ElevenLabs far-end BYE.** If M1 shows ElevenLabs opens a new connection to the Contact or top Via for its BYE, the hang-up arrives only through `media_timeout` (10 s of silence for the caller). Mitigations if that is unacceptable: a router port-forward plus a TLS listener (out of v1 scope), or a shorter media timeout once the gap statistics from `sip test` are known.
+- **Line echo.** The phone network returns an echo of the far end's own voice (allochka needed an echo gate against OpenAI). ElevenLabs and PBX endpoints have their own echo handling, so siptooth ships without one; if M3 shows the agent interrupting itself, allochka's echo gate can be ported as an option.
+- **NAT variants.** CGNAT or an address-dependent NAT toward a far end that does not latch breaks media; the doctor observations and `sip test` make this visible early.
+- **No RTCP.** Some media servers time out calls without RTCP; neither v1 target does. RTCP sender reports later are contained in `rtp`.
+- **Media timeout vs silence suppression.** A far end that stops RTP during silence would trip the 10 s timeout. Neither v1 target does (LiveKit sends every 20 ms; Asterisk without VAD likewise); other trunks may need a larger value.
+- **Narrowband only.** CVSD 8 kHz is the audio ceiling; mSBC/G.722 is a later iteration.
+- **OpenAI path (later).** OpenAI's SIP endpoint needs TLS + SRTP (supported here) plus a public webhook and an `accept` call per call; a separate service that siptooth's `call.ringing` hook (with `X-CALL-ID` correlation) can feed.
+
+## Appendix A — Review log (revision 2)
+
+Reviewed by Fable 5.1 (Claude subagent), gpt-6.1-sol and gpt-6-astra (Codex CLI). Changes:
+
+- INVITE ownership moved into `internal/sip` with explicit CANCEL/2xx-crossing, fork and late-2xx handling, because sipgo v1.6.0 `WaitAnswer`/`inviteCancel` leave a crossing 2xx un-ACKed and can block up to 64·T1 (all three).
+- Startup audio buffered losslessly for the whole answering window, allochka's 800 ms settle delay kept, drain before CHUP on far-end BYE (all three).
+- Answering event table, ATA error classes and generation discards added; ownership rule stated (all three).
+- SCO loss: BYE only, never CHUP, 1.5 s grace, outcome `audio_lost` (Fable, gpt-6.1-sol, gpt-6-astra).
+- Stall fallback plays buffered audio, not silence (all three).
+- NAT: per-destination `nat.mode` (LAN PBX gets local addresses; Fable), STUN keepalive while ringing (Fable), Contact from OPTIONS `received`/`rport`, CRLF keepalives, `WithClientNAT`, `sip.local_port`, honest diagnostics, no `0.0.0.0` fallback (all three).
+- TLS ServerName derived per destination for ElevenLabs node Contacts; `RewriteContact` off (all three).
+- Far-end BYE reachability made a qualification item; media timeout default 30 → 10 s (Fable).
+- RTP latching instead of source filtering, early media dropped, all negotiated G.711 types decoded, timestamp-based playout (all three).
+- Renegotiation narrowed: UPDATE dropped, re-INVITE limited to refresh/address change, 488 otherwise, remote CSeq tracked, UDP 2xx retransmission (all three).
+- SDES recipe: directional keys, replay protection, tag/length/MKI rules, key redaction in logs (gpt-6.1-sol, gpt-6-astra).
+- Auth: two challenges allowed (sipgo `maxAuthAttempts`), BYE re-sent on challenge (all three).
+- `pion/stun` dropped for a hand-rolled Binding Request (the unsuffixed module is v0.6.1 with a parser panic; Fable, gpt-6.1-sol); versions pinned (all three).
+- URIs: `sip:` only, explicit port honored, component-aware escaping, CR/LF rejected; `{call_id}` placeholder; provider recipes (all three).
+- Hooks back to allochka's single worker (Fable, gpt-6.1-sol); claims narrowed to two qualified targets (gpt-6-astra).
