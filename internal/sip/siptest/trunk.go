@@ -573,3 +573,31 @@ func (tr *Trunk) RespondRaw(req *sip.Request, code int, reason, toTag string, bo
 	}
 	return tr.WriteResponse(res)
 }
+
+// CloseConnection closes the TCP/TLS connection req arrived on, the way a
+// far end or a NAT drops a signaling connection mid-call. It reports whether
+// a connection was found.
+func (tr *Trunk) CloseConnection(req *sip.Request) bool {
+	conn, err := tr.ua.TransportLayer().GetConnection(tr.transport, req.Source())
+	if err != nil || conn == nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// ByeUnknownDialog sends the caller a BYE whose To tag matches no dialog it
+// has and returns the answer (a correct caller replies 481).
+func (d *Dialog) ByeUnknownDialog(ctx context.Context) (*sip.Response, error) {
+	inv := d.sess.InviteRequest
+	contact := inv.Contact()
+	if contact == nil {
+		return nil, errors.New("siptest: INVITE has no Contact")
+	}
+	req := sip.NewRequest(sip.BYE, contact.Address)
+	req.SetTransport(inv.Transport())
+	to := inv.From().AsTo()
+	to.Params.Add("tag", "bogus-tag")
+	req.AppendHeader(&to)
+	return d.sess.Do(ctx, req)
+}

@@ -59,11 +59,20 @@ type UA struct {
 	server  *sipgo.Server
 	dialogs *sipgo.DialogClientCache
 
+	// bgCtx is cancelled by Close; every background cleanup and keepalive
+	// goroutine runs under it and is counted in loops, so Close returns only
+	// when all of them are gone.
+	bgCtx    context.Context
+	bgCancel context.CancelFunc
+	// callKeepalive is the CRLF ping interval of an established TCP/TLS call.
+	callKeepalive time.Duration
+
 	mu       sync.Mutex
 	closed   bool
 	cancels  []context.CancelFunc
-	loops    sync.WaitGroup // running keepalive goroutines
-	nextHop  netip.AddrPort // cache for keepalive
+	loops    sync.WaitGroup      // running keepalive and cleanup goroutines
+	attempts map[string]*attempt // INVITE attempts by Call-ID (see dial.go)
+	nextHop  netip.AddrPort      // cache for keepalive
 	haveNext bool
 }
 
@@ -128,7 +137,12 @@ func NewUA(o Options) (*UA, error) {
 		return nil, fmt.Errorf("sip: new user agent: %w", err)
 	}
 
-	u := &UA{opts: o, transport: o.Transport, log: log, resolver: resolver, ua: sua}
+	u := &UA{
+		opts: o, transport: o.Transport, log: log, resolver: resolver, ua: sua,
+		callKeepalive: callKeepaliveEvery,
+		attempts:      make(map[string]*attempt),
+	}
+	u.bgCtx, u.bgCancel = context.WithCancel(context.Background())
 
 	copts := []sipgo.ClientOption{sipgo.WithClientLogger(log)}
 	if o.Transport == "udp" {
@@ -166,8 +180,31 @@ func NewUA(o Options) (*UA, error) {
 		Scheme: "sip", User: "siptooth", Host: "invalid",
 	}})
 
-	sua.TransportLayer().OnMessage(func(m gosip.Message) { LogMessage(log, "recv", m) })
+	sua.TransportLayer().OnMessage(u.onMessage)
+	u.installHandlers()
 	return u, nil
+}
+
+// callKeepaliveEvery is the RFC 5626 CRLF ping interval on the connection of
+// an established TCP/TLS call (spec 5.5). A variable only so tests can
+// shorten it.
+var callKeepaliveEvery = 25 * time.Second
+
+// spawn runs f on a goroutine that Close waits for. It reports false (and
+// does not run f) once the UA is closed.
+func (u *UA) spawn(f func()) bool {
+	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		return false
+	}
+	u.loops.Add(1)
+	u.mu.Unlock()
+	go func() {
+		defer u.loops.Done()
+		f()
+	}()
+	return true
 }
 
 // Close stops keepalives, the transaction layer and every connection.
@@ -178,6 +215,7 @@ func (u *UA) Close() error {
 		return nil
 	}
 	u.closed = true
+	u.bgCancel()
 	cancels := u.cancels
 	u.cancels = nil
 	u.mu.Unlock()
