@@ -89,6 +89,7 @@ func (u *UA) destination(ctx context.Context, transport, hop string) (string, er
 // reason than ctx leaves its TCP socket to the garbage collector; that is
 // sipgo's TLS dial, which cannot be wrapped from outside.
 func (u *UA) writeRequest(ctx context.Context, req *gosip.Request) error {
+	u.pinRequest(ctx, req)
 	if req.Via() == nil {
 		if err := sipgo.ClientRequestAddVia(u.client, req); err != nil {
 			return err
@@ -103,4 +104,16 @@ func (u *UA) writeRequest(ctx context.Context, req *gosip.Request) error {
 	}
 	defer conn.TryClose()
 	return conn.WriteMsg(req)
+}
+
+// pinRequest sets req's destination to the pinned address of the host it
+// would be sent to (the first Route, else the Request-URI, or an explicit
+// destination such as a strict router's), so ACK and BYE follow the same
+// resolution rules as the INVITE flow.
+func (u *UA) pinRequest(ctx context.Context, req *gosip.Request) {
+	dest, err := u.destination(ctx, req.Transport(), req.Destination())
+	if err != nil {
+		return // sipgo resolves it itself and reports the failure
+	}
+	req.SetDestination(dest)
 }

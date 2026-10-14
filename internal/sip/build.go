@@ -3,7 +3,9 @@ package sip
 import (
 	"errors"
 	"fmt"
+	"net"
 	"sort"
+	"strconv"
 	"strings"
 
 	gosip "github.com/emiago/sipgo/sip"
@@ -173,6 +175,16 @@ func (p dialogPath) apply(req *gosip.Request) {
 		first := *routes[0].Clone()
 		first.Headers = nil
 		req.Recipient = first
+		// The strict router is where the request goes, not the next Route
+		// or the Contact sipgo would derive a destination from.
+		port := first.Port
+		if port == 0 {
+			port = 5060
+			if first.IsEncrypted() {
+				port = 5061
+			}
+		}
+		req.SetDestination(net.JoinHostPort(first.Host, strconv.Itoa(port)))
 		routes = routes[1:]
 	}
 	for i := range routes {

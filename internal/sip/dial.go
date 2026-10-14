@@ -111,15 +111,21 @@ func (u *UA) Start(req DialRequest) (Attempt, error) {
 		claimed:   make(map[string]bool),
 		pending:   make(map[string]*gosip.Response),
 		acks:      make(map[string]*gosip.Request),
+		forks:     make(map[string]*forkState),
 	}
 	a.setupCtx, a.setupCancel = context.WithCancel(u.bgCtx)
+	// waitCtx covers WaitAnswer, including the connection of an
+	// authenticated retry. UA.Close ends it (as a forced cancel, so sipgo
+	// does not try a CANCEL of its own).
 	a.waitCtx, a.waitCancel = context.WithCancelCause(context.Background())
+	a.stopClose = context.AfterFunc(u.bgCtx, func() { a.waitCancel(sipgo.WaitAnswerForceCancelErr) })
 
 	u.mu.Lock()
 	if u.closed {
 		u.mu.Unlock()
 		a.setupCancel()
 		a.waitCancel(nil)
+		a.stopClose()
 		return nil, errors.New("sip: user agent closed")
 	}
 	u.attempts[a.callID] = a
@@ -129,6 +135,7 @@ func (u *UA) Start(req DialRequest) (Attempt, error) {
 		u.forget(a.callID)
 		a.setupCancel()
 		a.waitCancel(nil)
+		a.stopClose()
 		return nil, errors.New("sip: user agent closed")
 	}
 	return a, nil
@@ -170,6 +177,7 @@ type attempt struct {
 	transport string
 	result    chan DialResult // capacity 1; written once under mu
 	fin       chan struct{}   // closed when run returns
+	stopClose func() bool     // detaches waitCtx from the UA's lifetime
 
 	// setupCtx covers DNS, connect and TLS before the INVITE is on the wire;
 	// Abandon cancels it then. waitCtx is WaitAnswer's context; it is only
@@ -190,7 +198,12 @@ type attempt struct {
 	cancelSent bool
 	// acks holds the ACK template of every dialog this attempt ACKed, by To
 	// tag; a retransmitted 2xx of that tag is answered with a clone.
-	acks      map[string]*gosip.Request
+	acks map[string]*gosip.Request
+	// forks holds the 2xx of every dialog that is being discarded, by To
+	// tag, until its BYE has been sent: an ACK that has been delivered always
+	// owes a BYE, even when the first ACK failed and a retransmitted 2xx
+	// delivers it later.
+	forks     map[string]*forkState
 	published bool
 	// decided is set once the goroutine knows which dialog (To tag) it keeps
 	// or that it keeps none. claimed holds the tags somebody owns (kept, or
@@ -250,6 +263,7 @@ func (a *attempt) run() {
 	defer close(a.fin)
 	defer a.setupCancel()
 	defer a.waitCancel(sipgo.WaitAnswerForceCancelErr)
+	defer a.stopClose()
 	// A late 2xx of a fork still needs routing for one transaction lifetime.
 	defer u.forgetLater(a.callID)
 
@@ -483,7 +497,9 @@ func (a *attempt) resendAck(tag string) {
 		LogMessage(a.u.log, "send", req)
 		if err := a.u.writeRequest(ctx, req); err != nil {
 			a.u.log.Debug("ACK for retransmitted 2xx failed", "call_id", a.callID, "error", err)
+			return
 		}
+		a.byeFork(tag) // no-op unless this is a discarded dialog still owing its BYE
 	})
 }
 
@@ -544,18 +560,48 @@ func (a *attempt) cleanup(forks []*gosip.Response) {
 	}
 }
 
+// forkState is a discarded dialog that still owes a BYE.
+type forkState struct {
+	res     *gosip.Response
+	byeSent bool
+}
+
 func (a *attempt) cleanupFork(res *gosip.Response) {
-	u := a.u
-	ctx, cancel := context.WithTimeout(u.bgCtx, u.ioTimeout)
-	defer cancel()
+	tag := toTag(res)
+	a.mu.Lock()
+	a.forks[tag] = &forkState{res: res.Clone()}
+	a.mu.Unlock()
 	if err := a.ack(res); err != nil {
-		u.log.Debug("ACK for extra answer failed", "error", err)
+		// A retransmitted 2xx of this tag retries the ACK and, once it is
+		// delivered, the BYE (resendAck).
+		a.u.log.Debug("ACK for extra answer failed", "error", err)
 		return
 	}
+	a.byeFork(tag)
+}
+
+// byeFork sends the BYE of a discarded dialog once its ACK was delivered.
+func (a *attempt) byeFork(tag string) {
+	u := a.u
+	a.mu.Lock()
+	f := a.forks[tag]
+	if f == nil || f.byeSent {
+		a.mu.Unlock()
+		return
+	}
+	f.byeSent = true // one sender at a time; reset if the BYE fails
+	res := f.res.Clone()
+	a.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(u.bgCtx, u.ioTimeout)
+	defer cancel()
 	bye := buildBye(a.invite, res, newDialogPath(a.invite, res), u.opts.UserAgent)
 	LogMessage(u.log, "send", bye)
 	if err := u.sendBye(ctx, bye); err != nil {
 		u.log.Debug("BYE for extra answer failed", "error", err)
+		a.mu.Lock()
+		f.byeSent = false // a further retransmitted 2xx tries again
+		a.mu.Unlock()
 	}
 }
 
@@ -610,6 +656,7 @@ func isChallenge(res *gosip.Response) bool {
 // sendBye sends bye outside any sipgo session and waits for the final
 // answer, answering one digest challenge (spec 5.4).
 func (u *UA) sendBye(ctx context.Context, bye *gosip.Request) error {
+	u.pinRequest(ctx, bye)
 	tx, err := u.client.TransactionRequest(ctx, bye)
 	if err != nil {
 		return err

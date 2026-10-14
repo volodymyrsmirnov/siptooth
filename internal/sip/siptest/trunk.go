@@ -90,6 +90,7 @@ type Trunk struct {
 	contact   sip.ContactHeader
 	ca        *testCA
 	closers   []io.Closer
+	listener  io.Closer // the TCP/TLS listener, closed by StopListening
 
 	keepalives atomic.Int64
 	rawMu      sync.Mutex
@@ -175,6 +176,7 @@ func NewTrunk(t testing.TB, transport string) *Trunk {
 	}
 	if listener != nil {
 		tr.closers = append(tr.closers, listener)
+		tr.listener = listener
 	}
 
 	tr.ua, err = sipgo.NewUA(
@@ -229,6 +231,14 @@ func (tr *Trunk) close() {
 		c.Close()
 	}
 	tr.ua.Close()
+}
+
+// StopListening closes the TCP/TLS listener (existing connections stay), so
+// a test can bind something else to the same port.
+func (tr *Trunk) StopListening() {
+	if tr.listener != nil {
+		tr.listener.Close()
+	}
 }
 
 // Transport returns "udp", "tcp" or "tls".

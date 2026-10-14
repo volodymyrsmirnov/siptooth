@@ -497,3 +497,149 @@ func TestCloseDuringStalledAck(t *testing.T) {
 		t.Errorf("Close took %v with a stalled ACK handshake", d)
 	}
 }
+
+func TestStrictRouterGetsTheRequest(t *testing.T) {
+	router := siptest.NewTrunk(t, "udp")
+	router.OnBye(byeOK)
+	endpoint := siptest.NewTrunk(t, "udp")
+	endpoint.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		rr := gosip.NewHeader("Record-Route", fmt.Sprintf("<sip:127.0.0.1:%d;transport=udp>", router.Addr().Port()))
+		endpoint.RespondRaw(req, 200, "OK", "strict2", answerBody(), rr)
+	})
+	endpoint.OnBye(byeOK)
+	u := newTestUA(t, endpoint, nil)
+	r := result(t, start(t, u, dialRequest(endpoint, nil)), 5*time.Second)
+	if r.Call == nil {
+		t.Fatalf("result = %+v", r)
+	}
+	if err := r.Call.Hangup(ctx5(t)); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []string{"ACK", "BYE"} {
+		if _, ok := router.WaitRequest(m, 1, 5*time.Second); !ok {
+			t.Errorf("the strict router never received the %s", m)
+		}
+		if n := len(endpoint.RequestsFor(m)); n != 0 {
+			t.Errorf("the endpoint got the %s directly (%d), skipping the strict router", m, n)
+		}
+	}
+	closeBounded(t, u)
+}
+
+func TestForkByeAfterFailedAck(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp")
+	reqs := make(chan *gosip.Request, 1)
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) { reqs <- req })
+	tr.OnBye(byeOK)
+	// The fork's Contact: nothing listens there yet, so its first ACK fails.
+	probe, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+	forkContact := func() gosip.Header {
+		return &gosip.ContactHeader{Address: gosip.Uri{Scheme: "sip", User: "fork", Host: "127.0.0.1", Port: port,
+			UriParams: gosip.HeaderParams{{K: "transport", V: "tcp"}}}}
+	}
+	u := newTestUA(t, tr, nil)
+	u.ioTimeout = 500 * time.Millisecond
+	a := start(t, u, dialRequest(tr, nil))
+	req := <-reqs
+	if err := tr.RespondRaw(req, 200, "OK", "main", answerBody()); err != nil {
+		t.Fatal(err)
+	}
+	if r := result(t, a, 5*time.Second); r.Call == nil {
+		t.Fatalf("result = %+v", r)
+	}
+	tr.RespondRaw(req, 200, "OK", "fork", answerBody(), forkContact()) // its ACK is refused
+	time.Sleep(300 * time.Millisecond)
+
+	ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Skipf("cannot reuse port %d: %v", port, err)
+	}
+	var mu sync.Mutex
+	var got bytes.Buffer
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					n, err := c.Read(buf)
+					mu.Lock()
+					got.Write(buf[:n])
+					mu.Unlock()
+					if err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+	tr.RespondRaw(req, 200, "OK", "fork", answerBody(), forkContact()) // retransmitted 2xx
+	eventually(t, "ACK then BYE to the fork", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		s := got.String()
+		i := strings.Index(s, "ACK sip:")
+		return i >= 0 && strings.Contains(s[i:], "BYE sip:")
+	})
+	closeBounded(t, u)
+}
+
+func TestCloseDuringStalledChallengeRetry(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tls")
+	port := int(tr.Addr().Port())
+	var once sync.Once
+	var accepted atomic.Int32
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		siptest.Challenge(req, tx, false, testRealm, "retry-nonce", false)
+		// The authenticated retry must open a new connection; make that one
+		// stall in the TLS handshake.
+		once.Do(func() {
+			tr.CloseConnection(req)
+			tr.StopListening()
+			ln, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { ln.Close() })
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					accepted.Add(1)
+					t.Cleanup(func() { c.Close() })
+				}
+			}()
+		})
+	})
+	u := newTestUA(t, tr, withCredentials)
+	start(t, u, dialRequest(tr, func(r *DialRequest) {
+		// Runs before sipgo sends the authenticated retry: give the trunk time
+		// to drop the first connection so the retry has to dial again.
+		r.OnResponse = func(status int, _ string) {
+			if status == 401 {
+				time.Sleep(400 * time.Millisecond)
+			}
+		}
+	}))
+	if _, ok := tr.WaitRequest("INVITE", 1, 5*time.Second); !ok {
+		t.Fatal("no INVITE")
+	}
+	eventually(t, "the retry to reach the stalled listener", func() bool { return accepted.Load() > 0 })
+	time.Sleep(200 * time.Millisecond) // the retry is now inside its handshake
+	begin := time.Now()
+	closeBounded(t, u)
+	if d := time.Since(begin); d > 2*time.Second {
+		t.Errorf("Close took %v with a stalled retry handshake", d)
+	}
+}
