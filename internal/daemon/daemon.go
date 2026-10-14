@@ -132,7 +132,7 @@ func run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 			status: coord.SetRegistration, errors: dispatcher, log: logger,
 		}
 		regCtx, regCancel := context.WithCancel(context.Background())
-		reg.Store(ua.Register(regCtx, "", cfg.SIP.RegistrarHost(),
+		reg.Store(ua.Register(regCtx, cfg.SIP.RegistrationAOR(), cfg.SIP.RegistrarHost(),
 			time.Duration(cfg.SIP.RegisterExpiresSeconds)*time.Second, rep.onState))
 		st.reg = registrationStop(rep, regCancel, reg.Load().Unregister, logger)
 	}
