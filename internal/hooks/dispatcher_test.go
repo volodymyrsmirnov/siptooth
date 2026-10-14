@@ -89,3 +89,21 @@ func TestWithheldCallerEnvEmpty(t *testing.T) {
 	d.Emit("call.ringing", CallInfo{ID: "x", CallerWithheld: true})
 	waitFor(t, func() bool { b, _ := os.ReadFile(out); return string(b) == "[]\n" })
 }
+
+func TestOutstandingCoversQueuedAndInFlight(t *testing.T) {
+	dir := t.TempDir()
+	d := NewDispatcher([]config.Hook{{ID: "h", Events: []string{"call.ended"}, Command: "sleep 0.2; touch " + filepath.Join(dir, "done"), TimeoutSeconds: 5}}, nil)
+	d.Emit("call.ended", sample())
+	d.Emit("call.ended", sample())
+	if d.Outstanding() != 2 {
+		t.Fatalf("queued: %d", d.Outstanding())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go d.Run(ctx)
+	time.Sleep(50 * time.Millisecond)
+	if d.Pending() != 1 || d.Outstanding() != 2 {
+		t.Fatalf("one in flight: pending %d outstanding %d", d.Pending(), d.Outstanding())
+	}
+	waitFor(t, func() bool { return d.Outstanding() == 0 })
+}

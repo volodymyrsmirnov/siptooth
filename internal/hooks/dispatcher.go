@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
@@ -28,6 +29,9 @@ type Dispatcher struct {
 	hooks []config.Hook
 	log   *slog.Logger
 	queue chan job
+	// outstanding counts jobs queued or being delivered, so shutdown can wait
+	// for the last events (Outstanding).
+	outstanding atomic.Int64
 
 	mu       sync.Mutex
 	dropped  int
@@ -45,15 +49,21 @@ func NewDispatcher(hooks []config.Hook, logger *slog.Logger) *Dispatcher {
 // Pending reports the number of queued, not yet started deliveries.
 func (d *Dispatcher) Pending() int { return len(d.queue) }
 
+// Outstanding reports the deliveries queued or in progress; the daemon polls
+// it at shutdown to let the final events out.
+func (d *Dispatcher) Outstanding() int { return int(d.outstanding.Load()) }
+
 // enqueue never blocks. On overflow the event is dropped and a rate-limited warning
 // (hook_queue_full) is logged; it never triggers system.error hooks.
 func (d *Dispatcher) enqueue(j job) {
 	j.occurredAt = time.Now()
+	d.outstanding.Add(1)
 	select {
 	case d.queue <- j:
 		return
 	default:
 	}
+	d.outstanding.Add(-1)
 	d.mu.Lock()
 	d.dropped++
 	n := d.dropped
@@ -85,6 +95,7 @@ func (d *Dispatcher) Run(ctx context.Context) {
 			return
 		case j := <-d.queue:
 			d.process(ctx, j)
+			d.outstanding.Add(-1)
 		}
 	}
 }
