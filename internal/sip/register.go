@@ -228,7 +228,9 @@ func (r *Registration) keepalive(ctx context.Context) error {
 // cycle registers once and, when the registrar saw a different flow address
 // than the Contact it was given, again at once with the discovered one (the
 // same request expires the superseded Contact). It returns the granted
-// lifetime. The published state names only a Contact that is registered.
+// lifetime. Registered is published only once the flow is settled (or the follow-up cap
+// is reached, then with the last registered Contact), so a caller that dials
+// on it never gets a pre-correction Contact.
 func (r *Registration) cycle(ctx context.Context) (time.Duration, error) {
 	if !r.contact.IsValid() {
 		c, err := r.initialContact(ctx)
@@ -239,6 +241,7 @@ func (r *Registration) cycle(ctx context.Context) (time.Duration, error) {
 		r.contact = c
 	}
 	var granted time.Duration
+	var last RegState // the last Contact successfully registered
 	for i := 0; i < maxFlowFollowups; i++ {
 		used := r.contact
 		res, flow, err := r.register(ctx, used, r.want)
@@ -256,14 +259,16 @@ func (r *Registration) cycle(ctx context.Context) (time.Duration, error) {
 			return 0, err
 		}
 		r.held = []netip.AddrPort{used} // the same request expired every other Contact
-		r.setState(RegState{Registered: true, Contact: used, Expires: time.Now().Add(granted)})
+		last = RegState{Registered: true, Contact: used, Expires: time.Now().Add(granted)}
 		if !flow.IsValid() || flow == used {
+			r.setState(last) // the flow is settled: only now is the Contact worth dialing with
 			return granted, nil
 		}
 		r.contact = flow
 		r.u.log.Info("registrar sees a different flow address, registering again", "contact", flow.String())
 	}
 	r.u.log.Warn("flow address keeps changing, registering the newest one at the next refresh", "contact", r.contact.String())
+	r.setState(last)
 	return granted, nil
 }
 

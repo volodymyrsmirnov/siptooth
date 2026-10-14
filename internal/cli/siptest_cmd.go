@@ -300,7 +300,9 @@ func onOff(b bool) string {
 	return "off"
 }
 
-// register registers the test's own Contact and waits for the first answer.
+// register registers the test's own Contact and waits (bounded) for the
+// registered state, which the registration publishes only once the Contact is
+// the registrar-observed flow address; it prints that final Contact.
 func (t *sipTest) register(ctx context.Context, ua *sip.UA, cfg config.Config) (reg *sip.Registration, ok bool) {
 	states := make(chan sip.RegState, 16)
 	r := ua.Register(context.Background(), cfg.SIP.RegistrationAOR(), cfg.SIP.RegistrarHost(),

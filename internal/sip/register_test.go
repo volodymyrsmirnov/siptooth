@@ -352,6 +352,49 @@ func TestReregisterOnMappingChange(t *testing.T) {
 	closeBounded(t, u)
 }
 
+// The first REGISTER's Contact is a private guess; State must not offer it as
+// registered while the flow-corrected REGISTER is still to come.
+func TestRegisteredOnlyAfterFlowCorrection(t *testing.T) {
+	tr := siptest.NewTrunk(t, "udp")
+	reg := newFakeRegistrar(tr, 0)
+	u := regUA(t, tr, nil)
+	want := netip.MustParseAddrPort("203.0.113.5:40000")
+	reg.flowIP.Store("203.0.113.5")
+	reg.flowPort.Store(40000)
+	var bad atomic.Value
+	var log stateLog
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r := u.Register(ctx, "", tr.HostPort(), 60*time.Second, func(s RegState) {
+		log.add(s)
+		if s.Registered && s.Contact != want {
+			bad.Store(s.Contact.String())
+		}
+	})
+	stop := make(chan struct{})
+	polled := make(chan struct{})
+	go func() {
+		defer close(polled)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if s := r.State(); s.Registered && s.Contact != want {
+				bad.Store(s.Contact.String())
+			}
+		}
+	}()
+	waitState(t, &log, "corrected", func(s RegState) bool { return s.Registered && s.Contact == want })
+	close(stop)
+	<-polled
+	if v := bad.Load(); v != nil {
+		t.Errorf("Registered with the pre-correction Contact %v", v)
+	}
+	closeBounded(t, u)
+}
+
 func TestRegisterRetryAfterFailure(t *testing.T) {
 	tr := siptest.NewTrunk(t, "udp")
 	reg := newFakeRegistrar(tr, 0)
@@ -528,7 +571,7 @@ func TestUnregisterRemovesEveryContact(t *testing.T) {
 	reg.flowPort.Store(40000) // the registrar sees another port than the guess, so a follow-up is due
 	u := regUA(t, tr, nil)
 	r, log, _ := startReg(t, u, tr, 60*time.Second)
-	waitState(t, log, "registered on the guess", registered)
+	// The guess is bound but never published as Registered.
 	waitState(t, log, "a failed follow-up", func(s RegState) bool { return !s.Registered && s.Err != nil })
 	if len(reg.bindings()) != 1 {
 		t.Fatalf("bindings = %v, want only the guess", reg.bindings())
