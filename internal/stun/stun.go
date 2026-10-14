@@ -126,6 +126,9 @@ func parseAddress(v []byte, xor bool, txID [12]byte) (netip.AddrPort, error) {
 	default:
 		return netip.AddrPort{}, fmt.Errorf("stun: unknown address family %d", v[1])
 	}
+	if addr.IsUnspecified() || port == 0 {
+		return netip.AddrPort{}, errors.New("stun: mapped address is unspecified or has port 0")
+	}
 	return netip.AddrPortFrom(addr, port), nil
 }
 

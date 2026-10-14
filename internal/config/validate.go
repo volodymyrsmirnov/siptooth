@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -39,8 +40,18 @@ var forbiddenHeaders = map[string]bool{
 	"supported": true, "require": true, "authorization": true, "proxy-authorization": true,
 }
 
+// compactHeaders maps RFC 3261 section 7.3.3 compact names to their long form.
+var compactHeaders = map[string]string{
+	"i": "call-id", "m": "contact", "e": "content-encoding", "l": "content-length",
+	"c": "content-type", "f": "from", "s": "subject", "k": "supported", "t": "to",
+	"v": "via", "o": "event", "r": "refer-to", "x": "session-expires", "u": "allow-events",
+}
+
 func forbiddenHeader(name string) bool {
 	n := strings.ToLower(name)
+	if long, ok := compactHeaders[n]; ok {
+		n = long
+	}
 	return forbiddenHeaders[n] || strings.HasPrefix(n, "content-")
 }
 
@@ -122,7 +133,7 @@ func Validate(c Config, password string) []error {
 		} else if expanded, err := placeholder.ExpandURI(c.SIP.Target, sample); err != nil {
 			add("sip.target", "%v", err)
 		} else {
-			for _, p := range strings.Split(strings.SplitN(expanded, "?", 2)[0], ";")[1:] {
+			for _, p := range placeholder.URIParams(expanded) {
 				if k, v, ok := strings.Cut(p, "="); ok && strings.EqualFold(k, "transport") &&
 					transport != "" && !strings.EqualFold(v, transport) {
 					add("sip.target", "transport parameter %q does not match sip.transport %q", v, transport)
@@ -168,7 +179,13 @@ func Validate(c Config, password string) []error {
 	if c.SIP.SRTP && transport != "tls" {
 		add("sip.srtp", "sip.srtp requires sip.transport tls")
 	}
-	for name, value := range c.SIP.Headers {
+	headerNames := make([]string, 0, len(c.SIP.Headers))
+	for name := range c.SIP.Headers {
+		headerNames = append(headerNames, name)
+	}
+	sort.Strings(headerNames)
+	for _, name := range headerNames {
+		value := c.SIP.Headers[name]
 		field := "sip.headers[" + strconv.Quote(name) + "]"
 		if !tokenRe.MatchString(name) {
 			add("sip.headers", "header name %q is not a valid token", name)

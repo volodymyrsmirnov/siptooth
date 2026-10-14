@@ -5,6 +5,9 @@ package placeholder
 
 import (
 	"fmt"
+	"net/netip"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -186,8 +189,39 @@ func ExpandURI(tmpl string, v Values) (string, error) {
 	return out, nil
 }
 
-// checkSIPURI is a minimal sanity check: scheme "sip:", non-empty host, no
-// whitespace or control characters.
+// splitURI splits a sip: URI (scheme already verified) into hostport and the
+// parameter list. The user part ends at the first '@' that precedes any '?'
+// (a user part cannot contain an unescaped '?'); ';' and '?' inside it are not
+// URI parameters.
+func splitURI(u string) (hostport string, params []string) {
+	rest := u[4:]
+	q := strings.IndexByte(rest, '?')
+	if at := strings.IndexByte(rest, '@'); at >= 0 && (q < 0 || at < q) {
+		rest = rest[at+1:]
+	}
+	if i := strings.IndexByte(rest, '?'); i >= 0 {
+		rest = rest[:i]
+	}
+	parts := strings.Split(rest, ";")
+	return parts[0], parts[1:]
+}
+
+// URIParams returns the URI parameters (the ";name=value" items after the host
+// part, without headers) of a sip: URI. Text in the user part or the headers
+// never counts. It returns nil for anything that does not start with "sip:".
+func URIParams(u string) []string {
+	if len(u) < 4 || !strings.EqualFold(u[:4], "sip:") {
+		return nil
+	}
+	_, params := splitURI(u)
+	return params
+}
+
+var hostLabelRe = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
+
+// checkSIPURI checks the scheme "sip:", the absence of whitespace and control
+// characters, and a well-formed host (hostname, IPv4 or [IPv6]) with an
+// optional port in 1..65535.
 func checkSIPURI(u string) error {
 	if len(u) < 4 || !strings.EqualFold(u[:4], "sip:") {
 		return fmt.Errorf("not a sip: URI")
@@ -197,26 +231,65 @@ func checkSIPURI(u string) error {
 			return fmt.Errorf("invalid character %q in URI", c)
 		}
 	}
-	rest := u[4:]
-	if at := strings.IndexByte(rest, '@'); at >= 0 {
-		rest = rest[at+1:]
-	}
-	if i := strings.IndexAny(rest, ";?"); i >= 0 {
-		rest = rest[:i]
-	}
-	host := rest
-	if strings.HasPrefix(host, "[") {
-		end := strings.IndexByte(host, ']')
+	hostport, _ := splitURI(u)
+	host, port := hostport, ""
+	if strings.HasPrefix(hostport, "[") {
+		end := strings.IndexByte(hostport, ']')
 		if end < 2 {
 			return fmt.Errorf("empty or malformed IPv6 host")
 		}
+		if a, err := netip.ParseAddr(hostport[1:end]); err != nil || !a.Is6() {
+			return fmt.Errorf("invalid IPv6 host %q", hostport[:end+1])
+		}
+		rest := hostport[end+1:]
+		if rest != "" {
+			if rest[0] != ':' {
+				return fmt.Errorf("unexpected text after IPv6 host")
+			}
+			port = rest[1:]
+			if port == "" {
+				return fmt.Errorf("empty port")
+			}
+		}
+	} else {
+		if i := strings.IndexByte(hostport, ':'); i >= 0 {
+			host, port = hostport[:i], hostport[i+1:]
+			if port == "" {
+				return fmt.Errorf("empty port")
+			}
+		}
+		if host == "" {
+			return fmt.Errorf("empty host")
+		}
+		if err := checkHostname(host); err != nil {
+			return err
+		}
+	}
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || strings.TrimLeft(port, "0123456789") != "" {
+			return fmt.Errorf("invalid port %q", port)
+		}
+	}
+	return nil
+}
+
+func checkHostname(host string) error {
+	if a, err := netip.ParseAddr(host); err == nil {
+		if !a.Is4() {
+			return fmt.Errorf("invalid host %q", host)
+		}
 		return nil
 	}
-	if i := strings.IndexByte(host, ':'); i >= 0 {
-		host = host[:i]
+	labels := strings.Split(strings.TrimSuffix(host, "."), ".")
+	for _, l := range labels {
+		if len(l) > 63 || !hostLabelRe.MatchString(l) {
+			return fmt.Errorf("invalid host %q", host)
+		}
 	}
-	if host == "" {
-		return fmt.Errorf("empty host")
+	// A dotted-numeric name that is not an IPv4 address is malformed.
+	if last := labels[len(labels)-1]; strings.TrimLeft(last, "0123456789") == "" {
+		return fmt.Errorf("invalid host %q", host)
 	}
 	return nil
 }

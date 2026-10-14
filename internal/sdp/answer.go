@@ -51,8 +51,11 @@ func parseStream(body []byte) (stream, error) {
 				continue
 			}
 			f := strings.Fields(val)
-			if len(f) < 4 || f[0] != "audio" {
+			if len(f) == 0 || f[0] != "audio" {
 				continue
+			}
+			if len(f) < 4 {
+				return st, bad("malformed m=audio line %q", val)
 			}
 			p, err := strconv.Atoi(f[1])
 			if err != nil || p < 0 || p > 65535 {

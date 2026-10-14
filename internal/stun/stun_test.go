@@ -200,3 +200,28 @@ func TestQueryTimeout(t *testing.T) {
 		t.Fatalf("elapsed %v, want about attempts*timeout", el)
 	}
 }
+
+func TestParseRejectsUnspecifiedOrPortZero(t *testing.T) {
+	for _, ap := range []netip.AddrPort{
+		netip.MustParseAddrPort("0.0.0.0:5000"),
+		netip.MustParseAddrPort("1.2.3.4:0"),
+	} {
+		if _, err := ParseBindingResponse(response(rfcTxID, ap), rfcTxID); err == nil {
+			t.Errorf("%v must be rejected", ap)
+		}
+	}
+	b := []byte{0x01, 0x01, 0x00, 0x0c, 0x21, 0x12, 0xa4, 0x42}
+	b = append(b, rfcTxID[:]...)
+	b = append(b, 0x00, 0x01, 0x00, 0x08, 0x00, 0x01, 0x1f, 0x90, 0, 0, 0, 0)
+	if _, err := ParseBindingResponse(b, rfcTxID); err == nil {
+		t.Error("unspecified MAPPED-ADDRESS must be rejected")
+	}
+	// IPv6 unspecified, XOR-MAPPED: the encoded value is the mask itself.
+	v6 := []byte{0x01, 0x01, 0x00, 0x18, 0x21, 0x12, 0xa4, 0x42}
+	v6 = append(v6, rfcTxID[:]...)
+	v6 = append(v6, 0x00, 0x20, 0x00, 0x14, 0x00, 0x02, 0x21, 0x12^0x13, 0x21, 0x12, 0xa4, 0x42)
+	v6 = append(v6, rfcTxID[:]...)
+	if _, err := ParseBindingResponse(v6, rfcTxID); err == nil {
+		t.Error("unspecified IPv6 must be rejected")
+	}
+}

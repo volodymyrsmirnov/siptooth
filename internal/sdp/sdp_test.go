@@ -97,6 +97,8 @@ func TestParseAnswer(t *testing.T) {
 		{name: "pcmu only", body: answer(), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "198.51.100.9:30000"},
 		{name: "both, pcma first", body: crlf("v=0", "c=IN IP4 1.2.3.4", "m=audio 4000 RTP/AVP 8 0"), ok: true, send: g711.PCMA, recv: []g711.Codec{g711.PCMU, g711.PCMA}, addr: "1.2.3.4:4000"},
 		{name: "telephone-event ignored", body: crlf("c=IN IP4 1.2.3.4", "m=audio 4000 RTP/AVP 101 8", "a=rtpmap:101 telephone-event/8000"), ok: true, send: g711.PCMA, recv: []g711.Codec{g711.PCMA}, addr: "1.2.3.4:4000"},
+		{name: "malformed first audio does not fall through", body: crlf("c=IN IP4 1.2.3.4", "m=audio 4000 RTP/AVP", "m=audio 5000 RTP/AVP 0")},
+		{name: "bad port first audio does not fall through", body: crlf("c=IN IP4 1.2.3.4", "m=audio xx RTP/AVP 0", "m=audio 5000 RTP/AVP 0")},
 		{name: "media c overrides", body: crlf("c=IN IP4 1.1.1.1", "m=audio 4000 RTP/AVP 0", "c=IN IP4 2.2.2.2"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "2.2.2.2:4000"},
 		{name: "explicit sendrecv", body: answer("a=sendrecv"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "198.51.100.9:30000"},
 		{name: "video first with own c and sendonly", body: crlf("c=IN IP4 1.2.3.4", "m=video 5000 RTP/AVP 96", "c=IN IP4 9.9.9.9", "a=sendonly", "m=audio 4000 RTP/AVP 0"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "1.2.3.4:4000"},

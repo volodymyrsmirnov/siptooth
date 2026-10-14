@@ -278,3 +278,49 @@ func equalConfig(a, b Config) bool {
 	}
 	return reflect.DeepEqual(a, b)
 }
+
+func TestCompactForbiddenHeaders(t *testing.T) {
+	for _, name := range []string{"i", "m", "l", "c", "e", "f", "t", "v", "k", "I", "V"} {
+		c := valid()
+		c.SIP.Headers = map[string]string{name: "x"}
+		if p := problems(c, ""); !strings.Contains(p, "not allowed") {
+			t.Errorf("compact header %q must be rejected, got %q", name, p)
+		}
+	}
+	for _, name := range []string{"s", "o", "r", "x", "u", "X-Foo"} {
+		c := valid()
+		c.SIP.Headers = map[string]string{name: "x"}
+		if p := problems(c, ""); p != "" {
+			t.Errorf("header %q must be allowed, got %q", name, p)
+		}
+	}
+}
+
+func TestHeaderErrorOrderDeterministic(t *testing.T) {
+	c := valid()
+	c.SIP.Headers = map[string]string{"Via": "x", "Call-ID": "x", "From": "x", "To": "x", "Route": "x"}
+	first := problems(c, "")
+	for i := 0; i < 20; i++ {
+		if p := problems(c, ""); p != first {
+			t.Fatalf("order changed:\n%s\n---\n%s", first, p)
+		}
+	}
+}
+
+func TestTargetTransportParamParsing(t *testing.T) {
+	c := valid()
+	c.SIP.Transport = "udp"
+	// ';transport=tls' inside the user part is not a URI parameter.
+	c.SIP.Target = "sip:a;transport=tls@host.example"
+	if p := problems(c, ""); p != "" {
+		t.Errorf("user-part text must not count as parameter: %q", p)
+	}
+	c.SIP.Target = "sip:a@host.example?x=;transport=tls"
+	if p := problems(c, ""); p != "" {
+		t.Errorf("header text must not count as parameter: %q", p)
+	}
+	c.SIP.Target = "sip:a@host.example;transport=tls"
+	if p := problems(c, ""); !strings.Contains(p, "does not match") {
+		t.Errorf("real mismatch must be reported: %q", p)
+	}
+}

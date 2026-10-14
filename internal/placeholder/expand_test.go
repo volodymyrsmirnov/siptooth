@@ -115,3 +115,42 @@ func TestCleanCaller(t *testing.T) {
 		t.Error("CRLF survived")
 	}
 }
+
+func TestExpandURIMalformedHostPort(t *testing.T) {
+	v := Values{Caller: "1"}
+	for _, tmpl := range []string{
+		"sip:a@host:notaport", "sip:a@[xyz]", "sip:a@host:99999", "sip:a@host:0", "sip:a@host:",
+		"sip:a@[::1]x", "sip:a@[::1]:abc", "sip:a@-bad.example", "sip:a@bad_host.example",
+		"sip:a@1.2.3.999", "sip:a@host:1:2", "sip:a@[1.2.3.4]", "sip:a@ho..st",
+	} {
+		if _, err := ExpandURI(tmpl, v); err == nil {
+			t.Errorf("%q must fail", tmpl)
+		}
+	}
+	for _, tmpl := range []string{"sip:a@host:5060;transport=tcp", "sip:a@[::1]:5060?x=y", "sip:a@my-host.example.com", "sip:a@10.0.0.1:65535"} {
+		if _, err := ExpandURI(tmpl, v); err != nil {
+			t.Errorf("%q: %v", tmpl, err)
+		}
+	}
+}
+
+func TestURIParams(t *testing.T) {
+	cases := map[string][]string{
+		"sip:a;transport=tls@h.example":         nil,
+		"sip:a@h.example;transport=tcp;lr?x=;y": {"transport=tcp", "lr"},
+		"sip:h.example?a@b;c":                   nil,
+		"sip:h.example;lr":                      {"lr"},
+	}
+	for u, want := range cases {
+		got := URIParams(u)
+		if len(got) != len(want) {
+			t.Errorf("%q: got %v want %v", u, got, want)
+			continue
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Errorf("%q: got %v want %v", u, got, want)
+			}
+		}
+	}
+}
