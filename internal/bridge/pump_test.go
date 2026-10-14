@@ -3,7 +3,11 @@ package bridge
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +20,11 @@ type fakeRTP struct {
 	frames   [][]int16
 	silences int
 	pl       *rtp.Playout
+
+	clk          *fakeClock              // set before the pump starts
+	silenceTimes []time.Time             // clock time of each WriteSilence
+	attempts     int                     // WriteFrame calls, including failed ones
+	frameErr     func(attempt int) error // nil: never fail; attempt counts from 1
 }
 
 func newFakeRTP(jitterMs int) *fakeRTP {
@@ -27,10 +36,24 @@ func newFakeRTP(jitterMs int) *fakeRTP {
 func (f *fakeRTP) WriteFrame(pcm []int16) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.attempts++
+	if f.frameErr != nil {
+		if err := f.frameErr(f.attempts); err != nil {
+			return err
+		}
+	}
 	f.frames = append(f.frames, append([]int16(nil), pcm...))
 	return nil
 }
-func (f *fakeRTP) WriteSilence() error   { f.mu.Lock(); f.silences++; f.mu.Unlock(); return nil }
+func (f *fakeRTP) WriteSilence() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.silences++
+	if f.clk != nil {
+		f.silenceTimes = append(f.silenceTimes, f.clk.Now())
+	}
+	return nil
+}
 func (f *fakeRTP) Playout() *rtp.Playout { return f.pl }
 func (f *fakeRTP) Stats() rtp.Stats      { return rtp.Stats{} }
 func (f *fakeRTP) frameCount() int       { f.mu.Lock(); defer f.mu.Unlock(); return len(f.frames) }
@@ -77,6 +100,7 @@ func startPump(t *testing.T, settle time.Duration, r *fakeRTP) *pumpRun {
 	pumpSide, phone := sco.NewPipe(60)
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &pumpRun{end: make(chan PumpEnd, 1), cancel: cancel, phone: phone, clk: newFakeClock(), rtp: r}
+	r.clk = run.clk
 	go func() { run.end <- RunPump(ctx, pumpSide, r, settle, run.clk) }()
 	t.Cleanup(func() { cancel(); phone.Close(); pumpSide.Close() })
 	want := 2 // stall and RTP silence tickers
@@ -198,8 +222,17 @@ func TestSettleSilenceThenAudio(t *testing.T) {
 		p.clk.Advance(step)
 	}
 	p.clk.Advance(100 * time.Millisecond) // settle elapsed
-	time.Sleep(20 * time.Millisecond)     // let the pump see the timer
-	out := toPCM(p.exchange(t, make([]byte, 60)))
+	// The pump reacts to the timer asynchronously: keep reading (the fake clock does
+	// not move) until the downlink turns into audio.
+	var out []int16
+	for i := 0; i < 2000 && out == nil; i++ {
+		if pcm := toPCM(p.exchange(t, make([]byte, 60))); pcm[0] != 0 {
+			out = pcm
+		}
+	}
+	if out == nil {
+		t.Fatal("downlink stayed silent after settle")
+	}
 	for k, s := range out {
 		if s != int16(k+1) {
 			t.Fatalf("after settle sample %d = %d, want %d", k, s, k+1)
@@ -288,5 +321,178 @@ func TestCtxReturns(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("pump did not return")
+	}
+}
+
+func (r *fakeRTP) silenceTimeline() []time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]time.Time(nil), r.silenceTimes...)
+}
+
+func TestNoRTPSilenceWhileReadsFlow(t *testing.T) {
+	r := newFakeRTP(0)
+	p := startPump(t, 0, r)
+	for i := 0; i < 100; i++ { // 375 ms of steady reads
+		p.exchange(t, make([]byte, 60))
+		p.clk.Advance(3750 * time.Microsecond)
+	}
+	if n := r.silenceCount(); n != 0 {
+		t.Fatalf("WriteSilence called %d times while reads flowed", n)
+	}
+}
+
+func TestStallThenResume(t *testing.T) {
+	r := newFakeRTP(0)
+	pushRamp(r.pl, 4000)
+	p := startPump(t, 0, r)
+	var writes atomic.Int64
+	go func() {
+		buf := make([]byte, 64)
+		for {
+			if _, err := p.phone.Read(buf); err != nil {
+				return
+			}
+			writes.Add(1)
+		}
+	}()
+	for i := 0; i < 6; i++ {
+		p.clk.Advance(100 * time.Millisecond)
+	}
+	waitFor(t, "stall writes", func() bool { return writes.Load() > 50 })
+	waitFor(t, "stall silences", func() bool { return len(r.silenceTimeline()) >= 15 })
+	ts := r.silenceTimeline()
+	if len(ts) < 10 {
+		t.Fatalf("only %d silences during a 600 ms stall", len(ts))
+	}
+	for i := 1; i < len(ts); i++ {
+		// The pump may observe the fake clock a step late, hence the tolerance.
+		if d := ts[i].Sub(ts[i-1]); d < 16*time.Millisecond || d > 24*time.Millisecond {
+			t.Fatalf("silence %d spaced %v from the previous, want 20ms", i, d)
+		}
+	}
+
+	// Reads resume: silences and stall writes stop; exactly one write per read.
+	silences := r.silenceCount()
+	time.Sleep(10 * time.Millisecond) // let in-flight stall writes land
+	base := writes.Load()
+	const reads = 60
+	for i := 0; i < reads; i++ {
+		if _, err := p.phone.Write(make([]byte, 60)); err != nil {
+			t.Fatal(err)
+		}
+		want := base + int64(i) + 1
+		waitFor(t, "downlink answer", func() bool { return writes.Load() >= want })
+		p.clk.Advance(3750 * time.Microsecond)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if got := writes.Load() - base; got != reads {
+		t.Fatalf("%d SCO writes for %d reads after resume", got, reads)
+	}
+	if n := r.silenceCount(); n > silences+1 {
+		t.Fatalf("silences grew from %d to %d after reads resumed", silences, n)
+	}
+}
+
+func TestStartupEndedOnce(t *testing.T) {
+	// Leaving startup mode re-primes the playout to the jitter target, so with less
+	// than the target buffered a playout that (again) left startup mode is silent,
+	// while one in startup mode plays what it has.
+	r := newFakeRTP(600)
+	pushRamp(r.pl, 12000) // 1.5 s
+	p := startPump(t, 100*time.Millisecond, r)
+	p.clk.Advance(150 * time.Millisecond)
+	// The pump reacts to the timer asynchronously: read until audio plays.
+	audible := false
+	for i := 0; i < 2000 && !audible; i++ {
+		audible = toPCM(p.exchange(t, make([]byte, 60)))[0] != 0
+	}
+	if !audible {
+		t.Fatal("pump never ended startup mode")
+	}
+	for r.pl.Depth() > 500*time.Millisecond {
+		p.exchange(t, make([]byte, 60))
+	}
+	r.pl.SetStartup(true) // put it back; the pump must not end startup again
+	for i := 0; i < 50; i++ {
+		if toPCM(p.exchange(t, make([]byte, 60)))[0] == 0 {
+			t.Fatal("pump ended startup mode a second time")
+		}
+		p.clk.Advance(3750 * time.Microsecond)
+	}
+}
+
+func TestTransientRTPErrorsSurvive(t *testing.T) {
+	r := newFakeRTP(0)
+	r.frameErr = func(a int) error {
+		if a <= 4 {
+			return errors.New("send: no buffer space")
+		}
+		return nil
+	}
+	p := startPump(t, 0, r)
+	for i := 0; i < 100; i++ {
+		p.exchange(t, make([]byte, 60)) // the downlink is answered despite failed uplink sends
+		p.clk.Advance(3750 * time.Microsecond)
+	}
+	select {
+	case end := <-p.end:
+		t.Fatalf("pump ended: %q", end)
+	default:
+	}
+	if r.frameCount() < 10 {
+		t.Fatalf("only %d frames sent after the errors cleared", r.frameCount())
+	}
+}
+
+func TestPersistentRTPErrorsEnd(t *testing.T) {
+	r := newFakeRTP(0)
+	r.frameErr = func(int) error { return errors.New("send: network unreachable") }
+	p := startPump(t, 0, r)
+	stop := p.drain()
+	defer stop()
+	start := p.clk.Now()
+	var end PumpEnd
+	for i := 0; i < 400 && end == ""; i++ {
+		p.phone.Write(make([]byte, 60))
+		p.clk.Advance(50 * time.Millisecond)
+		time.Sleep(time.Millisecond)
+		select {
+		case end = <-p.end:
+		default:
+		}
+	}
+	if end != PumpRTPError {
+		t.Fatalf("end = %q, want %q", end, PumpRTPError)
+	}
+	if el := p.clk.Now().Sub(start); el < 5*time.Second || el > 6*time.Second {
+		t.Fatalf("ended after %v, want about 5s", el)
+	}
+}
+
+func TestPermanentRTPErrorEndsAtOnce(t *testing.T) {
+	for name, err := range map[string]error{
+		"closed":      fmt.Errorf("rtp: send: %w", net.ErrClosed),
+		"not running": rtp.ErrNotRunning,
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newFakeRTP(0)
+			r.frameErr = func(int) error { return err }
+			p := startPump(t, 0, r)
+			for i := 0; i < 6; i++ {
+				p.phone.Write(make([]byte, 60))
+			}
+			select {
+			case end := <-p.end:
+				if end != PumpRTPError {
+					t.Fatalf("end = %q", end)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("pump did not return")
+			}
+			if p.clk.Now().After(time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)) {
+				t.Fatal("clock moved")
+			}
+		})
 	}
 }

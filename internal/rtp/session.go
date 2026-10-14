@@ -122,6 +122,9 @@ func Listen(bind netip.Addr, portMin, portMax int) (*Session, error) {
 
 func (s *Session) LocalAddr() netip.AddrPort { return s.local }
 
+// ErrNotRunning is returned by the send methods before Start and after Close.
+var ErrNotRunning = errors.New("rtp: session not running")
+
 // Err delivers a fatal socket read error (not per-packet failures). It is
 // closed when the reader exits.
 func (s *Session) Err() <-chan error { return s.errCh }
@@ -285,7 +288,7 @@ func (s *Session) sendLocked(payload func(g711.Codec) []byte) error {
 	s.mu.Lock()
 	if !s.started || s.closed {
 		s.mu.Unlock()
-		return errors.New("rtp: session not running")
+		return ErrNotRunning
 	}
 	dst := s.remote
 	if s.latched.IsValid() {

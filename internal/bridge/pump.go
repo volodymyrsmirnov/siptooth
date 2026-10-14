@@ -4,6 +4,9 @@ package bridge
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"log/slog"
+	"net"
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/rtp"
@@ -15,6 +18,8 @@ const (
 	rtpFrameDur     = 20 * time.Millisecond
 	stallAfter      = 100 * time.Millisecond
 	stallLimit      = 5 * time.Second
+	rtpFailLimit    = 5 * time.Second // transient RTP send failures tolerated before giving up
+	rtpWarnEvery    = time.Second
 )
 
 // RTP is the part of an RTP session the pump uses.
@@ -39,9 +44,13 @@ const (
 // is read-driven: every SCO read is answered with the same number of bytes from
 // the playout. Without reads for 100 ms a ticker keeps the downlink and RTP
 // uplink going; after 5 s without reads it returns PumpSCOStall. A SCO write
-// error counts as PumpSCOEOF. For the first settle after start the pump writes
+// error counts as PumpSCOEOF. A permanent RTP error (closed socket, session not
+// running) returns PumpRTPError at once; other send errors are tolerated, logged
+// at most once a second, and never skip the downlink write, and only failures
+// lasting 5 s without a single success return PumpRTPError. For the first settle after start the pump writes
 // silence to SCO and leaves the playout in startup mode, then ends startup mode
-// once. The caller closes link to unblock the reader after RunPump returns.
+// once. A blocked link.Write delays the reaction to ctx; the caller unblocks it
+// (and the reader goroutine, after RunPump returns) by closing the link.
 func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock) PumpEnd {
 	mtu := link.MTU()
 	frames := make(chan []byte, 8)
@@ -88,6 +97,30 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 	lastRead := clk.Now()
 	pending := make([]int16, 0, 2*rtpFrameSamples)
 
+	var failSince, lastWarn time.Time // start of the current RTP failure streak
+	// rtpResult digests one RTP send result and reports whether the pump must stop.
+	rtpResult := func(op string, err error) bool {
+		if err == nil {
+			failSince = time.Time{}
+			return false
+		}
+		if errors.Is(err, net.ErrClosed) || errors.Is(err, rtp.ErrNotRunning) {
+			return true
+		}
+		now := clk.Now()
+		if failSince.IsZero() {
+			failSince = now
+		}
+		if now.Sub(failSince) >= rtpFailLimit {
+			return true
+		}
+		if lastWarn.IsZero() || now.Sub(lastWarn) >= rtpWarnEvery {
+			lastWarn = now
+			slog.Warn("rtp send failing", "op", op, "for", now.Sub(failSince).Round(time.Millisecond), "error", err)
+		}
+		return false
+	}
+
 	// down writes n bytes of downlink audio to SCO.
 	down := func(n int) error {
 		out := make([]byte, n&^1)
@@ -114,14 +147,16 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 			settled = true
 		case frame := <-frames:
 			lastRead = clk.Now()
+			// Samples are 16-bit; a stray odd trailing byte cannot be a sample and is dropped.
 			for i := 0; i+1 < len(frame); i += 2 {
 				pending = append(pending, int16(binary.LittleEndian.Uint16(frame[i:])))
 			}
 			for len(pending) >= rtpFrameSamples {
-				if err := r.WriteFrame(pending[:rtpFrameSamples]); err != nil {
+				stop := rtpResult("frame", r.WriteFrame(pending[:rtpFrameSamples]))
+				pending = append(pending[:0], pending[rtpFrameSamples:]...)
+				if stop {
 					return PumpRTPError
 				}
-				pending = append(pending[:0], pending[rtpFrameSamples:]...)
 			}
 			if err := down(len(frame)); err != nil {
 				return PumpSCOEOF
@@ -138,7 +173,7 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 			}
 		case <-silenceT.C():
 			if clk.Now().Sub(lastRead) > stallAfter {
-				if err := r.WriteSilence(); err != nil {
+				if rtpResult("silence", r.WriteSilence()) {
 					return PumpRTPError
 				}
 			}
