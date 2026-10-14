@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make check)",
+      "Bash(make race)",
+      "Bash(make build)",
+      "Bash(make dist)",
+      "Bash(go test:*)",
+      "Bash(go vet:*)",
+      "Bash(go build:*)",
+      "Bash(gofmt:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(ssh pi@rpi-pt 'journalctl --user -u siptooth:*)",
+      "Bash(ssh pi@rpi-pt '~/.local/bin/siptooth status:*)"
+    ],
+    "deny": [
+      "Read(./**/env)",
+      "Bash(git push --force:*)"
+    ]
+  }
+}
