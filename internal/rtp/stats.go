@@ -20,4 +20,10 @@ type Stats struct {
 	LastRx           time.Time
 	Latched          netip.AddrPort // zero until the first valid packet
 	MaxGap           time.Duration  // largest gap between consecutive accepted packets after Start
+
+	// Level of the audio sent (the caller): median and 95th percentile RMS in
+	// dBFS over the 20 ms frames above about -56 dBFS, and how many there were.
+	SentSpeechP50DB  int
+	SentSpeechP95DB  int
+	SentSpeechFrames uint64
 }

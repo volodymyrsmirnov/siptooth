@@ -16,7 +16,7 @@ The level comes from `SIPTOOTH_LOG_LEVEL` (`debug`, `info` default, `warn`, `err
 Exactly one line per call at `info`:
 
 ```
-msg="call ended" call_id=20261014T094331Z-b5fa caller=+380501234567 outcome=completed hangup_by=far_end sip_status=200 ringing_s=4.2 bridged_s=63.1 codec=PCMU nat_mode=stun lost=0 late=2 discarded_silence=12
+msg="call ended" call_id=20261014T094331Z-b5fa caller=+380501234567 outcome=completed hangup_by=far_end sip_status=200 ringing_s=4.2 bridged_s=63.1 codec=PCMU nat_mode=stun lost=0 late=2 discarded_silence=12 caller_db_p50=-24 caller_db_p95=-14 caller_speech_s=18.4
 ```
 
 | Field | Meaning |
@@ -33,6 +33,8 @@ msg="call ended" call_id=20261014T094331Z-b5fa caller=+380501234567 outcome=comp
 | `lost` | RTP packets never received (gaps) |
 | `late` | packets that arrived too late for the jitter buffer |
 | `discarded_silence` | silence frames skipped by catch-up |
+| `caller_db_p50`, `caller_db_p95` | level of the caller's speech sent to the far end, dBFS (median and loud peaks over 20 ms frames above about -56 dBFS). Normal speech sits around -30 to -15; much lower means the phone sends it too quietly (see "Caller too quiet"). |
+| `caller_speech_s` | seconds of caller audio above that floor |
 
 ## Outcomes
 

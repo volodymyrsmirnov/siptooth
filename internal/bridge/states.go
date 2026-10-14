@@ -505,7 +505,9 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 		"call_id", call.id, "caller", caller, "outcome", e.outcome, "hangup_by", e.hangupBy,
 		"sip_status", call.sipStat, "ringing_s", ringing, "bridged_s", bridgedS,
 		"codec", codec, "nat_mode", natMode,
-		"lost", stats.Lost, "late", stats.Late, "discarded_silence", stats.DiscardedSilence)
+		"lost", stats.Lost, "late", stats.Late, "discarded_silence", stats.DiscardedSilence,
+		"caller_db_p50", stats.CallerP50DB, "caller_db_p95", stats.CallerP95DB,
+		"caller_speech_s", float64(stats.CallerSpeechFrames)/50)
 	if call.echo != nil {
 		st := call.echo.Stats()
 		c.d.Logger.Info("echo gate",
@@ -578,12 +580,16 @@ func (c *Coordinator) callInfo(call *activeCall) hooks.CallInfo {
 type mediaCounters struct {
 	Latched                                                                     netip.AddrPort
 	Sent, Received, Lost, Late, Duplicate, Overflow, DiscardedSilence, SRTPFail uint64
+
+	CallerP50DB, CallerP95DB int    // speech level sent to the far end, dBFS
+	CallerSpeechFrames       uint64 // 20 ms frames above about -56 dBFS
 }
 
 func readCounters(m Media) mediaCounters {
 	s := m.Stats()
 	return mediaCounters{Latched: s.Latched, Sent: s.Sent, Received: s.Received, Lost: s.Lost, Late: s.Late,
-		Duplicate: s.Duplicate, Overflow: s.Overflow, DiscardedSilence: s.DiscardedSilence, SRTPFail: s.SRTPFail}
+		Duplicate: s.Duplicate, Overflow: s.Overflow, DiscardedSilence: s.DiscardedSilence, SRTPFail: s.SRTPFail,
+		CallerP50DB: s.SentSpeechP50DB, CallerP95DB: s.SentSpeechP95DB, CallerSpeechFrames: s.SentSpeechFrames}
 }
 
 func closeMedia(log *slog.Logger, m Media) {

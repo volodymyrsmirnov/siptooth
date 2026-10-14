@@ -68,6 +68,7 @@ type Session struct {
 	sentAny  bool
 	pl       *Playout
 	st       Stats
+	sent     levels // level of the frames sent by WriteFrame (s.mu)
 	hiSeq    uint16
 	missing  map[uint16]struct{}
 	haveSeq  bool
@@ -262,6 +263,9 @@ func (s *Session) WriteFrame(pcm []int16) error {
 	if len(pcm) != frameSamples {
 		return fmt.Errorf("rtp: frame must be %d samples, got %d", frameSamples, len(pcm))
 	}
+	s.mu.Lock()
+	s.sent.add(pcm)
+	s.mu.Unlock()
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	return s.sendLocked(func(c g711.Codec) []byte { return c.Encode(pcm) })
@@ -334,6 +338,7 @@ func (s *Session) Stats() Stats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.st
+	st.SentSpeechP50DB, st.SentSpeechP95DB, st.SentSpeechFrames = s.sent.summary()
 	if s.pl != nil {
 		c := s.pl.counters()
 		st.Late, st.Duplicate, st.Overflow, st.DiscardedSilence = c.late, c.duplicate, c.overflow, c.discarded
