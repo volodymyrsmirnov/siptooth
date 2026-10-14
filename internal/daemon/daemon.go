@@ -45,9 +45,21 @@ const (
 	coordinatorStopTimeout = 8 * time.Second
 )
 
+// btStopTimeout bounds waiting for the Bluetooth goroutine at shutdown: BlueZ D-Bus calls
+// cannot be cancelled, so a stuck one must not hold up the rest of the sequence.
+var btStopTimeout = 5 * time.Second
+
+// bluetoothRunner is runBluetooth; tests inject a fake so they never touch real adapters.
+type bluetoothRunner func(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, logger *slog.Logger)
+
 // Run starts the daemon and blocks until ctx ends (nil) or a component fails
-// (that error). Every goroutine it started has returned when it does.
+// (that error). Every goroutine it started has returned when it does, except a
+// Bluetooth goroutine stuck in an uncancellable BlueZ call for more than 5 s (logged).
 func Run(ctx context.Context, cfg config.Config, password string, logger *slog.Logger) error {
+	return run(ctx, cfg, password, logger, runBluetooth)
+}
+
+func run(ctx context.Context, cfg config.Config, password string, logger *slog.Logger, bt bluetoothRunner) error {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -122,14 +134,7 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 		regCtx, regCancel := context.WithCancel(context.Background())
 		reg.Store(ua.Register(regCtx, "", cfg.SIP.RegistrarHost(),
 			time.Duration(cfg.SIP.RegisterExpiresSeconds)*time.Second, rep.onState))
-		st.reg = func() {
-			regCancel()
-			uctx, cancel := context.WithTimeout(context.Background(), unregisterTimeout)
-			defer cancel()
-			if err := reg.Load().Unregister(uctx); err != nil {
-				logger.Warn("sip: unregister", "err", err)
-			}
-		}
+		st.reg = registrationStop(rep, regCancel, reg.Load().Unregister, logger)
 	}
 
 	errCh := make(chan error, 1)
@@ -145,8 +150,15 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 
 	btCtx, btCancel := context.WithCancel(context.Background())
 	btDone := make(chan struct{})
-	go func() { defer close(btDone); runBluetooth(btCtx, cfg, coord, dispatcher, logger) }()
-	st.bt = func() { btCancel(); <-btDone }
+	go func() { defer close(btDone); bt(btCtx, cfg, coord, dispatcher, logger) }()
+	st.bt = func() {
+		btCancel()
+		select {
+		case <-btDone:
+		case <-time.After(btStopTimeout):
+			logger.Warn("daemon: bluetooth did not stop in time (a BlueZ call is stuck); continuing shutdown", "timeout", btStopTimeout)
+		}
+	}
 
 	logger.Info("daemon: started", "version", buildinfo.Version, "control", cfg.Control.Socket,
 		"transport", cfg.SIP.Transport, "next_hop", nextHop, "register", cfg.SIP.Register)
@@ -157,6 +169,20 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 	case err := <-errCh:
 		logger.Error("daemon: component failed, stopping", "err", err)
 		return err
+	}
+}
+
+// registrationStop is the registration shutdown step. The reporter is silenced first: a
+// final Unregister that fails is not a registration outage and must emit no sip_registration.
+func registrationStop(rep *registrationReporter, cancel func(), unregister func(context.Context) error, logger *slog.Logger) func() {
+	return func() {
+		rep.stopping.Store(true)
+		cancel()
+		uctx, ucancel := context.WithTimeout(context.Background(), unregisterTimeout)
+		defer ucancel()
+		if err := unregister(uctx); err != nil {
+			logger.Warn("sip: unregister", "err", err)
+		}
 	}
 }
 

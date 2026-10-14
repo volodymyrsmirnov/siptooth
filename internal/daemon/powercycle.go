@@ -20,6 +20,10 @@ func powerCycleInterval(bt config.Bluetooth) time.Duration {
 	return time.Duration(bt.PowerCycleMinutes) * time.Minute
 }
 
-// powerCycleAllowed reports whether a due power cycle may run now: only while no call is in
-// progress, since powering off drops the call's audio and HFP link.
-func powerCycleAllowed(st bridge.Status) bool { return st.State == "idle" }
+// powerCycleAllowed reports whether a due power cycle may run now: only while the bridge is
+// idle AND the phone is free AND no cleanup is pending. Powering off drops the HFP link, which
+// would cut a handset call or a ringing phone (whatever the bridge thinks), and a pending
+// late-CallActive window, AT+CHUP or BYE still needs that link.
+func powerCycleAllowed(st bridge.Status) bool {
+	return st.State == "idle" && !st.PhoneBusy && !st.CleanupPending
+}

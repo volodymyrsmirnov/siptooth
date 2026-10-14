@@ -30,3 +30,16 @@ func TestPowerCycleOnlyWhileIdle(t *testing.T) {
 		}
 	}
 }
+
+// Final fix wave A4: idle forwarding is not an idle phone.
+func TestPowerCyclePhoneAndCleanupBusy(t *testing.T) {
+	if powerCycleAllowed(bridge.Status{State: "idle", PhoneBusy: true}) {
+		t.Fatal("the phone rings or carries a handset call: no cycle")
+	}
+	if powerCycleAllowed(bridge.Status{State: "idle", CleanupPending: true}) {
+		t.Fatal("late window / AT+CHUP / BYE pending: no cycle")
+	}
+	if !powerCycleAllowed(bridge.Status{State: "idle", PhoneConnected: true, Ready: true}) {
+		t.Fatal("fully idle: cycle")
+	}
+}

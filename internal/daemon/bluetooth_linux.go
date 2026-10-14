@@ -207,16 +207,16 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 		case bluez.RoutingAssumed:
 			// The service runs without CAP_NET_RAW, so the routing usually cannot be read.
 			// It is assumed (Raspberry Pi OS's bthelper routes SCO over HCI at boot);
-			// doctor and the probe report it as unverified.
+			// `siptooth doctor` reports it as unverified.
 			logger.Warn("bluetooth: cannot read SCO routing without CAP_NET_RAW; assuming it is routed over HCI", "err", err)
 		case bluez.RoutingNeedsCapability:
-			logger.Error("bluetooth: SCO routing is not HCI and changing it needs CAP_NET_RAW once (run the probe once as root); calls will not be answered", "before", before, "err", err)
+			logger.Error("bluetooth: SCO routing is not HCI and changing it needs CAP_NET_RAW once (run `siptooth doctor`; SCO routing needs CAP_NET_RAW once, see docs/operations.md); calls will not be answered", "before", before, "err", err)
 			if !routingReported {
 				d.EmitError("routing", err.Error())
 				routingReported = true
 			}
 			coord.SetAudioRouting(false)
-			routingRetry = time.After(routingRetryInterval) // picks up a fix (the probe run as root) without a restart
+			routingRetry = time.After(routingRetryInterval) // picks up a fix (CAP_NET_RAW granted once) without a restart
 			return
 		case bluez.RoutingFailed:
 			if err != nil {

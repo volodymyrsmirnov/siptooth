@@ -2,9 +2,7 @@ package sco
 
 import (
 	"bytes"
-	"context"
 	"testing"
-	"time"
 )
 
 func TestParseAndPackAddr(t *testing.T) {
@@ -50,16 +48,6 @@ func TestPipeFramesAndMTU(t *testing.T) {
 	if _, err := b.Read(buf); err == nil {
 		t.Fatal("read after peer close must fail")
 	}
-}
-
-func TestListenerUnsupportedOffLinux(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	_, err := Listen("AA:BB:CC:DD:EE:FF")
-	if err == nil {
-		t.Skip("running on linux with a real adapter")
-	}
-	_ = ctx
 }
 
 func TestPipeWriteAfterPeerCloseFails(t *testing.T) {

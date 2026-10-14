@@ -47,7 +47,7 @@ func startDaemon(t *testing.T, cfg config.Config, password string) (c *control.C
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
-	go func() { errCh <- Run(ctx, cfg, password, quietLogger()) }()
+	go func() { errCh <- run(ctx, cfg, password, quietLogger(), idleBluetooth) }()
 	var once sync.Once
 	var runErr error
 	stop = func() error {
@@ -96,7 +96,7 @@ func TestDaemonRefusesSecondInstance(t *testing.T) {
 	tr := siptest.NewTrunk(t, "udp")
 	cfg := testConfig(t, tr)
 	startDaemon(t, cfg, "")
-	err := Run(context.Background(), cfg, "", quietLogger())
+	err := run(context.Background(), cfg, "", quietLogger(), idleBluetooth)
 	if !errors.Is(err, control.ErrAlreadyRunning) {
 		t.Fatalf("second instance: %v", err)
 	}
@@ -236,5 +236,64 @@ func TestShutdownDeliversCallEnded(t *testing.T) {
 	b, err := os.ReadFile(out)
 	if err != nil || !strings.Contains(string(b), `"call.ended"`) {
 		t.Fatalf("call.ended not delivered: %q %v", b, err)
+	}
+}
+
+// idleBluetooth is the Bluetooth runner of tests: no hardware, just wait for shutdown.
+func idleBluetooth(ctx context.Context, _ config.Config, _ coordinator, _ errorSink, _ *slog.Logger) {
+	<-ctx.Done()
+}
+
+// A5: BlueZ D-Bus calls cannot be cancelled; a Bluetooth goroutine that never returns must not
+// stop the rest of the shutdown (registration, hooks, control socket, UA).
+func TestShutdownContinuesWhenBluetoothHangs(t *testing.T) {
+	old := btStopTimeout
+	btStopTimeout = 150 * time.Millisecond
+	t.Cleanup(func() { btStopTimeout = old })
+
+	tr := siptest.NewTrunk(t, "udp")
+	cfg := testConfig(t, tr)
+	hung := make(chan struct{})
+	t.Cleanup(func() { close(hung) })
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- run(ctx, cfg, "", quietLogger(), func(context.Context, config.Config, coordinator, errorSink, *slog.Logger) { <-hung })
+	}()
+	c := control.NewClient(cfg.Control.Socket)
+	for end := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if _, err := c.Status(context.Background()); err == nil {
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatal("control socket never came up")
+		}
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown blocked on the hung Bluetooth goroutine")
+	}
+	if _, err := os.Stat(cfg.Control.Socket); !os.IsNotExist(err) {
+		t.Fatal("the control socket must still be removed after a Bluetooth stop timeout")
+	}
+}
+
+// A7: the final Unregister failing is not a registration outage.
+func TestRegistrationStopSilencesReporterFirst(t *testing.T) {
+	var errs recordedErrors
+	rep := &registrationReporter{user: "alice", transport: "udp", errors: &errs, log: quietLogger(),
+		status: func(bridge.RegistrationStatus) {}}
+	stop := registrationStop(rep, func() {}, func(context.Context) error {
+		rep.onState(sip.RegState{Err: errors.New("unregister timed out")})
+		return errors.New("unregister timed out")
+	}, quietLogger())
+	stop()
+	if got := errs.list(); len(got) != 0 {
+		t.Fatalf("sip_registration emitted by a failed final unregister: %v", got)
 	}
 }
