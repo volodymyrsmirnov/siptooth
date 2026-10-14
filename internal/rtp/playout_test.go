@@ -388,3 +388,88 @@ func TestFlushPlaysRemnantBelowTarget(t *testing.T) {
 		t.Fatal("playout re-primed after SetStartup(false)")
 	}
 }
+
+// greeting: speech with natural short pauses (shorter than the minimum pause),
+// then the agent waits for the caller in a long silence.
+func greetingPattern() (src []int16, greetingLen int) {
+	for i, ms := range []int{300, 120, 400, 150, 250, 180, 350} {
+		if i%2 == 0 {
+			src = append(src, tone(ms*8, 8000)...)
+		} else {
+			src = append(src, make([]int16, ms*8)...)
+		}
+	}
+	greetingLen = len(src)
+	src = append(src, make([]int16, 3*8000)...)
+	return src, greetingLen
+}
+
+func TestCatchUpKeepsShortPausesInGreeting(t *testing.T) {
+	// The greeting arrives while the phone is answering (startup mode), so a
+	// 2 s backlog is buffered when steady state begins.
+	p := NewPlayout(Config{JitterMs: 60, SilenceRMS: 200, MinPauseMs: 200})
+	p.SetStartup(true)
+	src, greetingLen := greetingPattern()
+	pushed := 0
+	for ; pushed < 2*8000; pushed += 160 {
+		p.Push(uint32(pushed), 1, src[pushed:pushed+160])
+	}
+	p.SetStartup(false)
+
+	// Real time from here: 30 samples read per 30 samples received.
+	var got []int16
+	for len(got) < greetingLen {
+		got = append(got, readN(p, 30)...)
+		if len(got)%160 == 0 && pushed < len(src) {
+			p.Push(uint32(pushed), 1, src[pushed:pushed+160])
+			pushed += 160
+		}
+	}
+	if !equal(got[:greetingLen], src[:greetingLen]) {
+		t.Fatal("greeting was not played as sent: short pauses were shortened")
+	}
+	for pushed < len(src) {
+		got = append(got, readN(p, 30)...)
+		if len(got)%160 == 0 {
+			p.Push(uint32(pushed), 1, src[pushed:pushed+160])
+			pushed += 160
+		}
+	}
+	if d := p.Depth(); d > 100*time.Millisecond {
+		t.Fatalf("backlog not drained in the long pause: depth %v", d)
+	}
+}
+
+func TestCatchUpKeepsMinimumOfLongPause(t *testing.T) {
+	p := NewPlayout(Config{JitterMs: 60, SilenceRMS: 200, MinPauseMs: 200})
+	var src []int16
+	src = append(src, tone(800, 8000)...)
+	src = append(src, make([]int16, 8000)...) // 1 s pause
+	src = append(src, tone(800, 8000)...)
+	for i := 0; i < len(src); i += 160 {
+		p.Push(uint32(i), 1, src[i:i+160])
+	}
+	var got []int16
+	for p.Depth() > 0 {
+		got = append(got, readN(p, 30)...)
+	}
+	// The tone crosses zero every 100 samples; a pause is a longer zero run.
+	last := -1
+	for i, v := range got {
+		if v == 0 {
+			continue
+		}
+		if last >= 0 && i-last-1 > 160 {
+			pause := i - last - 1
+			if pause < 200*8 {
+				t.Fatalf("pause shortened to %d ms, want at least 200", pause/8)
+			}
+			if pause >= 8000 {
+				t.Fatalf("pause not shortened: %d ms", pause/8)
+			}
+			return
+		}
+		last = i
+	}
+	t.Fatal("second tone not found")
+}

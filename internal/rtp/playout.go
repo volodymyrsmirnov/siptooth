@@ -18,6 +18,7 @@ const (
 type Config struct {
 	JitterMs          int // steady-state target depth
 	SilenceRMS        int // catch-up threshold on the 16-bit scale; 0 disables catch-up
+	MinPauseMs        int // catch-up keeps this much of every pause; 0 lets it skip any silence
 	StartupCapSeconds int // buffer cap in startup mode (default 20)
 	HardCapSeconds    int // buffer cap in steady state (default 20)
 }
@@ -49,8 +50,9 @@ type Playout struct {
 	readPos  int64 // next sample to play
 	writeEnd int64 // one past the highest buffered sample
 	catching bool
-	primed   bool // depth reached the jitter target since the last drain
-	played   bool // a Read has consumed buffered audio; the origin is fixed from then on
+	primed   bool  // depth reached the jitter target since the last drain
+	played   bool  // a Read has consumed buffered audio; the origin is fixed from then on
+	quiet    int64 // samples of the current pause played so far (catch-up keeps MinPauseMs of it)
 
 	c playoutCounters
 }
@@ -263,10 +265,30 @@ func (p *Playout) Read(out []int16) {
 		p.filled[i] = false
 		p.readPos++
 	}
+	p.trackPause(out)
+}
+
+// trackPause counts how much of the current pause has been played: quiet reads
+// extend it, a read at speech level ends it.
+func (p *Playout) trackPause(out []int16) {
+	if len(out) == 0 || p.cfg.SilenceRMS <= 0 {
+		return
+	}
+	var sum float64
+	for _, s := range out {
+		sum += float64(s) * float64(s)
+	}
+	if math.Sqrt(sum/float64(len(out))) >= float64(p.cfg.SilenceRMS) {
+		p.quiet = 0
+	} else {
+		p.quiet += int64(len(out))
+	}
 }
 
 // catchUp skips whole silent 20 ms blocks while the depth exceeds the target
-// plus a margin, until it is back at the target. Speech is never skipped.
+// plus a margin, until it is back at the target. Speech is never skipped, and
+// every pause keeps its first MinPauseMs, so the short gaps between words and
+// sentences play at their natural length and only long pauses are shortened.
 func (p *Playout) catchUp() {
 	if p.startup || p.cfg.SilenceRMS <= 0 {
 		p.catching = false
@@ -281,6 +303,9 @@ func (p *Playout) catchUp() {
 	for p.catching && p.depth() > target && p.depth() >= blockSamples {
 		if p.blockRMS(p.readPos) >= float64(p.cfg.SilenceRMS) {
 			return
+		}
+		if p.quiet < int64(p.cfg.MinPauseMs)*samplesPerMilli {
+			return // too early in this pause: play it
 		}
 		p.clearRange(p.readPos, p.readPos+blockSamples)
 		p.readPos += blockSamples

@@ -126,7 +126,7 @@ func (a *SIPAdapter) Prepare(ctx context.Context, nextHopHost string) (Prepared,
 		return Prepared{}, err
 	}
 	media := rtpMedia{Session: sess, cfg: rtp.Config{
-		JitterMs: cfg.Media.JitterMs, SilenceRMS: cfg.Media.SilenceRMS,
+		JitterMs: cfg.Media.JitterMs, SilenceRMS: cfg.Media.SilenceRMS, MinPauseMs: cfg.Media.MinPauseMs,
 		StartupCapSeconds: 20, HardCapSeconds: 20,
 	}}
 	fail := func(err error) (Prepared, error) {

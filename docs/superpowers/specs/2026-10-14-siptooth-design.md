@@ -350,7 +350,7 @@ Pacing is read-driven, as in allochka: the SCO controller is the clock.
 - **Timestamp-based:** playout position is derived from RTP timestamps (32-bit wrap handled) and payload sample counts, not sequence numbers alone, so variable packet sizes (10–60 ms) and silence-suppression gaps play correctly. Duplicates are dropped; late packets (before the playout point) dropped and counted; gaps play as silence.
 - **Startup buffer:** from `Start` until SCO is up plus the settle delay, every received sample is kept, with no cap below the worst case answering time (`ATA` 3 s + `CallActive` 5 s + SCO 5 s + settle; the buffer holds 20 s, 320 KB). Nothing in it is dropped.
 - **Steady state:** target depth `media.jitter_ms` (default 60). Hard cap 20 s (oldest dropped and counted as `overflow` only beyond that; not reachable in a normal call).
-- **Catch-up:** whenever depth exceeds target + 40 ms, 20 ms blocks whose RMS is below `media.silence_rms` (default 200 on the 16-bit scale) are skipped instead of played, until the depth is back at target. Speech is never skipped, so the agent's greeting is heard in full and the extra latency drains in its first pauses. `silence_rms: 0` disables catch-up.
+- **Catch-up:** whenever depth exceeds target + 40 ms, 20 ms blocks whose RMS is below `media.silence_rms` (default 200 on the 16-bit scale) are skipped instead of played, until the depth is back at target. Speech is never skipped, and every pause keeps its first `media.min_pause_ms` (default 200; 0..2000) before any of it is skipped, so the gaps between words and sentences play at their natural length and the extra latency drains in the first long pause (typically while the agent waits for the caller after its greeting). `silence_rms: 0` disables catch-up.
 
 ### 6.4 SDP
 
@@ -446,6 +446,7 @@ media:
   codecs: [PCMU, PCMA]         # offer order; at least one
   jitter_ms: 60                # 20..500
   silence_rms: 200             # catch-up threshold, 0..5000 (0 disables catch-up)
+  min_pause_ms: 200            # catch-up keeps this much of every pause, 0..2000
 
 nat:
   mode: auto                   # auto | local | stun | public_ip
@@ -609,6 +610,8 @@ Reviewed by Fable 5.1 (Claude subagent), gpt-6.1-sol and gpt-6-astra (Codex CLI)
 - `pion/stun` dropped for a hand-rolled Binding Request (the unsuffixed module is v0.6.1 with a parser panic; Fable, gpt-6.1-sol); versions pinned (all three).
 - URIs: `sip:` only, explicit port honored, component-aware escaping, CR/LF rejected; `{call_id}` placeholder; provider recipes (all three).
 - Hooks back to allochka's single worker (Fable, gpt-6.1-sol); claims narrowed to two qualified targets (gpt-6-astra).
+
+2026-10-14 (hardware test, ElevenLabs direct): the agent's greeting sounded faster than the rest of its speech. ElevenLabs starts speaking on its 200 OK, so 1–2 s of greeting is buffered while the phone answers and SCO settles, and catch-up then removed the short silences between its words to drain that backlog. Catch-up now keeps the first `media.min_pause_ms` (200) of every pause (§6.3), so the backlog drains in the first long pause instead.
 
 Revision 4 (implementation): the owner-answer ownership rule was tightened (a definite ATA failure means the call is never siptooth's even if CallActive arrives first; outgoing call setup invalidates any pending answer); CallSetupCleared after ATA waits for CallActive (above); SCO loss latches no-CHUP; the far-end BYE drain bypasses jitter priming; re-INVITE 2xx is retransmitted on every transport (§5.6); `sip.local_port` must be 0 for TCP/TLS and maps to 5060 for UDP; the UDP Contact advertises the real bound port; transient RTP send errors are tolerated for 5 s.
 

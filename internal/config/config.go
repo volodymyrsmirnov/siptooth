@@ -56,6 +56,7 @@ type Media struct {
 	Codecs     []string `yaml:"codecs"`
 	JitterMs   int      `yaml:"jitter_ms"`
 	SilenceRMS int      `yaml:"silence_rms"`
+	MinPauseMs int      `yaml:"min_pause_ms"`
 }
 
 type NAT struct {
@@ -104,7 +105,7 @@ func Default() Config {
 		Bluetooth: Bluetooth{Adapter: "hci0", PowerCycleMinutes: 60},
 		SIP: SIP{Transport: "tls", DisplayName: "{caller}", AnonymousUser: "anonymous",
 			RegisterExpiresSeconds: 120, DialTimeoutSeconds: 30},
-		Media: Media{Codecs: []string{"PCMU", "PCMA"}, JitterMs: 60, SilenceRMS: 200},
+		Media: Media{Codecs: []string{"PCMU", "PCMA"}, JitterMs: 60, SilenceRMS: 200, MinPauseMs: 200},
 		NAT: NAT{Mode: "auto", StunServers: []string{"stun.l.google.com:19302", "stun.cloudflare.com:3478"},
 			RTPPortMin: 10000, RTPPortMax: 20000},
 		Calls:   Calls{CallerIDWaitMs: 2500, SCOSettleMs: 800, MediaTimeoutSeconds: 10},

@@ -67,6 +67,7 @@ All in `~/.siptooth/config.yaml`; restart after changing (`systemctl --user rest
 | --- | --- | --- |
 | `media.jitter_ms` (20..500) | 60 | Playout buffer depth for audio from the far end. Raise it when the far end sounds choppy and `late` or `lost` in the summary line are high; lower it to reduce delay on a clean path. |
 | `media.silence_rms` (0..5000) | 200 | Catch-up threshold: after a burst, frames quieter than this RMS may be skipped to bring the buffer back to `jitter_ms`. Lower it, or set `0` to disable catch-up, if you hear clipped quiet words (watch `discarded_silence`); raise it for more aggressive catch-up on a noisy line. |
+| `media.min_pause_ms` (0..2000) | 200 | Catch-up keeps this much of every pause and skips only the rest, so short gaps between words are never squeezed (a greeting buffered while the phone answers would otherwise sound rushed). `0` lets catch-up skip any silence. |
 | `calls.media_timeout_seconds` (5..300) | 10 | How long without RTP before siptooth hangs up. See "Far-end hang-up delayed". Raise it for a trunk that stops sending during silence. |
 | `calls.sco_settle_ms` (0..5000) | 800 | Pause after the SCO link comes up before audio is bridged. Raise it if the first words of calls are lost or garbled. |
 | `sip.dial_timeout_seconds` (5..120) | 30 | How long the SIP side may ring before siptooth gives up and lets the phone ring. Keep it shorter than the carrier's voicemail timeout. |
