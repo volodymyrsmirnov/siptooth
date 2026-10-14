@@ -26,12 +26,16 @@ type fakeRegistrar struct {
 	failFirst atomic.Int32 // answer this many REGISTERs 500
 	flowIP    atomic.Value // string: overrides Via received
 	flowPort  atomic.Int32 // overrides Via rport when > 0
+	// failRemoval answers 500 to any REGISTER that expires a Contact.
+	failRemoval atomic.Bool
 
 	mu       sync.Mutex
 	okTimes  []time.Time // authenticated REGISTERs
 	okReqs   []siptest.Request
 	posted   int
 	unauthed int
+	bound    map[string]*gosip.ContactHeader
+	maxBound int
 }
 
 func newFakeRegistrar(tr *siptest.Trunk, grant int) *fakeRegistrar {
@@ -57,26 +61,84 @@ func (r *fakeRegistrar) handle(req *gosip.Request, tx gosip.ServerTransaction) {
 	if h := req.GetHeader("Expires"); h != nil {
 		asked, _ = strconv.Atoi(h.Value())
 	}
-	res := gosip.NewResponseFromRequest(req, 200, "OK", nil)
-	granted := asked
-	if r.grant > 0 && asked > r.grant {
-		granted = r.grant
+	if r.failRemoval.Load() {
+		for _, h := range req.GetHeaders("Contact") {
+			if c, ok := h.(*gosip.ContactHeader); ok {
+				if v, has := c.Params.Get("expires"); has && v == "0" {
+					tx.Respond(gosip.NewResponseFromRequest(req, 500, "Server Internal Error", nil))
+					return
+				}
+			}
+		}
 	}
-	if c := req.Contact(); c != nil {
+	res := gosip.NewResponseFromRequest(req, 200, "OK", nil)
+
+	r.mu.Lock()
+	if r.bound == nil {
+		r.bound = map[string]*gosip.ContactHeader{}
+	}
+	for _, h := range req.GetHeaders("Contact") {
+		c, ok := h.(*gosip.ContactHeader)
+		if !ok {
+			continue
+		}
+		key := c.Address.User + "@" + net.JoinHostPort(c.Address.Host, strconv.Itoa(c.Address.Port))
+		granted := asked
+		if v, has := c.Params.Get("expires"); has {
+			granted, _ = strconv.Atoi(v)
+		}
+		if granted == 0 {
+			delete(r.bound, key)
+			continue
+		}
+		if r.grant > 0 && granted > r.grant {
+			granted = r.grant
+		}
 		cc := gosip.HeaderClone(c).(*gosip.ContactHeader)
 		cc.Params.Add("expires", strconv.Itoa(granted))
-		res.AppendHeader(cc)
+		r.bound[key] = cc
 	}
+	for _, cc := range r.bound {
+		res.AppendHeader(gosip.HeaderClone(cc))
+	}
+	if n := len(r.bound); n > r.maxBound {
+		r.maxBound = n
+	}
+	r.okTimes = append(r.okTimes, time.Now())
+	r.mu.Unlock()
+
 	if v, _ := r.flowIP.Load().(string); v != "" {
 		res.Via().Params.Add("received", v)
 	}
 	if p := r.flowPort.Load(); p > 0 {
 		res.Via().Params.Add("rport", strconv.Itoa(int(p)))
 	}
-	r.mu.Lock()
-	r.okTimes = append(r.okTimes, time.Now())
-	r.mu.Unlock()
 	tx.Respond(res)
+}
+
+// bindings returns the current bindings as user@host:port.
+func (r *fakeRegistrar) bindings() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []string
+	for k := range r.bound {
+		out = append(out, k)
+	}
+	return out
+}
+
+func (r *fakeRegistrar) hasBinding(c netip.AddrPort) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	_, ok := r.bound[testUser+"@"+c.String()]
+	return ok
+}
+
+// maxBindings is the most bindings the registrar ever held after a request.
+func (r *fakeRegistrar) maxBindings() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.maxBound
 }
 
 func (r *fakeRegistrar) authenticated() []siptest.Request {
@@ -139,6 +201,7 @@ func regUA(t *testing.T, tr *siptest.Trunk, mod func(*UA)) *UA {
 		}
 	})
 	u.regRetry = 100 * time.Millisecond
+	u.regMinRefresh = 50 * time.Millisecond
 	if mod != nil {
 		mod(u)
 	}
@@ -173,10 +236,11 @@ func registered(s RegState) bool { return s.Registered }
 
 func contactAddr(t *testing.T, q siptest.Request) netip.AddrPort {
 	t.Helper()
-	c := q.Req.Contact()
-	if c == nil {
+	hs := q.Req.GetHeaders("Contact")
+	if len(hs) == 0 {
 		t.Fatalf("REGISTER without Contact: %v", q.Headers)
 	}
+	c := hs[0].(*gosip.ContactHeader) // the Contact being registered comes first
 	ip, err := netip.ParseAddr(c.Address.Host)
 	if err != nil {
 		t.Fatal(err)
@@ -234,7 +298,11 @@ func TestRegisterContactFromVia(t *testing.T) {
 			u := regUA(t, tr, nil)
 			_, log, _ := startReg(t, u, tr, 60*time.Second)
 
-			st := waitState(t, log, "registered", registered)
+			// Over TCP the first REGISTER carries a guess; the state names the
+			// flow only once it is registered.
+			st := waitState(t, log, "registered on the flow", func(s RegState) bool {
+				return s.Registered && (tp == "udp" || s.Contact.Port() != defaultSIPPort)
+			})
 			reqs := reg.authenticated()
 			if len(reqs) == 0 {
 				t.Fatal("no authenticated REGISTER")
@@ -407,6 +475,202 @@ func TestIdleKeepaliveBetweenCalls(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	if n := tr.Keepalives() - during; n > 1 {
 		t.Errorf("%d registration keepalives during a call", n)
+	}
+	closeBounded(t, u)
+}
+
+func TestReregisterReplacesContact(t *testing.T) {
+	tr := siptest.NewTrunk(t, "udp")
+	reg := newFakeRegistrar(tr, 2)
+	u := regUA(t, tr, func(u *UA) { u.regMinRefresh = 100 * time.Millisecond })
+	reg.flowIP.Store("203.0.113.5")
+	reg.flowPort.Store(40000)
+	_, log, _ := startReg(t, u, tr, 60*time.Second)
+	waitState(t, log, "first mapping", func(s RegState) bool {
+		return s.Registered && s.Contact == netip.MustParseAddrPort("203.0.113.5:40000") && reg.hasBinding(s.Contact)
+	})
+	reg.flowPort.Store(40001)
+	waitState(t, log, "second mapping", func(s RegState) bool {
+		return s.Registered && s.Contact == netip.MustParseAddrPort("203.0.113.5:40001") && reg.hasBinding(s.Contact)
+	})
+	want := testUser + "@203.0.113.5:40001"
+	eventually(t, "only the current binding left", func() bool {
+		b := reg.bindings()
+		return len(b) == 1 && b[0] == want
+	})
+	if m := reg.maxBindings(); m > 1 {
+		t.Errorf("registrar held %d bindings at once; a Contact change must expire the old one in the same REGISTER", m)
+	}
+	closeBounded(t, u)
+}
+
+func TestFirstGuessIsExpiredOnceFlowKnown(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp") // ephemeral client port: the guess is wrong
+	reg := newFakeRegistrar(tr, 0)
+	u := regUA(t, tr, nil)
+	_, log, _ := startReg(t, u, tr, 60*time.Second)
+	st := waitState(t, log, "registered on the flow", func(s RegState) bool { return s.Registered && s.Contact.Port() != defaultSIPPort })
+	eventually(t, "single binding on the flow", func() bool {
+		b := reg.bindings()
+		return len(b) == 1 && b[0] == testUser+"@"+st.Contact.String()
+	})
+	if m := reg.maxBindings(); m > 1 {
+		t.Errorf("registrar held %d bindings at once", m)
+	}
+	closeBounded(t, u)
+}
+
+func TestUnregisterRemovesEveryContact(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp")
+	reg := newFakeRegistrar(tr, 0)
+	reg.failRemoval.Store(true) // the REGISTER that would expire the guess keeps failing
+	u := regUA(t, tr, nil)
+	r, log, _ := startReg(t, u, tr, 60*time.Second)
+	waitState(t, log, "registered on the guess", registered)
+	waitState(t, log, "a failed follow-up", func(s RegState) bool { return !s.Registered && s.Err != nil })
+	if len(reg.bindings()) != 1 {
+		t.Fatalf("bindings = %v, want only the guess", reg.bindings())
+	}
+	reg.failRemoval.Store(false)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := r.Unregister(ctx); err != nil {
+		t.Fatalf("Unregister: %v", err)
+	}
+	if b := reg.bindings(); len(b) != 0 {
+		t.Errorf("bindings left after Unregister: %v", b)
+	}
+	closeBounded(t, u)
+}
+
+func TestRegisterPublishesOnlyRegisteredContact(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tcp")
+	reg := newFakeRegistrar(tr, 0)
+	u := regUA(t, tr, nil)
+	var bad atomic.Value
+	var log stateLog
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	u.Register(ctx, "", tr.HostPort(), 60*time.Second, func(s RegState) {
+		log.add(s)
+		if s.Registered && !reg.hasBinding(s.Contact) {
+			bad.Store(s.Contact.String())
+		}
+	})
+	waitState(t, &log, "registered", func(s RegState) bool { return s.Registered && s.Contact.Port() != defaultSIPPort })
+	if v := bad.Load(); v != nil {
+		t.Errorf("Registered state published Contact %v before it was registered", v)
+	}
+	closeBounded(t, u)
+}
+
+func TestRefreshIntervalIsFloored(t *testing.T) {
+	tr := siptest.NewTrunk(t, "udp")
+	reg := newFakeRegistrar(tr, 4) // half is 2 s
+	u := regUA(t, tr, func(u *UA) { u.regMinRefresh = 3 * time.Second })
+	_, log, _ := startReg(t, u, tr, 60*time.Second)
+	waitState(t, log, "registered", registered)
+	eventually(t, "a refresh", func() bool { return len(reg.times()) >= 2 })
+	ts := reg.times()
+	if gap := ts[1].Sub(ts[0]); gap < 2600*time.Millisecond {
+		t.Errorf("refresh after %v, want at least the 3 s floor", gap)
+	}
+	closeBounded(t, u)
+}
+
+func TestRegisterTwiceIsAnError(t *testing.T) {
+	tr := siptest.NewTrunk(t, "udp")
+	newFakeRegistrar(tr, 0)
+	u := regUA(t, tr, nil)
+	first, log, _ := startReg(t, u, tr, 60*time.Second)
+	waitState(t, log, "registered", registered)
+	var second stateLog
+	r2 := u.Register(context.Background(), "", tr.HostPort(), 60*time.Second, second.add)
+	if st := r2.State(); st.Registered || st.Err == nil {
+		t.Errorf("second Register state = %+v, want an error", st)
+	}
+	if !first.State().Registered {
+		t.Error("the first registration was disturbed")
+	}
+	closeBounded(t, u)
+}
+
+func TestReinviteAnswerCarriesRegisteredContact(t *testing.T) {
+	tr := siptest.NewTrunk(t, "udp")
+	newFakeRegistrar(tr, 0)
+	dialogs := make(chan *siptest.Dialog, 1)
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		if d, err := tr.Accept(req, tx, answerBody()); err == nil {
+			dialogs <- d
+		}
+	})
+	u := regUA(t, tr, nil)
+	r, log, _ := startReg(t, u, tr, 60*time.Second)
+	waitState(t, log, "registered", registered)
+	call := result(t, start(t, u, dialRequest(tr, nil)), 5*time.Second)
+	if call.Call == nil {
+		t.Fatalf("result = %+v", call)
+	}
+	d := <-dialogs
+	res, err := d.ReInvite(ctx5(t), reofferBody(30000, ""))
+	if err != nil || res.StatusCode != 200 || res.Contact() == nil {
+		t.Fatalf("re-INVITE = %v, %v", res, err)
+	}
+	c := res.Contact().Address
+	want := r.State().Contact
+	if c.User != testUser || c.Host != want.Addr().String() || c.Port != int(want.Port()) {
+		t.Errorf("200 Contact = %v, want the registered %s@%v", c.String(), testUser, want)
+	}
+	closeBounded(t, u)
+}
+
+func TestRetransmittedReinviteIsAbsorbed(t *testing.T) {
+	tr, u, _, d := establish(t, "udp", nil)
+	src := learnFlow(t, tr, u)
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	local := pc.LocalAddr().(*net.UDPAddr)
+	req := d.FarEndRequest("INVITE", 77)
+	req.AppendHeader(&gosip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: "UDP",
+		Host: "127.0.0.1", Port: local.Port, Params: gosip.HeaderParams{{K: "branch", V: "z9hG4bKretrans1"}, {K: "rport", V: ""}}})
+	req.AppendHeader(&gosip.ContactHeader{Address: gosip.Uri{Scheme: "sip", User: "trunk", Host: "127.0.0.1", Port: local.Port}})
+	req.AppendHeader(gosip.NewHeader("Content-Type", "application/sdp"))
+	req.SetBody(reofferBody(30000, ""))
+	wire := []byte(req.String())
+
+	send := func() {
+		if _, err := pc.WriteTo(wire, net.UDPAddrFromAddrPort(src)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	send()
+	send() // back to back
+	time.Sleep(300 * time.Millisecond)
+	send() // after the first answer
+	statuses := map[int]int{}
+	buf := make([]byte, 4096)
+	pc.SetReadDeadline(time.Now().Add(800 * time.Millisecond))
+	for {
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		var res gosip.Response
+		if m, perr := gosip.ParseMessage(buf[:n]); perr == nil {
+			if r, ok := m.(*gosip.Response); ok {
+				res = *r
+				statuses[res.StatusCode]++
+			}
+		}
+	}
+	if statuses[500] != 0 {
+		t.Errorf("a retransmitted re-INVITE was answered 500: %v", statuses)
+	}
+	if statuses[200] == 0 {
+		t.Errorf("no 200 seen: %v", statuses)
 	}
 	closeBounded(t, u)
 }

@@ -97,31 +97,98 @@ func stripQuotes(s string) string {
 	return s
 }
 
-// dialogRoute applies RFC 3261 12.2.1.1 for requests of a dialog the UAC
-// created: the target is the 2xx Contact (else the INVITE's Request-URI), and
-// the Record-Route set of the 2xx, reversed, becomes the Route set.
-func dialogRoute(req *gosip.Request, invite *gosip.Request, res *gosip.Response) {
-	req.Recipient = invite.Recipient
+// dialogPath is how requests of a dialog siptooth created are routed (RFC
+// 3261 12.2.1.1): the remote target and the Route set, which is the
+// Record-Route set of the 2xx reversed. A target refresh replaces target and
+// keeps the route set.
+type dialogPath struct {
+	target gosip.Uri
+	routes []gosip.Uri
+}
+
+// newDialogPath derives the path from the INVITE and its 2xx: the target is
+// the 2xx Contact (else the INVITE's Request-URI).
+func newDialogPath(invite *gosip.Request, res *gosip.Response) dialogPath {
+	p := dialogPath{target: *invite.Recipient.Clone()}
 	if c := res.Contact(); c != nil {
-		req.Recipient = *c.Address.Clone()
+		p.target = *c.Address.Clone()
 	}
-	rr := res.GetHeaders("record-route")
-	for i := len(rr) - 1; i >= 0; i-- {
-		req.AppendHeader(gosip.NewHeader("Route", rr[i].Value()))
-	}
-	if len(rr) > 0 {
-		if first := req.Route(); first != nil && !first.Address.UriParams.Has("lr") {
-			req.Recipient = first.Address // strict router, same as sipgo
+	var set []gosip.Uri
+	for _, h := range res.GetHeaders("record-route") {
+		for _, entry := range splitRouteList(h.Value()) {
+			var r gosip.RouteHeader
+			if err := parseRouteValue(entry, &r); err == nil {
+				set = append(set, *r.Address.Clone())
+			}
 		}
+	}
+	for i := len(set) - 1; i >= 0; i-- {
+		p.routes = append(p.routes, set[i])
+	}
+	return p
+}
+
+// splitRouteList splits a Record-Route header value on the commas outside <>.
+func splitRouteList(v string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i, r := range v {
+		switch r {
+		case '<':
+			depth++
+		case '>':
+			depth--
+		case ',':
+			if depth == 0 {
+				out = append(out, v[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, v[start:])
+}
+
+// parseRouteValue parses one name-addr of a Record-Route value.
+func parseRouteValue(v string, h *gosip.RouteHeader) error {
+	v = strings.TrimSpace(v)
+	if i := strings.Index(v, "<"); i >= 0 {
+		j := strings.Index(v[i:], ">")
+		if j < 0 {
+			return fmt.Errorf("sip: bad route %q", v)
+		}
+		v = v[i+1 : i+j]
+	}
+	return gosip.ParseUri(v, &h.Address)
+}
+
+// apply sets the Request-URI and Route headers of req. With a loose router
+// first in the route set (lr) the target is the Request-URI and the whole set
+// goes into Route. A strict router first (no lr) becomes the Request-URI, is
+// dropped from Route, and the remote target is appended last.
+func (p dialogPath) apply(req *gosip.Request) {
+	req.Recipient = *p.target.Clone()
+	routes := p.routes
+	strict := len(routes) > 0 && !routes[0].UriParams.Has("lr")
+	if strict {
+		first := *routes[0].Clone()
+		first.Headers = nil
+		req.Recipient = first
+		routes = routes[1:]
+	}
+	for i := range routes {
+		req.AppendHeader(&gosip.RouteHeader{Address: *routes[i].Clone()})
+	}
+	if strict {
+		req.AppendHeader(&gosip.RouteHeader{Address: *p.target.Clone()})
 	}
 }
 
-// buildAck builds the ACK for a 2xx of invite (RFC 3261 13.2.2.4) without a
-// session: it is used for answers sipgo does not hand to the caller, such as
-// the second 2xx of a fork. Via is added by the client when it is written.
+// buildAck builds the ACK for a 2xx of invite (RFC 3261 13.2.2.4) outside any
+// sipgo session. It is a template: send a Clone, because the client adds a
+// Via when it writes. A retransmitted 2xx is answered with another Clone.
 func buildAck(invite *gosip.Request, res *gosip.Response) *gosip.Request {
 	ack := gosip.NewRequest(gosip.ACK, invite.Recipient)
-	dialogRoute(ack, invite, res)
+	newDialogPath(invite, res).apply(ack)
 	ack.AppendHeader(gosip.HeaderClone(invite.From()))
 	ack.AppendHeader(gosip.HeaderClone(res.To()))
 	ack.AppendHeader(gosip.HeaderClone(invite.CallID()))
@@ -134,16 +201,12 @@ func buildAck(invite *gosip.Request, res *gosip.Response) *gosip.Request {
 	return ack
 }
 
-// buildBye builds the BYE for the dialog a 2xx of invite established. With
-// routes false the Route set is left to sipgo's session code, which adds it
-// itself (adding it twice would duplicate it). Via is added when sent.
-func buildBye(invite *gosip.Request, res *gosip.Response, routes bool, userAgent string) *gosip.Request {
+// buildBye builds the BYE for the dialog a 2xx of invite established, routed
+// by path (the current remote target and the route set). Via is added when
+// sent.
+func buildBye(invite *gosip.Request, res *gosip.Response, path dialogPath, userAgent string) *gosip.Request {
 	bye := gosip.NewRequest(gosip.BYE, invite.Recipient)
-	if routes {
-		dialogRoute(bye, invite, res)
-	} else if c := res.Contact(); c != nil {
-		bye.Recipient = *c.Address.Clone()
-	}
+	path.apply(bye)
 	maxFwd := gosip.MaxForwardsHeader(70)
 	bye.AppendHeader(&maxFwd)
 	bye.AppendHeader(gosip.HeaderClone(invite.From()))
@@ -158,6 +221,30 @@ func buildBye(invite *gosip.Request, res *gosip.Response, routes bool, userAgent
 	bye.Laddr = invite.Laddr
 	bye.SetBody(nil)
 	return bye
+}
+
+// buildCancel builds the CANCEL of a pending INVITE (RFC 3261 9.1): same
+// Request-URI, top Via (branch), From, To, Call-ID, Route set and destination
+// as the INVITE, CSeq number with method CANCEL. It is a snapshot: the INVITE
+// itself is changed by sipgo when it answers a challenge.
+func buildCancel(invite *gosip.Request, userAgent string) *gosip.Request {
+	cancel := gosip.NewRequest(gosip.CANCEL, *invite.Recipient.Clone())
+	cancel.AppendHeader(gosip.HeaderClone(invite.Via()))
+	for _, r := range invite.GetHeaders("Route") {
+		cancel.AppendHeader(gosip.HeaderClone(r))
+	}
+	maxFwd := gosip.MaxForwardsHeader(70)
+	cancel.AppendHeader(&maxFwd)
+	cancel.AppendHeader(gosip.HeaderClone(invite.From()))
+	cancel.AppendHeader(gosip.HeaderClone(invite.To()))
+	cancel.AppendHeader(gosip.HeaderClone(invite.CallID()))
+	cancel.AppendHeader(&gosip.CSeqHeader{SeqNo: invite.CSeq().SeqNo, MethodName: gosip.CANCEL})
+	cancel.AppendHeader(gosip.NewHeader("User-Agent", userAgent))
+	cancel.SetTransport(invite.Transport())
+	cancel.SetDestination(invite.Destination())
+	cancel.Laddr = invite.Laddr
+	cancel.SetBody(nil)
+	return cancel
 }
 
 // toTag returns the To tag of a response, or "".

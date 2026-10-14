@@ -30,9 +30,14 @@ func (u *UA) DiscoverContact(ctx context.Context, target string) (netip.AddrPort
 	defer cancel()
 
 	tp := strings.ToUpper(u.transport)
+	dest, err := u.destination(ctx, u.transport, u.opts.NextHop)
+	if err != nil {
+		u.log.Debug("contact discovery: next hop", "error", err)
+		return netip.AddrPort{}, false
+	}
 	req := gosip.NewRequest(gosip.OPTIONS, uri)
 	req.SetTransport(tp)
-	req.SetDestination(u.opts.NextHop)
+	req.SetDestination(dest)
 
 	// A Via with rport on every transport: over TCP/TLS the response only
 	// carries the source port when the request asks for it (RFC 3581).
@@ -49,6 +54,7 @@ func (u *UA) DiscoverContact(ctx context.Context, target string) (netip.AddrPort
 	LogMessage(u.log, "send", req)
 	res, err := u.client.Do(ctx, req)
 	if err != nil {
+		u.forgetHop(u.opts.NextHop)
 		u.log.Debug("contact discovery failed", "error", err)
 		return netip.AddrPort{}, false
 	}

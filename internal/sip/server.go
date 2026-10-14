@@ -140,12 +140,15 @@ func (c *call) handleReinvite(req *gosip.Request, tx gosip.ServerTransaction) {
 	c.offer.Version++
 	body := sdp.AnswerFor(c.offer, c.media)
 	c.pendingAck = p
+	// A re-INVITE is a target refresh: its Contact is where our requests go
+	// from now on; the route set stays (RFC 3261 12.2.2).
+	if ct := req.Contact(); ct != nil && ct.Address.Host != "" {
+		c.path.target = *ct.Address.Clone()
+	}
 	c.mu.Unlock()
 
 	res := gosip.NewResponseFromRequest(req, gosip.StatusOK, "OK", body)
-	if contact := c.sess.InviteRequest.Contact(); contact != nil {
-		res.AppendHeader(gosip.HeaderClone(contact))
-	}
+	res.AppendHeader(c.localContact())
 	ct := gosip.ContentTypeHeader("application/sdp")
 	res.AppendHeader(&ct)
 	LogMessage(u.log, "send", res)
@@ -157,6 +160,18 @@ func (c *call) handleReinvite(req *gosip.Request, tx gosip.ServerTransaction) {
 	u.spawn(func() { c.awaitAck(res, p) })
 }
 
+// localContact is the Contact of our answers: the registered Contact while
+// registered (so the far end keeps using the flow the registrar knows),
+// otherwise the one the INVITE carried.
+func (c *call) localContact() gosip.Header {
+	if r := c.u.reg.Load(); r != nil {
+		if st := r.State(); st.Registered {
+			return &gosip.ContactHeader{Address: r.contactURI(st.Contact)}
+		}
+	}
+	return gosip.HeaderClone(c.invite.Contact())
+}
+
 func (c *call) clearPending(p *reinvitePending) {
 	c.mu.Lock()
 	if c.pendingAck == p {
@@ -165,22 +180,17 @@ func (c *call) clearPending(p *reinvitePending) {
 	c.mu.Unlock()
 }
 
-// awaitAck retransmits the 2xx over UDP (T1 doubling to T2, RFC 3261
-// 13.3.1.4) until the ACK arrives. After reinviteAckTimeout without one the
-// far end is gone: BYE and TransportLost (spec 5.6).
+// awaitAck retransmits the 2xx on every transport (T1 doubling to T2, RFC
+// 3261 13.3.1.4) until the ACK arrives. After reinviteAckTimeout without one
+// the far end is gone: BYE and TransportLost (spec 5.6).
 func (c *call) awaitAck(res *gosip.Response, p *reinvitePending) {
 	u := c.u
 	deadline := time.NewTimer(u.reinviteAckTimeout)
 	defer deadline.Stop()
 	interval := u.reinviteT1
-	retransmit := c.transport == "udp"
 	for {
-		var tick <-chan time.Time
-		var t *time.Timer
-		if retransmit {
-			t = time.NewTimer(interval)
-			tick = t.C
-		}
+		t := time.NewTimer(interval)
+		tick := t.C
 		select {
 		case <-p.acked:
 		case <-c.ctx.Done():
@@ -208,9 +218,7 @@ func (c *call) awaitAck(res *gosip.Response, p *reinvitePending) {
 			}
 			continue
 		}
-		if t != nil {
-			t.Stop()
-		}
+		t.Stop()
 		return
 	}
 }

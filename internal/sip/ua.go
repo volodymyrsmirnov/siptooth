@@ -7,7 +7,6 @@ package sip
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -74,6 +73,10 @@ type UA struct {
 	// reinviteT1/T2/AckTimeout drive the 2xx retransmission of a re-INVITE
 	// over UDP (RFC 3261 13.3.1.4); only tests change them.
 	reinviteT1, reinviteT2, reinviteAckTimeout time.Duration
+	// ioTimeout bounds ACK, CANCEL and cleanup BYE I/O (DNS, connect, handshake, write).
+	ioTimeout time.Duration
+	// regMinRefresh floors the REGISTER refresh interval.
+	regMinRefresh time.Duration
 	// reg is the active registration, if any (see register.go).
 	reg atomic.Pointer[Registration]
 
@@ -84,8 +87,7 @@ type UA struct {
 	attempts map[string]*attempt      // INVITE attempts by Call-ID (see dial.go)
 	timers   map[*time.Timer]struct{} // registry linger timers, stopped by Close
 	calls    map[*sipgo.DialogClientSession]*call
-	nextHop  netip.AddrPort // cache for keepalive
-	haveNext bool
+	hops     map[string]netip.AddrPort // resolved next hops by "host:port" (see hop.go)
 }
 
 // NewUA builds the user agent. Nothing is sent and no socket is opened until
@@ -115,6 +117,8 @@ func NewUA(o Options) (*UA, error) {
 	if log == nil {
 		log = slog.Default()
 	}
+	// sipgo logs raw packets when it cannot parse them: keep secrets out.
+	sipLog := slog.New(newRedactHandler(log.Handler()))
 	resolver := o.Resolver
 	if resolver == nil {
 		resolver = net.DefaultResolver
@@ -141,7 +145,7 @@ func NewUA(o Options) (*UA, error) {
 		sipgo.WithUserAgentDNSResolver(resolver),
 		sipgo.WithUserAgenTLSConfig(tlsConf),
 		sipgo.WithUserAgentTransportLayerOptions(
-			gosip.WithTransportLayerLogger(log),
+			gosip.WithTransportLayerLogger(sipLog),
 			gosip.WithTransportLayerTransports(transports),
 		),
 	)
@@ -153,18 +157,21 @@ func NewUA(o Options) (*UA, error) {
 		opts: o, transport: o.Transport, log: log, resolver: resolver, ua: sua,
 		callKeepalive: callKeepaliveEvery,
 		idleKeepalive: idleKeepaliveEvery,
+		ioTimeout:     cleanupTimeout,
+		regMinRefresh: registerMinRefresh,
 		regRetry:      registerRetryEvery,
 		reinviteT1:    500 * time.Millisecond,
 		reinviteT2:    4 * time.Second,
 
 		reinviteAckTimeout: 32 * time.Second,
+		hops:               make(map[string]netip.AddrPort),
 		attempts:           make(map[string]*attempt),
 		timers:             make(map[*time.Timer]struct{}),
 		calls:              make(map[*sipgo.DialogClientSession]*call),
 	}
 	u.bgCtx, u.bgCancel = context.WithCancel(context.Background())
 
-	copts := []sipgo.ClientOption{sipgo.WithClientLogger(log)}
+	copts := []sipgo.ClientOption{sipgo.WithClientLogger(sipLog)}
 	if o.Transport == "udp" {
 		copts = append(copts, sipgo.WithClientNAT())
 	}
@@ -190,7 +197,7 @@ func NewUA(o Options) (*UA, error) {
 		sua.Close()
 		return nil, fmt.Errorf("sip: new client: %w", err)
 	}
-	if u.server, err = sipgo.NewServer(sua, sipgo.WithServerLogger(log)); err != nil {
+	if u.server, err = sipgo.NewServer(sua, sipgo.WithServerLogger(sipLog)); err != nil {
 		sua.Close()
 		return nil, fmt.Errorf("sip: new server: %w", err)
 	}
@@ -271,29 +278,12 @@ func (u *UA) Transport() string { return u.transport }
 // NextHop is the configured next hop, "host:port".
 func (u *UA) NextHop() string { return u.opts.NextHop }
 
-// ResolveNextHop resolves the next hop host through A/AAAA lookups (no
-// NAPTR/SRV), preferring IPv4. A literal IP is returned as is.
+// ResolveNextHop resolves the configured next hop through A/AAAA lookups (no
+// NAPTR/SRV), preferring IPv4. A literal IP is returned as is. The answer is
+// pinned: every later use (OPTIONS, REGISTER, INVITE, keepalive) sees the
+// same address until a send to it fails (hop.go).
 func (u *UA) ResolveNextHop(ctx context.Context) (netip.AddrPort, error) {
-	host, portStr, err := net.SplitHostPort(u.opts.NextHop)
-	if err != nil {
-		return netip.AddrPort{}, err
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return netip.AddrPort{}, err
-	}
-	if ip, err := netip.ParseAddr(host); err == nil {
-		return netip.AddrPortFrom(ip.Unmap().WithZone(""), uint16(port)), nil
-	}
-	ips, err := u.resolver.LookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return netip.AddrPort{}, fmt.Errorf("sip: resolve %s: %w", host, err)
-	}
-	ip := preferIPv4(ips)
-	if !ip.IsValid() {
-		return netip.AddrPort{}, errors.New("sip: " + host + " has no addresses")
-	}
-	return netip.AddrPortFrom(ip, uint16(port)), nil
+	return u.pinnedHop(ctx, u.opts.NextHop)
 }
 
 // preferIPv4 returns the first IPv4 address (4-in-6 unmapped), else the first address.

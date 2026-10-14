@@ -22,6 +22,9 @@ var registerRetryEvery = 30 * time.Second
 
 // idleKeepaliveEvery is the CRLF ping interval of the registration flow
 // between calls (spec 5.5, 5.7).
+// registerMinRefresh floors the refresh interval, whatever the registrar grants.
+var registerMinRefresh = 5 * time.Second
+
 var idleKeepaliveEvery = 25 * time.Second
 
 const (
@@ -67,8 +70,9 @@ type Registration struct {
 
 	// Owned by the run goroutine; Unregister uses them only after it exited.
 	cseq    uint32
-	contact netip.AddrPort
-	sent    bool // some REGISTER reached the registrar
+	contact netip.AddrPort   // the Contact to register next
+	held    []netip.AddrPort // Contacts this UA may have bound at the registrar
+	sent    bool             // a REGISTER was sent
 }
 
 // Register starts keeping aor registered at registrarHost ("host" or
@@ -77,7 +81,13 @@ type Registration struct {
 // that follow share its connection or UDP flow. expires is the requested
 // binding lifetime; the registrar's grant (Contact expires parameter, else
 // Expires header) is refreshed at half its value. Failures are retried every
-// 30 s. onState (may be nil) is called, in order, on every state change.
+// 30 s. onState (may be nil) is called, in order, on every state change, from
+// the registration's goroutine: it must not call Unregister (which waits for
+// that goroutine) or block for long.
+//
+// A UA keeps one registration. Calling Register while another is active is
+// not supported: the returned Registration is dead, with State().Err set (and
+// onState called with it), and the active one is untouched.
 func (u *UA) Register(ctx context.Context, aor, registrarHost string, expires time.Duration, onState func(RegState)) *Registration {
 	if expires <= 0 {
 		expires = defaultRegisterExpires
@@ -103,8 +113,12 @@ func (u *UA) Register(ctx context.Context, aor, registrarHost string, expires ti
 		r.fail(fmt.Errorf("sip: registrar %q: invalid", registrarHost))
 		return r
 	}
-	u.reg.Store(r)
+	if !u.reg.CompareAndSwap(nil, r) {
+		r.fail(errors.New("sip: a registration is already active on this UA"))
+		return r
+	}
 	if !u.spawn(func() { r.run(rctx) }) {
+		u.reg.CompareAndSwap(r, nil)
 		r.fail(errors.New("sip: user agent closed"))
 	}
 	return r
@@ -148,6 +162,7 @@ func sameState(a, b RegState) bool {
 func (r *Registration) run(ctx context.Context) {
 	defer close(r.done)
 	u := r.u
+	defer u.reg.CompareAndSwap(r, nil)
 	var keep <-chan time.Time
 	if u.idleKeepalive > 0 {
 		t := time.NewTicker(u.idleKeepalive)
@@ -181,28 +196,39 @@ func (r *Registration) run(ctx context.Context) {
 			wait = u.regRetry
 			continue
 		}
-		wait = granted / 2
+		wait = u.refreshAfter(granted)
 	}
 }
 
-// keepalive sends the idle CRLF ping on the registration flow. While a
-// TCP/TLS call is up its own keepalive holds the same connection.
+// refreshAfter is the wait before the next REGISTER: half the granted
+// lifetime, but not under the UA's floor (so a tiny grant cannot make a busy
+// loop), and always before the binding lapses.
+func (u *UA) refreshAfter(granted time.Duration) time.Duration {
+	wait := granted / 2
+	if wait < u.regMinRefresh {
+		wait = min(u.regMinRefresh, granted*3/4)
+	}
+	return wait
+}
+
+// keepalive sends the idle CRLF ping on the registration flow. While a call
+// is up its own keepalive holds the same flow (INVITE and REGISTER share the
+// next hop).
 func (r *Registration) keepalive(ctx context.Context) error {
 	u := r.u
-	if u.transport != "udp" {
-		u.mu.Lock()
-		busy := len(u.calls) > 0
-		u.mu.Unlock()
-		if busy {
-			return nil
-		}
+	u.mu.Lock()
+	busy := len(u.calls) > 0
+	u.mu.Unlock()
+	if busy {
+		return nil // the call's own keepalive rides the same flow
 	}
 	return u.sendKeepalive(ctx)
 }
 
 // cycle registers once and, when the registrar saw a different flow address
-// than the Contact it was given, again at once with the discovered one. It
-// returns the granted lifetime.
+// than the Contact it was given, again at once with the discovered one (the
+// same request expires the superseded Contact). It returns the granted
+// lifetime. The published state names only a Contact that is registered.
 func (r *Registration) cycle(ctx context.Context) (time.Duration, error) {
 	if !r.contact.IsValid() {
 		c, err := r.initialContact(ctx)
@@ -229,15 +255,15 @@ func (r *Registration) cycle(ctx context.Context) (time.Duration, error) {
 			r.setFailed(err)
 			return 0, err
 		}
-		if flow.IsValid() {
-			r.contact = flow
-		}
-		r.setState(RegState{Registered: true, Contact: r.contact, Expires: time.Now().Add(granted)})
-		if r.contact == used {
+		r.held = []netip.AddrPort{used} // the same request expired every other Contact
+		r.setState(RegState{Registered: true, Contact: used, Expires: time.Now().Add(granted)})
+		if !flow.IsValid() || flow == used {
 			return granted, nil
 		}
-		r.u.log.Info("registrar sees a different flow address, registering again", "contact", r.contact.String())
+		r.contact = flow
+		r.u.log.Info("registrar sees a different flow address, registering again", "contact", flow.String())
 	}
+	r.u.log.Warn("flow address keeps changing, registering the newest one at the next refresh", "contact", r.contact.String())
 	return granted, nil
 }
 
@@ -281,9 +307,13 @@ func (r *Registration) register(ctx context.Context, contact netip.AddrPort, lif
 	ctx, cancel := context.WithTimeout(ctx, registerTxTimeout)
 	defer cancel()
 
+	dest, err := u.destination(ctx, u.transport, u.opts.NextHop)
+	if err != nil {
+		return nil, netip.AddrPort{}, fmt.Errorf("sip: REGISTER next hop: %w", err)
+	}
 	req := gosip.NewRequest(gosip.REGISTER, r.registrar)
 	req.SetTransport(r.tp)
-	req.SetDestination(u.opts.NextHop)
+	req.SetDestination(dest)
 
 	// rport on every transport, as for contact discovery (RFC 3581).
 	via := &gosip.ViaHeader{ProtocolName: "SIP", ProtocolVersion: "2.0", Transport: r.tp}
@@ -307,16 +337,28 @@ func (r *Registration) register(ctx context.Context, contact netip.AddrPort, lif
 		ch.Params.Add("expires", "0") // an unregister names it on the Contact too
 	}
 	req.AppendHeader(ch)
+	// Every other Contact this UA may have bound is expired by the same
+	// request, so a registrar that keeps one binding per AOR never holds two.
+	r.held = appendUnique(r.held, contact)
+	for _, old := range r.held {
+		if old == contact {
+			continue
+		}
+		oc := &gosip.ContactHeader{Address: r.contactURI(old)}
+		oc.Params.Add("expires", "0")
+		req.AppendHeader(oc)
+	}
 	req.AppendHeader(gosip.NewHeader("Expires", strconv.Itoa(secs)))
 	req.AppendHeader(gosip.NewHeader("Allow", allowMethods))
 	req.AppendHeader(gosip.NewHeader("User-Agent", u.opts.UserAgent))
 
 	LogMessage(u.log, "send", req)
+	r.sent = true
 	res, err := u.client.Do(ctx, req)
 	if err != nil {
+		u.forgetHop(u.opts.NextHop)
 		return nil, netip.AddrPort{}, fmt.Errorf("sip: REGISTER: %w", err)
 	}
-	r.sent = true
 	var challengeFlow netip.AddrPort
 	challenges := 0
 	for {
@@ -356,6 +398,15 @@ func (r *Registration) register(ctx context.Context, contact netip.AddrPort, lif
 			return nil, netip.AddrPort{}, fmt.Errorf("sip: REGISTER answered %d %s", res.StatusCode, res.Reason)
 		}
 	}
+}
+
+func appendUnique(s []netip.AddrPort, v netip.AddrPort) []netip.AddrPort {
+	for _, x := range s {
+		if x == v {
+			return s
+		}
+	}
+	return append(s, v)
 }
 
 func minExpires(res *gosip.Response) time.Duration {
@@ -409,9 +460,11 @@ func grantedLifetime(res *gosip.Response, ours netip.AddrPort, user string, aske
 	return asked
 }
 
-// Unregister stops the registration and removes our own binding with
-// Expires: 0 (never Contact: *), bounded by ctx. It does nothing when no
-// REGISTER ever reached the registrar. Safe to call more than once.
+// Unregister stops the registration and removes every Contact this UA
+// registered (never Contact: *) with Expires: 0, bounded by ctx. It does
+// nothing when no REGISTER was ever sent. Safe to call more than once. It
+// waits for the registration's goroutine, so it must not be called from the
+// onState callback.
 func (r *Registration) Unregister(ctx context.Context) error {
 	r.cancel()
 	select {
@@ -419,17 +472,15 @@ func (r *Registration) Unregister(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	if r.u.reg.Load() == r {
-		r.u.reg.CompareAndSwap(r, nil)
-	}
+	r.u.reg.CompareAndSwap(r, nil)
 	if !r.sent || !r.contact.IsValid() {
 		return nil
 	}
+	// register names every held Contact besides r.contact with expires=0 too.
 	_, _, err := r.register(ctx, r.contact, 0)
-	r.sent = false
-	r.setState(RegState{Contact: r.contact, Err: err})
-	if err != nil {
-		return err
+	if err == nil {
+		r.sent, r.held = false, nil
 	}
-	return nil
+	r.setState(RegState{Contact: r.contact, Err: err})
+	return err
 }

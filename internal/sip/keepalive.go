@@ -69,7 +69,7 @@ func keepaliveLoop(ctx context.Context, every time.Duration, send func() error, 
 }
 
 func (u *UA) sendKeepalive(ctx context.Context) error {
-	hop, err := u.cachedNextHop(ctx)
+	hop, err := u.ResolveNextHop(ctx)
 	if err != nil {
 		return err
 	}
@@ -78,24 +78,11 @@ func (u *UA) sendKeepalive(ctx context.Context) error {
 		return nil // no connection to the next hop: nothing to keep alive
 	}
 	defer conn.TryClose()
-	return writeKeepalive(conn, hop)
-}
-
-func (u *UA) cachedNextHop(ctx context.Context) (netip.AddrPort, error) {
-	u.mu.Lock()
-	hop, ok := u.nextHop, u.haveNext
-	u.mu.Unlock()
-	if ok {
-		return hop, nil
+	if err := writeKeepalive(conn, hop); err != nil {
+		u.forgetHop(u.opts.NextHop)
+		return err
 	}
-	hop, err := u.ResolveNextHop(ctx)
-	if err != nil {
-		return netip.AddrPort{}, err
-	}
-	u.mu.Lock()
-	u.nextHop, u.haveNext = hop, true
-	u.mu.Unlock()
-	return hop, nil
+	return nil
 }
 
 // writeKeepalive writes the CRLF ping on conn; raddr is the UDP destination.

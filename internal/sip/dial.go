@@ -69,7 +69,8 @@ type Attempt interface {
 
 var errAbandonedAtChallenge = errors.New("sip: abandoned before the authenticated retry")
 
-// bye/ACK cleanup after an unwanted 2xx is bounded by this (spec 5.3).
+// ACK, CANCEL and BYE cleanup I/O (DNS, connect, handshake, write) is bounded
+// by this (spec 5.3); UA.ioTimeout starts from it.
 const cleanupTimeout = 5 * time.Second
 
 // registryLinger is how long the UA keeps routing late 2xx responses of a
@@ -99,22 +100,26 @@ func (u *UA) Start(req DialRequest) (Attempt, error) {
 	}
 
 	a := &attempt{
-		u:       u,
-		req:     req,
-		invite:  invite,
-		callID:  invite.CallID().Value(),
-		result:  make(chan DialResult, 1),
-		claimed: make(map[string]bool),
-		pending: make(map[string]*gosip.Response),
+		u:         u,
+		req:       req,
+		invite:    invite,
+		callID:    invite.CallID().Value(),
+		hop:       hop,
+		transport: transport,
+		result:    make(chan DialResult, 1),
+		fin:       make(chan struct{}),
+		claimed:   make(map[string]bool),
+		pending:   make(map[string]*gosip.Response),
+		acks:      make(map[string]*gosip.Request),
 	}
 	a.setupCtx, a.setupCancel = context.WithCancel(u.bgCtx)
-	a.waitCtx, a.waitCancel = context.WithCancel(context.Background())
+	a.waitCtx, a.waitCancel = context.WithCancelCause(context.Background())
 
 	u.mu.Lock()
 	if u.closed {
 		u.mu.Unlock()
 		a.setupCancel()
-		a.waitCancel()
+		a.waitCancel(nil)
 		return nil, errors.New("sip: user agent closed")
 	}
 	u.attempts[a.callID] = a
@@ -123,7 +128,7 @@ func (u *UA) Start(req DialRequest) (Attempt, error) {
 	if !u.spawn(a.run) {
 		u.forget(a.callID)
 		a.setupCancel()
-		a.waitCancel()
+		a.waitCancel(nil)
 		return nil, errors.New("sip: user agent closed")
 	}
 	return a, nil
@@ -160,20 +165,32 @@ type attempt struct {
 	req    DialRequest
 	invite *gosip.Request
 	callID string
-	result chan DialResult // capacity 1; written once under mu
+	hop    string // next hop "host:port" the INVITE goes to
+	// transport is the effective transport, lower case.
+	transport string
+	result    chan DialResult // capacity 1; written once under mu
+	fin       chan struct{}   // closed when run returns
 
 	// setupCtx covers DNS, connect and TLS before the INVITE is on the wire;
-	// Abandon cancels it then. waitCtx makes sipgo's WaitAnswer send CANCEL;
-	// Abandon cancels it only after a 1xx has been seen (RFC 3261 9.1).
+	// Abandon cancels it then. waitCtx is WaitAnswer's context; it is only
+	// ever cancelled with sipgo.WaitAnswerForceCancelErr, because sipgo's own
+	// CANCEL ignores the INVITE's next hop (see sendCancel).
 	setupCtx    context.Context
 	setupCancel context.CancelFunc
 	waitCtx     context.Context
-	waitCancel  context.CancelFunc
+	waitCancel  context.CancelCauseFunc
 
 	mu        sync.Mutex
 	abandoned bool
 	sent      bool // the INVITE transaction exists
 	seen1xx   bool
+	// cancelReq is the CANCEL for the current INVITE transaction, built when
+	// its first 1xx arrives (RFC 3261 9.1); cancelSent says it went out.
+	cancelReq  *gosip.Request
+	cancelSent bool
+	// acks holds the ACK template of every dialog this attempt ACKed, by To
+	// tag; a retransmitted 2xx of that tag is answered with a clone.
+	acks      map[string]*gosip.Request
 	published bool
 	// decided is set once the goroutine knows which dialog (To tag) it keeps
 	// or that it keeps none. claimed holds the tags somebody owns (kept, or
@@ -197,7 +214,7 @@ func (a *attempt) Abandon() {
 	case !a.sent:
 		a.setupCancel() // nothing on the wire yet; stop connecting
 	case a.seen1xx:
-		a.waitCancel() // CANCEL now
+		a.cancelLocked() // CANCEL now
 	}
 	// else: the first 1xx (onResponse) or a final response ends it.
 }
@@ -230,14 +247,24 @@ func (a *attempt) hasCredentials() bool {
 
 func (a *attempt) run() {
 	u := a.u
+	defer close(a.fin)
 	defer a.setupCancel()
-	defer a.waitCancel()
+	defer a.waitCancel(sipgo.WaitAnswerForceCancelErr)
 	// A late 2xx of a fork still needs routing for one transaction lifetime.
 	defer u.forgetLater(a.callID)
+
+	dest, err := u.destination(a.setupCtx, a.transport, a.hop)
+	if err != nil {
+		a.cleanup(a.decide(""))
+		a.publish(DialResult{Cause: FailError, Reason: "invite_failed", Err: fmt.Errorf("sip: next hop: %w", err)})
+		return
+	}
+	a.invite.SetDestination(dest)
 
 	LogMessage(u.log, "send", a.invite)
 	sess, err := u.dialogs.WriteInvite(a.setupCtx, a.invite)
 	if err != nil {
+		u.forgetHop(a.hop)
 		a.cleanup(a.decide(""))
 		a.publish(DialResult{Cause: FailError, Reason: "invite_failed", Err: fmt.Errorf("sip: send INVITE: %w", err)})
 		return
@@ -271,8 +298,11 @@ func (a *attempt) onResponse(res *gosip.Response) error {
 	case res.IsProvisional():
 		a.mu.Lock()
 		a.seen1xx = true
+		if a.cancelReq == nil {
+			a.cancelReq = buildCancel(a.invite, a.u.opts.UserAgent)
+		}
 		if a.abandoned {
-			a.waitCancel() // the first 1xx after Abandon: CANCEL now
+			a.cancelLocked() // the first 1xx after Abandon: CANCEL now
 		}
 		a.mu.Unlock()
 	case isChallenge(res) && a.hasCredentials():
@@ -285,8 +315,47 @@ func (a *attempt) onResponse(res *gosip.Response) error {
 			return errAbandonedAtChallenge
 		}
 		a.seen1xx = false
+		a.cancelReq = nil
 	}
 	return nil
+}
+
+// cancelLocked sends the CANCEL of the current INVITE transaction, once, in
+// the background. a.mu held; a 1xx has been seen.
+func (a *attempt) cancelLocked() {
+	if a.cancelSent || a.cancelReq == nil {
+		return
+	}
+	a.cancelSent = true
+	req := a.cancelReq
+	a.u.spawn(func() { a.sendCancel(req) })
+}
+
+// sendCancel sends CANCEL on the INVITE's own next hop and connection (sipgo's
+// CANCEL goes to the Request-URI host, past a configured proxy). WaitAnswer
+// stays running to read the 487 (or a 2xx that crossed the CANCEL, which
+// answered ACKs and BYEs). If the far end never answers the INVITE, WaitAnswer
+// is forced out after 64*T1 (RFC 3261 9.1).
+func (a *attempt) sendCancel(req *gosip.Request) {
+	u := a.u
+	ctx, cancel := context.WithTimeout(u.bgCtx, u.ioTimeout)
+	LogMessage(u.log, "send", req)
+	res, err := u.client.Do(ctx, req)
+	cancel()
+	switch {
+	case err != nil:
+		u.log.Debug("CANCEL failed", "call_id", a.callID, "error", err)
+	case res.StatusCode != gosip.StatusOK:
+		u.log.Debug("CANCEL refused", "call_id", a.callID, "status", res.StatusCode)
+	}
+	t := time.NewTimer(64 * gosip.T1)
+	defer t.Stop()
+	select {
+	case <-a.fin:
+	case <-t.C:
+		a.waitCancel(sipgo.WaitAnswerForceCancelErr)
+	case <-u.bgCtx.Done():
+	}
 }
 
 // classify maps a WaitAnswer error without a 2xx to a result (spec 4.3, 5.4).
@@ -332,18 +401,18 @@ func (a *attempt) answered(sess *sipgo.DialogClientSession, res *gosip.Response,
 		if !a.isAbandoned() {
 			a.publish(DialResult{Cause: FailError, Status: status, Reason: "invite_failed", Err: werr})
 		}
-		a.ackAndBye(sess, c)
+		a.ackAndBye(res, c)
 		return
 	}
 	media, err := sdp.ParseAnswer(res.Body(), a.req.Offer)
 	if err != nil {
 		a.publish(DialResult{Cause: FailMedia, Status: status, Reason: reason, Err: err})
-		a.ackAndBye(sess, c)
+		a.ackAndBye(res, c)
 		return
 	}
-	if err := sess.Ack(a.u.bgCtx); err != nil {
+	if err := a.ack(res); err != nil {
 		a.publish(DialResult{Cause: FailError, Status: status, Reason: "ack_failed", Err: fmt.Errorf("sip: send ACK: %w", err)})
-		a.byeDirect(c, sess)
+		a.byeOnly(c)
 		return
 	}
 	c.setAnswer(media, status, reason, res)
@@ -358,35 +427,64 @@ func (a *attempt) answered(sess *sipgo.DialogClientSession, res *gosip.Response,
 	c.start()
 }
 
-// ackAndBye ACKs the 2xx and ends the dialog, bounded by cleanupTimeout.
-func (a *attempt) ackAndBye(sess *sipgo.DialogClientSession, c *call) {
-	if err := sess.Ack(a.u.bgCtx); err != nil {
+// ack builds and sends the ACK of a 2xx and remembers it for its To tag, so
+// a retransmitted 2xx of that dialog gets an identical ACK (RFC 3261
+// 13.2.2.4). The write is bounded by the UA's I/O timeout.
+func (a *attempt) ack(res *gosip.Response) error {
+	ack := buildAck(a.invite, res)
+	a.mu.Lock()
+	a.acks[toTag(res)] = ack
+	req := ack.Clone() // templates are only touched under mu
+	a.mu.Unlock()
+	return a.u.sendAck(req)
+}
+
+// ackAndBye ACKs the 2xx and ends the dialog, bounded by the I/O timeout.
+func (a *attempt) ackAndBye(res *gosip.Response, c *call) {
+	if err := a.ack(res); err != nil {
 		a.u.log.Debug("ACK for discarded answer failed", "error", err)
-		a.byeDirect(c, sess)
-		return
 	}
 	a.byeOnly(c)
 }
 
-// byeDirect ends a dialog whose ACK could not be written: sipgo's WriteBye
-// refuses to run unless the dialog is Confirmed, so the BYE is built here.
-func (a *attempt) byeDirect(c *call, sess *sipgo.DialogClientSession) {
-	c.hangingUp.Store(true)
-	c.finish()
-	ctx, cancel := context.WithTimeout(a.u.bgCtx, cleanupTimeout)
-	defer cancel()
-	bye := buildBye(a.invite, sess.InviteResponse, true, a.u.opts.UserAgent)
-	if err := a.u.sendBye(ctx, bye); err != nil {
-		a.u.log.Debug("BYE without ACK failed", "error", err)
-	}
-}
-
 func (a *attempt) byeOnly(c *call) {
-	ctx, cancel := context.WithTimeout(a.u.bgCtx, cleanupTimeout)
+	ctx, cancel := context.WithTimeout(a.u.bgCtx, a.u.ioTimeout)
 	defer cancel()
 	if err := c.Hangup(ctx); err != nil {
 		a.u.log.Debug("BYE for discarded answer failed", "error", err)
 	}
+}
+
+// sendAck writes an ACK (a clone of the template; the client adds a fresh
+// Via), bounded by the I/O timeout: sipgo's own ACK write would dial with no
+// deadline.
+func (u *UA) sendAck(req *gosip.Request) error {
+	ctx, cancel := context.WithTimeout(u.bgCtx, u.ioTimeout)
+	defer cancel()
+	LogMessage(u.log, "send", req)
+	return u.writeRequest(ctx, req)
+}
+
+// resendAck answers a retransmitted 2xx of an ACKed dialog.
+func (a *attempt) resendAck(tag string) {
+	a.mu.Lock()
+	tmpl := a.acks[tag]
+	var req *gosip.Request
+	if tmpl != nil {
+		req = tmpl.Clone()
+	}
+	a.mu.Unlock()
+	if req == nil {
+		return
+	}
+	a.u.spawn(func() {
+		ctx, cancel := context.WithTimeout(a.u.bgCtx, a.u.ioTimeout)
+		defer cancel()
+		LogMessage(a.u.log, "send", req)
+		if err := a.u.writeRequest(ctx, req); err != nil {
+			a.u.log.Debug("ACK for retransmitted 2xx failed", "call_id", a.callID, "error", err)
+		}
+	})
 }
 
 // decide records which To tag the goroutine keeps ("" for none) and returns
@@ -419,8 +517,13 @@ func (a *attempt) onSuccess(res *gosip.Response) {
 		return
 	}
 	a.mu.Lock()
+	if a.acks[tag] != nil {
+		a.mu.Unlock() // a retransmitted 2xx of a dialog already ACKed
+		a.resendAck(tag)
+		return
+	}
 	if a.claimed[tag] {
-		a.mu.Unlock() // the kept dialog, or a retransmission of a fork
+		a.mu.Unlock() // the kept dialog before its ACK, or a retransmission of a fork
 		return
 	}
 	if !a.decided {
@@ -443,15 +546,13 @@ func (a *attempt) cleanup(forks []*gosip.Response) {
 
 func (a *attempt) cleanupFork(res *gosip.Response) {
 	u := a.u
-	ctx, cancel := context.WithTimeout(u.bgCtx, cleanupTimeout)
+	ctx, cancel := context.WithTimeout(u.bgCtx, u.ioTimeout)
 	defer cancel()
-	ack := buildAck(a.invite, res)
-	LogMessage(u.log, "send", ack)
-	if err := u.client.WriteRequest(ack); err != nil {
+	if err := a.ack(res); err != nil {
 		u.log.Debug("ACK for extra answer failed", "error", err)
 		return
 	}
-	bye := buildBye(a.invite, res, true, u.opts.UserAgent)
+	bye := buildBye(a.invite, res, newDialogPath(a.invite, res), u.opts.UserAgent)
 	LogMessage(u.log, "send", bye)
 	if err := u.sendBye(ctx, bye); err != nil {
 		u.log.Debug("BYE for extra answer failed", "error", err)

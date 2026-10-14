@@ -543,6 +543,55 @@ func (d *Dialog) Ack(sdp []byte) error {
 	return d.sess.WriteRequest(ack)
 }
 
+// FarEndRequest builds a request of method with this dialog's identifiers as
+// the far end would send it to the caller (From = the trunk's side with its
+// tag, To = the caller, Call-ID, the given CSeq and Max-Forwards). Via,
+// Contact and body are the test's to add. The Request-URI is the caller's
+// Contact.
+func (d *Dialog) FarEndRequest(method string, cseq uint32) *sip.Request {
+	inv := d.sess.InviteRequest
+	req := sip.NewRequest(sip.RequestMethod(method), inv.Contact().Address)
+	req.SetTransport(inv.Transport())
+	from := d.sess.InviteResponse.To().AsFrom()
+	req.AppendHeader(&from)
+	to := inv.From().AsTo()
+	req.AppendHeader(&to)
+	req.AppendHeader(sip.HeaderClone(inv.CallID()))
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: cseq, MethodName: sip.RequestMethod(method)})
+	maxFwd := sip.MaxForwardsHeader(70)
+	req.AppendHeader(&maxFwd)
+	return req
+}
+
+// ReInviteContact sends a re-INVITE whose Contact is contactURI (a target
+// refresh, RFC 3261 12.2.2) and ACKs a 2xx.
+func (d *Dialog) ReInviteContact(ctx context.Context, contactURI string, sdp []byte) (*sip.Response, error) {
+	var u sip.Uri
+	if err := sip.ParseUri(contactURI, &u); err != nil {
+		return nil, err
+	}
+	inv := d.sess.InviteRequest
+	contact := inv.Contact()
+	if contact == nil {
+		return nil, errors.New("siptest: INVITE has no Contact")
+	}
+	req := sip.NewRequest(sip.INVITE, contact.Address)
+	req.SetTransport(inv.Transport())
+	req.AppendHeader(&sip.ContactHeader{Address: u})
+	if sdp != nil {
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+		req.SetBody(sdp)
+	}
+	res, err := d.sess.Do(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if res.IsSuccess() {
+		return res, d.Ack(nil)
+	}
+	return res, nil
+}
+
 // Trunk is the trunk this dialog belongs to.
 func (d *Dialog) Trunk() *Trunk { return d.tr }
 

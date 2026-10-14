@@ -41,6 +41,8 @@ type Call interface {
 type call struct {
 	u         *UA
 	sess      *sipgo.DialogClientSession
+	invite    *gosip.Request  // the INVITE (read only once answered)
+	answer    *gosip.Response // the 2xx that established the dialog
 	offer     sdp.Offer
 	transport string // effective transport of this call, lower case
 	byeSeen   atomic.Bool
@@ -50,6 +52,10 @@ type call struct {
 	status int
 	reason string
 	hop    string // remote address of the connection that carried the 2xx
+
+	// path routes our requests (BYE): the remote target, which a re-INVITE
+	// Contact refreshes, and the route set (RFC 3261 12.2).
+	path dialogPath
 
 	// In-dialog re-INVITE state (server.go).
 	remoteCSeq uint32 // highest CSeq of a far-end re-INVITE
@@ -71,6 +77,9 @@ func newCall(u *UA, sess *sipgo.DialogClientSession, offer sdp.Offer, transport 
 	c := &call{
 		u:            u,
 		sess:         sess,
+		invite:       sess.InviteRequest,
+		answer:       sess.InviteResponse,
+		path:         newDialogPath(sess.InviteRequest, sess.InviteResponse),
 		offer:        offer,
 		transport:    transport,
 		mediaUpdates: make(chan sdp.Media, 4),
@@ -129,24 +138,31 @@ func (c *call) end(cause EndCause) {
 	c.stop()
 }
 
-// finish stops the keepalive and drops the call from the UA's BYE routing.
+// finish stops the keepalive, drops the call from the UA's BYE routing and
+// closes the sipgo session (which removes the dialog from its cache). Safe to
+// call on every terminal path, more than once.
 func (c *call) finish() {
 	c.stop()
 	c.u.mu.Lock()
 	delete(c.u.calls, c.sess)
 	c.u.mu.Unlock()
+	c.sess.Close()
 }
 
-// start begins the signaling keepalive for connection-oriented transports
-// (spec 5.5): a failed ping means the connection the far end would use for
-// in-dialog requests is gone.
+// start begins the call's CRLF keepalive (spec 5.5): on the connection that
+// carried the 2xx for TCP/TLS, on the INVITE's UDP flow (same socket, same
+// next hop) for UDP. A failed ping means the connection or flow the far end
+// would use for in-dialog requests is gone.
 func (c *call) start() {
-	if c.transport == "udp" || c.u.callKeepalive <= 0 {
+	if c.u.callKeepalive <= 0 {
 		return
 	}
 	c.mu.Lock()
 	hop := c.hop
 	c.mu.Unlock()
+	if c.transport == "udp" {
+		hop = c.invite.Destination()
+	}
 	c.u.spawn(func() {
 		keepaliveLoop(c.ctx, c.u.callKeepalive,
 			func() error { return c.u.pingConnection(c.transport, hop) },
@@ -194,21 +210,11 @@ func (c *call) bye(ctx context.Context) error {
 	if c.sess.LoadState() == gosip.DialogStateEnded {
 		return nil // the far end already hung up
 	}
+	c.mu.Lock()
+	path := c.path
+	c.mu.Unlock()
 	u := c.u
-	bye := buildBye(c.sess.InviteRequest, c.sess.InviteResponse, false, u.opts.UserAgent)
+	bye := buildBye(c.invite, c.answer, path, u.opts.UserAgent)
 	LogMessage(u.log, "send", bye)
-	err := c.sess.WriteBye(ctx, bye)
-	var res *gosip.Response
-	var val sipgo.ErrDialogResponse
-	var ptr *sipgo.ErrDialogResponse
-	switch {
-	case errors.As(err, &val):
-		res = val.Res
-	case errors.As(err, &ptr):
-		res = ptr.Res
-	}
-	if res == nil {
-		return err
-	}
-	return u.byeResult(ctx, bye, res)
+	return u.sendBye(ctx, bye)
 }
