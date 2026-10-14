@@ -56,7 +56,10 @@ func buildInvite(req DialRequest, transport, nextHop, userAgent string) (*gosip.
 	invite.AppendHeader(gosip.NewHeader("User-Agent", userAgent))
 	names := make([]string, 0, len(req.Headers))
 	for name, value := range req.Headers {
-		if strings.ContainsAny(name+value, "\r\n\x00") || name == "" {
+		if name == "" || strings.ContainsAny(name, ": \t") {
+			return nil, fmt.Errorf("sip: invalid header name %q", name)
+		}
+		if strings.ContainsAny(name+value, "\r\n\x00") {
 			return nil, fmt.Errorf("sip: header %q has CR, LF or NUL", name)
 		}
 		names = append(names, name)
