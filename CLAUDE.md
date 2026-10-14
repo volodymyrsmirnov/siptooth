@@ -54,7 +54,7 @@ Development happens on macOS; Linux-only code (`*_linux.go`) is compiled by `mak
 
 ## Runtime layout (on the Pi)
 
-`~/.siptooth/`: `config.yaml`, `env` (0600, `SIPTOOTH_SIP_PASSWORD=`), `siptooth.sock`. Service: `~/.config/systemd/user/siptooth.service` (written by `siptooth install`), logs `journalctl --user -u siptooth -f`, restart `systemctl --user restart siptooth`.
+`~/.siptooth/`: `config.yaml`, `env` (0600, `SIPTOOTH_SIP_PASSWORD=`), `siptooth.sock`. Service: `~/.config/systemd/user/siptooth.service` (written by `siptooth install`), logs `journalctl --user-unit siptooth -f`, restart `systemctl --user restart siptooth`.
 
 ## Hard rules
 
@@ -74,7 +74,7 @@ Development happens on macOS; Linux-only code (`*_linux.go`) is compiled by `mak
 - SCO: MTU 64, the controller delivers 60-byte packets; pacing is read-driven (write one frame per frame read). In-band ringing leaves a ~222-frame SCO backlog that is drained before the greeting. Broadcom SCO routing defaults to HCI already; the routing check is skipped for manufacturer 305.
 - The controller can get stuck after hours connected: SCO comes up normally (eSCO, CVSD) but carries constant noise both ways (caller channel hiss at ~-17 dBFS from the first packet, the caller hears nothing). An adapter power cycle clears it; the daemon power-cycles every `bluetooth.power_cycle_minutes` (60) while idle.
 - SIP: sipgo v1.6.0 `WaitAnswer` does not ACK/BYE a 2xx that crosses CANCEL; `internal/sip` owns that (spec 5.3).
-- Debugging a call: `journalctl --user -u siptooth` lines with the `call_id`; one `call ended` summary line per call.
+- Debugging a call: `journalctl --user-unit siptooth` lines with the `call_id`; one `call ended` summary line per call.
 
 ## Working with the owner
 

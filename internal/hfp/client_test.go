@@ -52,7 +52,7 @@ func expectNoEvent(t *testing.T, c *Client, d time.Duration) {
 func TestSLCSequence(t *testing.T) {
 	_, ag := startClient(t, defaultCIND)
 	got := strings.Join(ag.got(), " ")
-	want := "AT+BRSF=36 AT+CIND=? AT+CIND? AT+CMER=3,0,0,1 AT+CHLD=? AT+CLIP=1"
+	want := "AT+BRSF=52 AT+CIND=? AT+CIND? AT+CMER=3,0,0,1 AT+CHLD=? AT+CLIP=1 AT+VGS=15 AT+VGM=15"
 	if got != want {
 		t.Fatalf("got %q", got)
 	}
@@ -60,7 +60,7 @@ func TestSLCSequence(t *testing.T) {
 
 func TestSLCWithoutThreeWay(t *testing.T) {
 	ag, conn := newFakeAG(t, defaultCIND)
-	ag.replies["AT+BRSF=36"] = []string{"+BRSF: 4094"} // bit0 (three-way) cleared
+	ag.replies["AT+BRSF=52"] = []string{"+BRSF: 4094"} // bit0 (three-way) cleared
 	c := New(conn, slog.Default())
 	if err := c.Start(context.Background()); err != nil {
 		t.Fatal(err)
@@ -424,4 +424,48 @@ func TestOutgoingSetupNotEmittedDuringACall(t *testing.T) {
 	expectEvent(t, c, CallActive)
 	ag.send("+CIEV: 3,2") // a second call placed from the handset while one is active
 	expectNoEvent(t, c, 100*time.Millisecond)
+}
+
+// A phone that refuses the gain commands still gets a working connection.
+func TestSLCVolumeRefused(t *testing.T) {
+	ag, conn := newFakeAG(t, defaultCIND)
+	ag.errors["AT+VGS=15"] = true
+	ag.errors["AT+VGM=15"] = true
+	c := New(conn, slog.Default())
+	if err := c.Start(context.Background()); err != nil {
+		t.Fatalf("SLC failed on refused gain: %v", err)
+	}
+	defer c.Close()
+}
+
+// The phone lowering the speaker gain (its volume buttons, or reporting its
+// own level when audio connects) is answered with AT+VGS=15: the caller's
+// voice reaches siptooth at the phone's full level.
+func TestSpeakerGainRestored(t *testing.T) {
+	c, ag := startClient(t, defaultCIND)
+	defer c.Close()
+	n := len(ag.got())
+	ag.send("+VGS: 7")
+	waitCmd := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for len(ag.got()) < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("commands %v", ag.got())
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	waitCmd(n + 1)
+	if got := ag.got()[n]; got != "AT+VGS=15" {
+		t.Fatalf("got %q, want AT+VGS=15", got)
+	}
+	ag.send("+VGS=9") // the older HSP form
+	waitCmd(n + 2)
+	ag.send("+VGS: 15")
+	ag.send("+VGM: 3") // microphone gain is informational
+	time.Sleep(50 * time.Millisecond)
+	if got := len(ag.got()); got != n+2 {
+		t.Fatalf("unexpected commands %v", ag.got()[n:])
+	}
 }

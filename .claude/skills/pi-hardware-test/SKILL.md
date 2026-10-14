@@ -10,7 +10,7 @@ The owner runs the hardware; you guide. Host `pi@rpi-pt`, binary `~/.local/bin/s
 ## Protocol
 
 1. Give exactly **one** command per message, say in one line what to look for, and wait for the pasted output before the next step. Never send a list of commands.
-2. Read-only inspection you may run yourself over ssh (`ssh -o BatchMode=yes pi@rpi-pt 'journalctl --user -u siptooth --since -10min'`, `... '~/.local/bin/siptooth status'`, reading files under `~/.siptooth/` except `env`). Anything that changes the Pi (deploy, restart, config edits, pairing) is the owner's step unless they ask you to do it.
+2. Read-only inspection you may run yourself over ssh (`ssh -o BatchMode=yes pi@rpi-pt 'journalctl --user-unit siptooth --since -10min'`, `... '~/.local/bin/siptooth status'`, reading files under `~/.siptooth/` except `env`). Anything that changes the Pi (deploy, restart, config edits, pairing) is the owner's step unless they ask you to do it.
 3. Never ask for or print the SIP password.
 
 ## Typical sequence after a code change
@@ -21,7 +21,7 @@ The owner runs the hardware; you guide. Host `pi@rpi-pt`, binary `~/.local/bin/s
 4. `siptooth doctor` - everything ok or explained.
 5. `siptooth sip test --tone` - SIP leg works without a phone call (registration, INVITE, tone audible at the far end).
 6. Owner places a test call to the phone from a second phone.
-7. You read `ssh -o BatchMode=yes pi@rpi-pt 'journalctl --user -u siptooth --since -10min'` yourself and analyse the call.
+7. You read `ssh -o BatchMode=yes pi@rpi-pt 'journalctl --user-unit siptooth --since -10min'` yourself and analyse the call.
 
 ## Reading a call
 

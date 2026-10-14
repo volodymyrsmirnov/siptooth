@@ -417,6 +417,7 @@ Copied from allochka with these changes only:
 
 - Names: adapter alias `siptooth`, D-Bus object paths `/com/siptooth/hfp` and `/com/siptooth/agent`, profile name `Siptooth`.
 - `calls.answer_delay_seconds` removed; nothing calls `Answer` on ring any more: `bridge` does after the SIP `2xx`.
+- Remote volume control (2026-10-14, hardware test): `AT+BRSF=52` adds bit 4 to allochka's 36, the SLC ends with `AT+VGS=15` and `AT+VGM=15` (a refusal only logs), and every `+VGS` below 15 from the phone is answered with `AT+VGS=15`. Android scales the call audio it sends over SCO by this speaker gain, and at the phone's own volume the caller reached ElevenLabs at about -24 dB below the agent and sounded distorted once ElevenLabs raised it.
 - Probe mode (`internal/probe`) removed; `siptooth sip test` (section 11) covers the SIP side, and the Bluetooth side is already qualified by allochka on this hardware.
 - Everything else unchanged, including the hard-won fixes: ring dedup and call-waiting latch, `CallActive` while ringing means the owner answered, `CallSetupCleared` only with `call` = 0, SLC retries, profile re-registration, routing retries, bus reconnect, idle-only power cycle (`bluetooth.power_cycle_minutes`, default 60), in-band ringing backlog drain, read-driven SCO pacing with the stall fallback, 3 s AT deadlines, 2 s SCO dial fallback.
 
@@ -623,6 +624,8 @@ Reviewed by Fable 5.1 (Claude subagent), gpt-6.1-sol and gpt-6-astra (Codex CLI)
 - `pion/stun` dropped for a hand-rolled Binding Request (the unsuffixed module is v0.6.1 with a parser panic; Fable, gpt-6.1-sol); versions pinned (all three).
 - URIs: `sip:` only, explicit port honored, component-aware escaping, CR/LF rejected; `{call_id}` placeholder; provider recipes (all three).
 - Hooks back to allochka's single worker (Fable, gpt-6.1-sol); claims narrowed to two qualified targets (gpt-6-astra).
+
+2026-10-14 (hardware test, ElevenLabs direct, caller level): the caller was quiet and distorted at ElevenLabs; siptooth now holds the phone's HFP speaker gain at 15 (section 8) and logs the caller's speech level (`caller_db_p50`, `caller_db_p95`, `caller_speech_s`) in the call summary.
 
 2026-10-14 (hardware test, ElevenLabs direct, later): the agent heard its own echo from the phone line and interrupted itself; the allochka echo gate is ported as section 6.6 with `media.echo_suppression`, `media.echo_threshold_db` and `media.echo_window_ms`.
 

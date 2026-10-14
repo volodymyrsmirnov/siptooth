@@ -24,12 +24,14 @@ func newFakeAG(t *testing.T, cindList string) (*fakeAG, net.Conn) {
 	t.Helper()
 	agSide, hfSide := net.Pipe()
 	ag := &fakeAG{t: t, conn: agSide, replies: map[string][]string{}, errors: map[string]bool{}, silent: map[string]bool{}, done: make(chan struct{})}
-	ag.replies["AT+BRSF=36"] = []string{"+BRSF: 4095"}
+	ag.replies["AT+BRSF=52"] = []string{"+BRSF: 4095"}
 	ag.replies["AT+CIND=?"] = []string{cindList}
 	ag.replies["AT+CIND?"] = []string{"+CIND: 1,0,0,5,4,0,0"}
 	ag.replies["AT+CMER=3,0,0,1"] = nil
 	ag.replies["AT+CHLD=?"] = []string{"+CHLD: (0,1,2,3)"}
 	ag.replies["AT+CLIP=1"] = nil
+	ag.replies["AT+VGS=15"] = nil
+	ag.replies["AT+VGM=15"] = nil
 	ag.replies["ATA"] = nil
 	ag.replies["AT+CHUP"] = nil
 	go ag.serve()

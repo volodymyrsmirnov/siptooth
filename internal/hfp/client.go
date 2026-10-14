@@ -66,7 +66,15 @@ var (
 	ErrNotSent = fmt.Errorf("%w (command not sent)", ErrTimeout)
 )
 
-const hfFeatures = 36 // CLI presentation (bit 2) + enhanced call status (bit 5)
+// hfFeatures: CLI presentation (bit 2) + remote volume control (bit 4) +
+// enhanced call status (bit 5). Remote volume control lets siptooth hold the
+// phone's speaker gain at maximum: Android scales the call audio it sends over
+// SCO by that gain, and the caller reached the far end too quietly at the
+// phone's own volume setting (2026-10-14 hardware test).
+const hfFeatures = 52
+
+// maxGain is the highest HFP speaker and microphone gain.
+const maxGain = 15
 const agThreeWay = 1 << 0
 
 type transaction struct {
@@ -183,6 +191,14 @@ func (c *Client) Start(ctx context.Context) error {
 	}
 	if _, err := step("AT+CLIP=1", ""); err != nil {
 		c.log.Warn("hfp: AT+CLIP=1 failed, caller ID unavailable", "err", err)
+	}
+	// Report our gains: speaker at maximum so the phone sends the call audio
+	// at full level; the microphone gain is informational.
+	if _, err := step(fmt.Sprintf("AT+VGS=%d", maxGain), ""); err != nil {
+		c.log.Warn("hfp: AT+VGS failed, the caller may sound quiet", "err", err)
+	}
+	if _, err := step(fmt.Sprintf("AT+VGM=%d", maxGain), ""); err != nil {
+		c.log.Debug("hfp: AT+VGM failed", "err", err)
 	}
 	c.emit(Event{Kind: Connected})
 	return nil
@@ -427,8 +443,27 @@ func (c *Client) handleUnsolicited(line string) {
 			defer cancel()
 			c.command(ctx, "AT+BCS=1", "")
 		}()
+	case strings.HasPrefix(line, "+VGS"):
+		// The phone changed the speaker gain (volume buttons, or its own level
+		// reported when audio connects): put it back to maximum.
+		gain, err := parseGain(line)
+		if err != nil {
+			c.log.Warn("hfp: bad +VGS", "line", line)
+			return
+		}
+		if gain >= maxGain {
+			return
+		}
+		c.log.Info("hfp: phone lowered the speaker gain, restoring it", "gain", gain)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+			defer cancel()
+			if _, err := c.command(ctx, fmt.Sprintf("AT+VGS=%d", maxGain), ""); err != nil {
+				c.log.Warn("hfp: AT+VGS failed", "err", err)
+			}
+		}()
 	default:
-		// +BSIR, +VGS, +VGM, +CCWA, +BVRA and anything else: ignored.
+		// +BSIR, +VGM, +CCWA, +BVRA and anything else: ignored.
 	}
 }
 

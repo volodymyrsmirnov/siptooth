@@ -5,8 +5,8 @@
 siptooth logs with `log/slog` text lines to stderr; under systemd they go to the journal:
 
 ```sh
-journalctl --user -u siptooth -f
-journalctl --user -u siptooth --since "1 hour ago" | grep 'call ended'
+journalctl --user-unit siptooth -f
+journalctl --user-unit siptooth --since "1 hour ago" | grep 'call ended'
 ```
 
 The level comes from `SIPTOOTH_LOG_LEVEL` (`debug`, `info` default, `warn`, `error`). `debug` adds each SIP message's start line and SDP bodies, with `a=crypto` keys and `Authorization` / `Proxy-Authorization` values redacted. Every call-scoped line carries `call_id`. Passwords and SRTP keys never appear in logs or hook payloads.
@@ -131,6 +131,7 @@ Every `bluetooth.power_cycle_minutes` (default 60; `0` = off, otherwise 10..1440
 | `sip_timeout` | The far end never answered within `sip.dial_timeout_seconds`. Check the route on the provider side; with `register: true`, `siptooth status` must show `registered=yes`. |
 | `sip_media_failed` | The SDP answer was refused. Check `media.codecs` against what the provider supports, and `sip.srtp` against its media-encryption setting. |
 | One-way audio, or none | NAT checklist below. |
+| Caller too quiet or distorted at the far end | `caller_db_p50` in the call summary. Normal speech is about -30 to -15 dBFS. siptooth holds the phone's Bluetooth call volume at maximum (`AT+VGS=15`, logged as "phone lowered the speaker gain, restoring it" when the phone changes it); if the level stays low, raise the call volume on the phone during a call and check that the phone has no "volume limit" or hearing-aid setting for Bluetooth. |
 | The agent interrupts itself or answers its own words | Echo; see "Echo" above and the `echo gate` line of the call. |
 | Far-end hang-up delayed | The far end's BYE did not reach siptooth; see below. |
 | Hooks fail | `siptooth hooks test --event call.ended` shows exit code, stdout and stderr; hooks run as you with a minimal environment. See `docs/hooks.md`. |

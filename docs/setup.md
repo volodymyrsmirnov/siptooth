@@ -59,7 +59,7 @@ Every command defaults to `--config ~/.siptooth/config.yaml` (or `$SIPTOOTH_CONF
 
 12. **Check the daemon:** `siptooth status`. Expect `ready: yes`, `phone connected: yes`, `state: idle` and, when `sip.register` is on, `registration: registered=yes` with the Contact and expiry. `--json` gives machine output.
 
-13. **Watch the logs and make a test call:** `journalctl --user -u siptooth -f`, then call the phone. A finished call logs one `call ended` line (fields in `docs/operations.md`).
+13. **Watch the logs and make a test call:** `journalctl --user-unit siptooth -f`, then call the phone. A finished call logs one `call ended` line (fields in `docs/operations.md`).
 
 ## Day to day
 

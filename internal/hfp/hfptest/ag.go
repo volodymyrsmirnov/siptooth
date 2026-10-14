@@ -37,12 +37,14 @@ func New(t testing.TB, cindList string) (*AG, net.Conn) {
 	t.Helper()
 	agSide, hfSide := net.Pipe()
 	ag := &AG{t: t, conn: agSide, replies: map[string][]string{
-		"AT+BRSF=36":      {"+BRSF: 4095"},
+		"AT+BRSF=52":      {"+BRSF: 4095"},
 		"AT+CIND=?":       {cindList},
 		"AT+CIND?":        {"+CIND: 1,0,0,5,4,0,0"},
 		"AT+CMER=3,0,0,1": nil,
 		"AT+CHLD=?":       {"+CHLD: (0,1,2,3)"},
 		"AT+CLIP=1":       nil,
+		"AT+VGS=15":       nil,
+		"AT+VGM=15":       nil,
 		"ATA":             nil,
 		"AT+CHUP":         nil,
 	}}

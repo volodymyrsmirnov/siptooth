@@ -80,7 +80,7 @@ func TestAnswerDeadlineUsesWriteDeadline(t *testing.T) {
 	agSide, hfSide := net.Pipe()
 	defer agSide.Close()
 	ag := &fakeAG{t: t, conn: agSide, replies: map[string][]string{}, errors: map[string]bool{}, silent: map[string]bool{}, done: make(chan struct{})}
-	ag.replies["AT+BRSF=36"] = []string{"+BRSF: 4095"}
+	ag.replies["AT+BRSF=52"] = []string{"+BRSF: 4095"}
 	ag.replies["AT+CIND=?"] = []string{defaultCIND}
 	ag.replies["AT+CIND?"] = []string{"+CIND: 1,0,0,5,4,0,0"}
 	ag.replies["AT+CMER=3,0,0,1"] = nil

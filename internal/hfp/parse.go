@@ -147,3 +147,16 @@ func parseCLIP(line string) (string, int, error) {
 	}
 	return number, typ, nil
 }
+
+// parseGain reads "+VGS: n", "+VGS:n" or the older "+VGS=n" (likewise +VGM).
+func parseGain(line string) (int, error) {
+	i := strings.IndexAny(line, ":=")
+	if i < 0 {
+		return 0, fmt.Errorf("hfp: no gain in %q", line)
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(line[i+1:]))
+	if err != nil || n < 0 || n > 15 {
+		return 0, fmt.Errorf("hfp: bad gain in %q", line)
+	}
+	return n, nil
+}

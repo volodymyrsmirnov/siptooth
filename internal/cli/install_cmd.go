@@ -125,7 +125,7 @@ func runInstall(args []string, stdout, stderr io.Writer) int {
 			return ExitError
 		}
 	}
-	fmt.Fprintf(stdout, "installed %s (ExecStart=%s run --config %s)\nlogs: journalctl --user -u siptooth -f\n", unitPath, exe, absCfg)
+	fmt.Fprintf(stdout, "installed %s (ExecStart=%s run --config %s)\nlogs: journalctl --user-unit siptooth -f\n", unitPath, exe, absCfg)
 	return ExitOK
 }
 

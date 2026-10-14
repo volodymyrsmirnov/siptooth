@@ -87,7 +87,7 @@ func TestInstallWritesUserUnitAndRunsCommands(t *testing.T) {
 	if err != nil || !strings.Contains(string(b), "ExecStart=/home/pi/.local/bin/siptooth run --config "+p+"\n") {
 		t.Fatalf("unit %v:\n%s", err, b)
 	}
-	if !strings.Contains(out.String(), "write "+unitPath) || !strings.Contains(out.String(), "$ systemctl --user restart siptooth") || !strings.Contains(out.String(), "journalctl --user -u siptooth -f") {
+	if !strings.Contains(out.String(), "write "+unitPath) || !strings.Contains(out.String(), "$ systemctl --user restart siptooth") || !strings.Contains(out.String(), "journalctl --user-unit siptooth -f") {
 		t.Fatalf("output: %s", out.String())
 	}
 	// Re-running refreshes: the unit is rewritten (here with another binary).
