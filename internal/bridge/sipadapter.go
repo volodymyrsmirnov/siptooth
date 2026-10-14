@@ -176,11 +176,11 @@ func (a *SIPAdapter) Prepare(ctx context.Context, nextHopHost string) (Prepared,
 		offer.LocalKey = key
 	}
 
-	contact := a.contact(ctx, nextHopHost, dec)
+	contact, source := a.contact(ctx, nextHopHost, dec)
 	if err := ctx.Err(); err != nil {
 		return fail(err)
 	}
-	return Prepared{Media: media, Offer: offer, LocalKey: key, Contact: contact, NAT: dec}, nil
+	return Prepared{Media: media, Offer: offer, LocalKey: key, Contact: contact, ContactSource: source, NAT: dec}, nil
 }
 
 // Start sends the INVITE.
@@ -230,7 +230,7 @@ func (a *SIPAdapter) noteSTUNFailed(detail string) {
 // contact works out the signaling address (spec 7.3): the registered flow
 // address while registered, the local address in local mode, else what the
 // next hop sees (OPTIONS), else the media address IP.
-func (a *SIPAdapter) contact(ctx context.Context, host string, dec nat.Decision) string {
+func (a *SIPAdapter) contact(ctx context.Context, host string, dec nat.Decision) (uri, source string) {
 	cfg := a.d.Config.SIP
 	transport := strings.ToLower(cfg.Transport)
 	user := "siptooth"
@@ -238,7 +238,7 @@ func (a *SIPAdapter) contact(ctx context.Context, host string, dec nat.Decision)
 		user = cfg.Username
 		if a.d.Registration != nil {
 			if st, ok := a.d.Registration(); ok && st.Contact.IsValid() {
-				return ContactURI(user, st.Contact, transport)
+				return ContactURI(user, st.Contact, transport), ContactRegistered
 			}
 		}
 	}
@@ -253,17 +253,25 @@ func (a *SIPAdapter) contact(ctx context.Context, host string, dec nat.Decision)
 		port = defaultSIPPort
 	}
 	if dec.Mode == nat.ModeLocal {
-		return ContactURI(user, netip.AddrPortFrom(dec.Local, port), transport)
+		return ContactURI(user, netip.AddrPortFrom(dec.Local, port), transport), ContactLocal
 	}
 	target := "sip:" + host
 	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
 		target = "sip:[" + host + "]"
 	}
 	if ap, ok := a.d.UA.DiscoverContact(ctx, target); ok {
-		return ContactURI(user, ap, transport)
+		return ContactURI(user, ap, transport), ContactOptions
 	}
-	return ContactURI(user, netip.AddrPortFrom(dec.Media.Addr(), port), transport)
+	return ContactURI(user, netip.AddrPortFrom(dec.Media.Addr(), port), transport), ContactFallback
 }
+
+// Contact sources reported in Prepared.ContactSource.
+const (
+	ContactRegistered = "registered" // the registered flow address
+	ContactLocal      = "local"      // the local address (nat local mode)
+	ContactOptions    = "options"    // received/rport of an OPTIONS answer
+	ContactFallback   = "fallback"   // media address IP with the local SIP port
+)
 
 // ContactURI renders sip:<user>@<addr>;transport=<t> (spec 5.2).
 func ContactURI(user string, addr netip.AddrPort, transport string) string {

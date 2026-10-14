@@ -46,13 +46,15 @@ type Media interface {
 // Prepared is what SIP.Prepare produces for one call: the open RTP socket,
 // the advertised addresses and the INVITE ingredients that depend on them.
 type Prepared struct {
-	Media     Media
-	Offer     sdp.Offer
-	LocalKey  []byte // SDES key sent in the offer; nil for plain RTP
-	Contact   string // signaling address URI (spec 7.3)
-	NAT       nat.Decision
-	NextHop   string // "host:port" the INVITE goes to; empty: sip.proxy or the UA default
-	Transport string // "udp" | "tcp" | "tls"; empty: the UA default
+	Media    Media
+	Offer    sdp.Offer
+	LocalKey []byte // SDES key sent in the offer; nil for plain RTP
+	Contact  string // signaling address URI (spec 7.3)
+	// ContactSource says how Contact was derived (the Contact* constants); informational.
+	ContactSource string
+	NAT           nat.Decision
+	NextHop       string // "host:port" the INVITE goes to; empty: sip.proxy or the UA default
+	Transport     string // "udp" | "tcp" | "tls"; empty: the UA default
 }
 
 // SIP starts outgoing calls.

@@ -2,17 +2,21 @@ package cli
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	gosip "github.com/emiago/sipgo/sip"
 
+	"github.com/volodymyrsmirnov/siptooth/internal/g711"
+	"github.com/volodymyrsmirnov/siptooth/internal/sdp"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip/siptest"
 )
 
@@ -20,8 +24,13 @@ const sipTestPassword = "s3cr3t-pa55-w0rd"
 
 func sipTestConfig(t *testing.T, tr *siptest.Trunk, extra string) string {
 	t.Helper()
-	body := fmt.Sprintf("bluetooth: {phone_address: 'AA:BB:CC:DD:EE:FF'}\nsip: {target: '%s', transport: udp%s}\nnat: {rtp_port_min: 41000, rtp_port_max: 42000}\n",
-		tr.URI("200"), extra)
+	return sipTestConfigT(t, tr, "udp", extra)
+}
+
+func sipTestConfigT(t *testing.T, tr *siptest.Trunk, transport, extra string) string {
+	t.Helper()
+	body := fmt.Sprintf("bluetooth: {phone_address: 'AA:BB:CC:DD:EE:FF'}\nsip: {target: '%s', transport: %s%s}\nnat: {rtp_port_min: 41000, rtp_port_max: 42000}\n",
+		tr.URI("200"), transport, extra)
 	return writeTempConfig(t, body)
 }
 
@@ -84,8 +93,15 @@ func TestSIPTestSuccess(t *testing.T) {
 	if n, _ := strconv.Atoi(m[1]); n == 0 {
 		t.Fatalf("received 0\n%s", out)
 	}
-	if strings.Contains(out, "received level:  -inf") {
-		t.Errorf("a tone echoed back should have a level\n%s", out)
+	lm := regexp.MustCompile(`received level:  (\S+) dBFS`).FindStringSubmatch(out)
+	if lm == nil {
+		t.Fatalf("no received level in\n%s", out)
+	}
+	if db, err := strconv.ParseFloat(lm[1], 64); err != nil || db < -30 || db > -17 {
+		t.Errorf("received level %q, want a -20 dBFS tone within -30..-17\n%s", lm[1], out)
+	}
+	if !strings.Contains(out, "(source: local)") {
+		t.Errorf("contact source missing\n%s", out)
 	}
 	if len(tr.RequestsFor("BYE")) != 1 {
 		t.Errorf("BYE requests = %d, want 1", len(tr.RequestsFor("BYE")))
@@ -227,5 +243,90 @@ func TestSIPTestRegistersOwnContact(t *testing.T) {
 	}
 	if last := regs[len(regs)-1]; !strings.Contains(last.Header("Contact"), "expires=0") || strings.Contains(last.Header("Contact"), "*") {
 		t.Errorf("last REGISTER Contact = %q, want this UA's contact with expires=0", last.Header("Contact"))
+	}
+}
+
+func TestSIPTestOptionsProbe(t *testing.T) {
+	t.Run("answering", func(t *testing.T) {
+		tr := siptest.NewTrunk(t, "udp")
+		answerWithEcho(tr, siptest.RTPEcho(t).Port(), nil)
+		tr.OnOptions(func(req *gosip.Request, tx gosip.ServerTransaction) {
+			tx.Respond(gosip.NewResponseFromRequest(req, 200, "OK", nil))
+		})
+		code, out, errOut := runSIPTest("--config", sipTestConfig(t, tr, ""), "--seconds", "1")
+		if code != ExitOK {
+			t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
+		}
+		if !regexp.MustCompile(`options: received=127\.0\.0\.1 rport=\d+`).MatchString(out) {
+			t.Errorf("no options observation\n%s", out)
+		}
+	})
+	t.Run("silent", func(t *testing.T) {
+		tr := siptest.NewTrunk(t, "udp")
+		answerWithEcho(tr, siptest.RTPEcho(t).Port(), nil)
+		tr.OnOptions(func(req *gosip.Request, tx gosip.ServerTransaction) {}) // never answers
+		code, out, errOut := runSIPTest("--config", sipTestConfig(t, tr, ""), "--seconds", "1")
+		if code != ExitOK {
+			t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
+		}
+		if !strings.Contains(out, "options: no answer, or no received/rport in Via") {
+			t.Errorf("no options failure line\n%s", out)
+		}
+	})
+}
+
+// With SRTP the offer carries an inline key; neither the password nor the
+// key may reach stdout or the debug log.
+func TestSIPTestSRTPKeyRedacted(t *testing.T) {
+	tr := siptest.NewTrunk(t, "tls")
+	sipTestTLS = tr.ClientTLSConfig()
+	t.Cleanup(func() { sipTestTLS = nil })
+	echo := siptest.RTPEcho(t)
+	keyRe := regexp.MustCompile(`inline:([A-Za-z0-9+/=]{20,})`)
+	var offered atomic.Value
+	tr.OnInvite(func(req *gosip.Request, tx gosip.ServerTransaction) {
+		if !siptest.CheckDigest(req, "alice", sipTestPassword, "nonce1") {
+			siptest.Challenge(req, tx, false, "test", "nonce1", false)
+			return
+		}
+		m := keyRe.FindSubmatch(req.Body())
+		if m == nil {
+			tx.Respond(gosip.NewResponseFromRequest(req, 488, "Not Acceptable Here", nil))
+			return
+		}
+		offered.Store(string(m[1]))
+		key, err := base64.StdEncoding.DecodeString(string(m[1]))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		// Echo the offered key back as ours: the RTP echo returns our own
+		// SRTP packets, which then decrypt with it.
+		body := sdp.Offer{SessID: 1, Version: 1, Addr: echo, Codecs: []g711.Codec{g711.PCMU}, LocalKey: key}.Marshal()
+		tr.Accept(req, tx, body)
+	})
+	t.Setenv("SIPTOOTH_SIP_PASSWORD", sipTestPassword)
+	t.Setenv("SIPTOOTH_LOG_LEVEL", "debug")
+	cfg := sipTestConfigT(t, tr, "tls", ", username: alice, srtp: true")
+	code, out, errOut := runSIPTest("--config", cfg, "--seconds", "1", "--tone")
+	if code != ExitOK {
+		t.Fatalf("exit %d\n%s\n%s", code, out, errOut)
+	}
+	key, _ := offered.Load().(string)
+	if key == "" {
+		t.Fatal("the trunk never saw an SRTP offer")
+	}
+	if !strings.Contains(out, "srtp: on") {
+		t.Errorf("srtp not negotiated\n%s", out)
+	}
+	all := out + errOut
+	if !strings.Contains(errOut, "a=crypto") {
+		t.Errorf("debug log should show the crypto line (redacted)\n%s", errOut)
+	}
+	if strings.Contains(all, key) || strings.Contains(all, sipTestPassword) {
+		t.Fatalf("secret leaked\nstdout:\n%s\nstderr:\n%s", out, errOut)
+	}
+	if m := keyRe.FindString(all); m != "" {
+		t.Fatalf("inline key material leaked: %s", m)
 	}
 }

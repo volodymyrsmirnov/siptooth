@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -54,6 +56,9 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	defer l.mu.Unlock()
 	return l.w.Write(p)
 }
+
+// sipTestTLS is replaced by tests (the fake trunk's CA); nil means system roots.
+var sipTestTLS *tls.Config
 
 func runSIP(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 || args[0] != "test" {
@@ -141,7 +146,7 @@ func (t *sipTest) run(ctx context.Context) int {
 	ua, err := sip.NewUA(sip.Options{
 		Transport: cfg.SIP.Transport, NextHop: nextHop, LocalPort: 0,
 		Username: cfg.SIP.Username, Password: t.password,
-		UserAgent: "siptooth/" + buildinfo.Version, Logger: t.log,
+		UserAgent: "siptooth/" + buildinfo.Version, Logger: t.log, TLSConfig: sipTestTLS,
 	})
 	if err != nil {
 		t.printf("error: %v", err)
@@ -151,14 +156,16 @@ func (t *sipTest) run(ctx context.Context) int {
 
 	var reg atomic.Pointer[sip.Registration]
 	if cfg.SIP.Register {
-		r := t.register(ctx, ua, cfg)
+		r, registered := t.register(ctx, ua, cfg)
 		reg.Store(r)
 		defer func() {
 			uctx, cancel := context.WithTimeout(context.Background(), unregisterTimeout)
 			defer cancel()
-			if err := r.Unregister(uctx); err != nil {
+			err := r.Unregister(uctx)
+			switch {
+			case err != nil:
 				t.printf("unregister failed: %v", err)
-			} else {
+			case registered:
 				t.printf("unregistered")
 			}
 		}()
@@ -192,7 +199,8 @@ func (t *sipTest) run(ctx context.Context) int {
 	if dec.Warning != "" {
 		t.printf("nat: warning: %s", dec.Warning)
 	}
-	t.printf("contact: %s", prep.Contact)
+	t.printf("contact: %s (source: %s)", prep.Contact, prep.ContactSource)
+	t.probeOptions(ctx, ua, host)
 
 	req, err := t.dialRequest(cfg, prep, nextHop)
 	if err != nil {
@@ -249,7 +257,7 @@ func (t *sipTest) run(ctx context.Context) int {
 		return ExitError
 	}
 	rep.endedBy, rep.rmsDB = t.talk(ctx, call, media)
-	if rep.endedBy == "local hangup" || rep.endedBy == "media stopped" {
+	if rep.endedBy == "local hangup" || rep.endedBy == "media stopped" || rep.endedBy == "wait limit reached" {
 		hangup(call)
 	}
 	s := media.Stats()
@@ -262,6 +270,21 @@ func (t *sipTest) run(ctx context.Context) int {
 		return ExitOK
 	}
 	return ExitError
+}
+
+// probeOptions shows what the far end observes of this flow: the top Via's
+// received/rport of an OPTIONS answer. It runs whatever the adapter used for the Contact.
+func (t *sipTest) probeOptions(ctx context.Context, ua *sip.UA, host string) {
+	target := "sip:" + host
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		target = "sip:[" + host + "]"
+	}
+	ap, ok := ua.DiscoverContact(ctx, target)
+	if !ok {
+		t.printf("options: no answer, or no received/rport in Via")
+		return
+	}
+	t.printf("options: received=%s rport=%d", ap.Addr(), ap.Port())
 }
 
 func hangup(call sip.Call) {
@@ -278,7 +301,7 @@ func onOff(b bool) string {
 }
 
 // register registers the test's own Contact and waits for the first answer.
-func (t *sipTest) register(ctx context.Context, ua *sip.UA, cfg config.Config) *sip.Registration {
+func (t *sipTest) register(ctx context.Context, ua *sip.UA, cfg config.Config) (reg *sip.Registration, ok bool) {
 	states := make(chan sip.RegState, 16)
 	r := ua.Register(context.Background(), "", cfg.SIP.RegistrarHost(),
 		time.Duration(cfg.SIP.RegisterExpiresSeconds)*time.Second, func(s sip.RegState) {
@@ -295,16 +318,16 @@ func (t *sipTest) register(ctx context.Context, ua *sip.UA, cfg config.Config) *
 			switch {
 			case s.Registered:
 				t.printf("register: ok, contact %s", s.Contact)
-				return r
+				return r, true
 			case s.Err != nil:
 				t.printf("register: failed: %v (continuing)", s.Err)
-				return r
+				return r, false
 			}
 		case <-timeout.C:
 			t.printf("register: no answer within %s (continuing)", registerWait)
-			return r
+			return r, false
 		case <-ctx.Done():
-			return r
+			return r, false
 		}
 	}
 }
@@ -434,6 +457,9 @@ func (t *sipTest) talk(ctx context.Context, call sip.Call, media bridge.Media) (
 				}
 			}
 			if !now.Before(end) {
+				if t.waitHangup {
+					return "wait limit reached", dbfs(totSq+secSq, totN+secN)
+				}
 				return "local hangup", dbfs(totSq+secSq, totN+secN)
 			}
 		}
