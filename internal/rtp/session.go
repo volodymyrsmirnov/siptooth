@@ -6,6 +6,7 @@ package rtp
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -169,10 +170,18 @@ func (s *Session) Start(m sdp.Media, localKey []byte, cfg Config) error {
 	// The reader drops everything until Start activates; the socket queue is
 	// FIFO, so once the reader has seen a marker sent to ourselves now, every
 	// earlier datagram has been read and dropped.
-	if _, err := s.conn.WriteToUDPAddrPort(token[:], s.selfAddr()); err == nil {
+	if err := s.writeUDP(token[:], s.selfAddr()); err == nil {
 		select {
 		case <-s.barrierCh:
+		case <-s.readerDone: // closed or fatal read error
 		case <-time.After(time.Second): // marker lost: best effort
+		}
+	} else {
+		// Deliberate fallback: give the reader a moment to drain the queue.
+		slog.Warn("rtp: start barrier write failed; draining by delay", "err", err)
+		select {
+		case <-s.readerDone:
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
 
@@ -195,6 +204,14 @@ func (s *Session) Start(m sdp.Media, localKey []byte, cfg Config) error {
 
 	s.stopKeepalive()
 	return nil
+}
+
+// writeUDP sends one datagram under a fresh write deadline, so a stuck socket
+// can never block a caller (or Close) for long.
+func (s *Session) writeUDP(b []byte, dst netip.AddrPort) error {
+	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	_, err := s.conn.WriteToUDPAddrPort(b, dst)
+	return err
 }
 
 // selfAddr is the address a datagram can be sent to to reach our own socket.
@@ -297,8 +314,7 @@ func (s *Session) sendLocked(payload func(g711.Codec) []byte) error {
 			return fmt.Errorf("rtp: srtp encrypt: %w", err)
 		}
 	}
-	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if _, err := s.conn.WriteToUDPAddrPort(raw, dst); err != nil {
+	if err := s.writeUDP(raw, dst); err != nil {
 		return fmt.Errorf("rtp: send: %w", err)
 	}
 	s.sentAny = true
@@ -499,8 +515,7 @@ func (s *Session) stunOnce(dst *net.UDPAddr, timeout time.Duration) (netip.AddrP
 		s.mu.Unlock()
 	}()
 
-	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	if _, err := s.conn.WriteToUDP(msg, dst); err != nil {
+	if err := s.writeUDP(msg, dst.AddrPort()); err != nil {
 		return netip.AddrPort{}, fmt.Errorf("stun: send to %s: %w", dst, err)
 	}
 	timer := time.NewTimer(timeout)

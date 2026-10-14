@@ -349,3 +349,16 @@ func TestSSRCChangeAfterRead(t *testing.T) {
 		t.Fatal("new SSRC must continue after the unplayed audio")
 	}
 }
+
+func TestStartupRebaseBounded(t *testing.T) {
+	p := NewPlayout(Config{})
+	p.SetStartup(true)
+	p.Push(1<<30, 1, ramp(0, 160))
+	p.Push(0, 1, ramp(0, 160)) // ~2^30 samples behind: dropped, not rebased
+	if c := p.counters(); c.late != 1 {
+		t.Fatalf("late = %d", c.late)
+	}
+	if d := p.Depth(); d != 20*time.Millisecond {
+		t.Fatalf("depth = %v", d)
+	}
+}

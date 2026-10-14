@@ -450,6 +450,7 @@ func TestSTUNKeepaliveStopsAtStart(t *testing.T) {
 		t.Fatal("no change notification")
 	}
 	s.Start(media(addrOf(srv)), nil, Config{})
+	time.Sleep(50 * time.Millisecond) // let a request already in flight arrive
 	for len(reqs) > 0 {
 		<-reqs
 	}
@@ -637,4 +638,37 @@ func TestConcurrentCloseWaits(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestEarlyRTPDroppedAfterStaleWriteDeadline(t *testing.T) {
+	s := listen(t)
+	srv, _ := stunServer(t, func() netip.AddrPort { return netip.MustParseAddrPort("203.0.113.5:4444") })
+	if _, err := s.QuerySTUN(addrOf(srv).String(), time.Second, 1); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond) // the STUN write deadline is now stale
+	p := peer(t)
+	for i := 0; i < 5; i++ {
+		send(t, p, s.LocalAddr(), rtpPacket(0, uint16(i), uint32(i*160), ulaw(160)))
+	}
+	if err := s.Start(media(addrOf(p)), nil, Config{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if st := s.Stats(); st.Received != 0 || st.Latched.IsValid() {
+		t.Fatalf("early RTP leaked: %+v", st)
+	}
+}
+
+func TestStartReturnsOnClose(t *testing.T) {
+	s := listen(t)
+	s.conn.SetWriteDeadline(time.Time{})
+	done := make(chan struct{})
+	go func() { s.Start(media(netip.MustParseAddrPort("127.0.0.1:9")), nil, Config{}); close(done) }()
+	s.Close()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Start did not return after Close")
+	}
 }

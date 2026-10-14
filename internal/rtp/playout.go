@@ -161,7 +161,7 @@ func (p *Playout) Push(ts uint32, ssrc uint32, pcm []int16) {
 	// Until playback begins, an earlier timestamp arriving after a later one
 	// (reordering at the start of the stream) moves the origin down instead
 	// of being dropped: spec 6.3, nothing in the startup buffer is lost.
-	if !p.played && off < p.readPos {
+	if !p.played && off < p.readPos && p.readPos-off <= p.limit() {
 		p.readPos = off
 	}
 
