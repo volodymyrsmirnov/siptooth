@@ -1,0 +1,55 @@
+# Siptooth configuration (~/.siptooth/config.yaml). Relative paths resolve against this directory.
+# The SIP password, if any, goes in ~/.siptooth/env as SIPTOOTH_SIP_PASSWORD=... (mode 0600).
+
+bluetooth:
+  adapter: hci0
+  phone_address: ""            # required; `siptooth pair` fills it in
+  power_cycle_minutes: 60      # 0 = off, otherwise 10..1440
+
+phone:
+  number: ""                   # the phone's own number, E.164 (e.g. +380441234567); required if {number} is used
+
+sip:
+  target: "sip:{number}@sip.rtc.elevenlabs.io;transport=tls"   # required, sip: URI
+  transport: tls               # udp | tcp | tls
+  proxy: ""                    # optional host:port next hop
+  local_port: 0                # 0: 5060 for udp, ephemeral for tcp/tls
+  from: ""                     # default "sip:{caller}@<target host>"
+  display_name: "{caller}"
+  anonymous_user: anonymous    # {caller} when the number is withheld
+  username: ""                 # digest username; password: SIPTOOTH_SIP_PASSWORD in ~/.siptooth/env
+  register: false              # REGISTER and keep the flow open (Zadarma); requires username
+  registrar: ""                # default: target host (with sip.proxy as next hop)
+  register_expires_seconds: 120   # 60..3600
+  headers: {}                  # extra INVITE headers, values may use placeholders
+                               # ElevenLabs: {X-CALLER-ID: "{caller}", X-CALL-ID: "{call_id}"}
+  srtp: false                  # SDES SRTP; requires transport tls
+  dial_timeout_seconds: 30     # 5..120
+
+media:
+  codecs: [PCMU, PCMA]         # offer order; at least one
+  jitter_ms: 60                # 20..500
+  silence_rms: 200             # catch-up threshold, 0..5000 (0 disables catch-up)
+
+nat:
+  mode: auto                   # auto | local | stun | public_ip
+  stun_servers: ["stun.l.google.com:19302", "stun.cloudflare.com:3478"]
+  public_ip: ""                # required for mode public_ip; fallback for stun
+  rtp_bind: ""                 # default: local address toward the next hop
+  rtp_port_min: 10000
+  rtp_port_max: 20000
+
+calls:
+  caller_id_wait_ms: 1000      # 0..3000
+  sco_settle_ms: 800           # 0..5000
+  media_timeout_seconds: 10    # 5..300
+  max_duration_seconds: 0      # 0 = no limit, else 60..86400
+
+control:
+  socket: siptooth.sock
+
+hooks: []
+#   - id: notify
+#     events: [call.ended]
+#     command: "/home/pi/.siptooth/hooks/notify.sh"
+#     timeout_seconds: 10      # 1..300, default 10
