@@ -66,19 +66,20 @@ func (f *fakeTel) counts() (answers, hangups int) {
 // --- media ---
 
 type fakeMedia struct {
-	mu       sync.Mutex
-	closed   int
-	stats    rtp.Stats
-	started  []sdp.Media
-	keys     [][]byte
-	startErr error
-	silences int
-	updates  []sdp.Media
-	errCh    chan error
-	pl       *rtp.Playout
-	panicOn  bool // Stats panics
-	frames   int
-	writeErr error
+	mu           sync.Mutex
+	closed       int
+	stats        rtp.Stats
+	started      []sdp.Media
+	keys         [][]byte
+	startErr     error
+	silences     int
+	updates      []sdp.Media
+	errCh        chan error
+	pl           *rtp.Playout
+	panicOn      bool // Stats panics
+	panicSilence bool // WriteSilence panics
+	frames       int
+	writeErr     error
 }
 
 func newFakeMedia() *fakeMedia {
@@ -102,6 +103,9 @@ func (m *fakeMedia) WriteFrame([]int16) error {
 func (m *fakeMedia) WriteSilence() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.panicSilence {
+		panic("silence exploded")
+	}
 	m.silences++
 	return m.writeErr
 }
@@ -187,8 +191,10 @@ type fakeSIP struct {
 	gate chan struct{}
 	// panicFirstStats makes the first media panic in Stats.
 	panicFirstStats bool
-	localKey        []byte
-	mediaStartErr   error
+	// panicSilenceFirst makes the first media panic in WriteSilence.
+	panicSilenceFirst bool
+	localKey          []byte
+	mediaStartErr     error
 }
 
 func (s *fakeSIP) Prepare(ctx context.Context, host string) (Prepared, error) {
@@ -205,6 +211,7 @@ func (s *fakeSIP) Prepare(ctx context.Context, host string) (Prepared, error) {
 	m := newFakeMedia()
 	s.mu.Lock()
 	m.panicOn = s.panicFirstStats && len(s.medias) == 0
+	m.panicSilence = s.panicSilenceFirst && len(s.medias) == 0
 	s.medias = append(s.medias, m)
 	s.mu.Unlock()
 	m.startErr = s.mediaStartErr
