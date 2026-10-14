@@ -9,6 +9,12 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/g711"
 )
 
+const (
+	sectSession = iota
+	sectChosen
+	sectOther
+)
+
 // stream is the first audio stream of a parsed SDP.
 type stream struct {
 	addr    netip.AddrPort
@@ -28,7 +34,8 @@ func parseStream(body []byte) (stream, error) {
 		st                stream
 		sessConn, medConn string
 		sessDir           string
-		inMedia, done     bool
+		inMedia           bool
+		sect              = sectSession
 		port              int
 	)
 	for _, raw := range strings.Split(string(body), "\n") {
@@ -39,10 +46,8 @@ func parseStream(body []byte) (stream, error) {
 		typ, val := line[0], line[2:]
 		switch {
 		case typ == 'm':
+			sect = sectOther
 			if inMedia {
-				done = true
-			}
-			if done || inMedia {
 				continue
 			}
 			f := strings.Fields(val)
@@ -63,9 +68,10 @@ func parseStream(body []byte) (stream, error) {
 				st.pts = append(st.pts, n)
 			}
 			inMedia = true
-		case done:
+			sect = sectChosen
+		case sect == sectOther:
 		case typ == 'c':
-			if inMedia {
+			if sect == sectChosen {
 				medConn = val
 			} else {
 				sessConn = val
@@ -73,12 +79,12 @@ func parseStream(body []byte) (stream, error) {
 		case typ == 'a':
 			switch {
 			case val == "sendrecv" || val == "sendonly" || val == "recvonly" || val == "inactive":
-				if inMedia {
+				if sect == sectChosen {
 					st.dir = val
 				} else {
 					sessDir = val
 				}
-			case strings.HasPrefix(val, "crypto:") && inMedia:
+			case strings.HasPrefix(val, "crypto:") && sect == sectChosen:
 				st.cryptos = append(st.cryptos, val[len("crypto:"):])
 			}
 		}
@@ -111,7 +117,7 @@ func parseStream(body []byte) (stream, error) {
 	return st, nil
 }
 
-// checkProfile validates profile and crypto; it returns the remote key (nil
+// checkSecurity validates profile and crypto; it returns the remote key (nil
 // without SRTP).
 func (st stream) checkSecurity(srtp bool) ([]byte, error) {
 	if !srtp {

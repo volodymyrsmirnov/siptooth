@@ -99,6 +99,12 @@ func TestParseAnswer(t *testing.T) {
 		{name: "telephone-event ignored", body: crlf("c=IN IP4 1.2.3.4", "m=audio 4000 RTP/AVP 101 8", "a=rtpmap:101 telephone-event/8000"), ok: true, send: g711.PCMA, recv: []g711.Codec{g711.PCMA}, addr: "1.2.3.4:4000"},
 		{name: "media c overrides", body: crlf("c=IN IP4 1.1.1.1", "m=audio 4000 RTP/AVP 0", "c=IN IP4 2.2.2.2"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "2.2.2.2:4000"},
 		{name: "explicit sendrecv", body: answer("a=sendrecv"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "198.51.100.9:30000"},
+		{name: "video first with own c and sendonly", body: crlf("c=IN IP4 1.2.3.4", "m=video 5000 RTP/AVP 96", "c=IN IP4 9.9.9.9", "a=sendonly", "m=audio 4000 RTP/AVP 0"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "1.2.3.4:4000"},
+		{name: "video first, no session c", body: crlf("m=video 5000 RTP/AVP 96", "c=IN IP4 9.9.9.9", "m=audio 4000 RTP/AVP 0")},
+		{name: "video after audio", body: crlf("c=IN IP4 1.2.3.4", "m=audio 4000 RTP/AVP 0", "m=video 5000 RTP/AVP 96", "c=IN IP4 9.9.9.9", "a=sendonly", goodCrypto()), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "1.2.3.4:4000"},
+		{name: "media dir overrides session", body: crlf("c=IN IP4 1.2.3.4", "a=sendonly", "m=audio 4000 RTP/AVP 0", "a=sendrecv"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "1.2.3.4:4000"},
+		{name: "session sendrecv", body: crlf("c=IN IP4 1.2.3.4", "a=sendrecv", "m=audio 4000 RTP/AVP 0"), ok: true, send: g711.PCMU, recv: []g711.Codec{g711.PCMU}, addr: "1.2.3.4:4000"},
+		{name: "srtp crypto only in video", srtp: true, body: crlf("c=IN IP4 1.2.3.4", "m=audio 4000 RTP/SAVP 0", "m=video 5000 RTP/SAVP 96", goodCrypto())},
 		{name: "port 0", body: crlf("c=IN IP4 1.2.3.4", "m=audio 0 RTP/AVP 0")},
 		{name: "sendonly", body: answer("a=sendonly")},
 		{name: "recvonly", body: answer("a=recvonly")},
@@ -197,6 +203,8 @@ func TestClassifyReoffer(t *testing.T) {
 		{"srtp key change", srtpAnswer("a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:" + b64(otherKey)), curS, Reject, ""},
 		{"srtp to plain", answer(), curS, Reject, ""},
 		{"port 0", crlf("c=IN IP4 198.51.100.9", "m=audio 0 RTP/AVP 0"), cur, Reject, ""},
+		{"hold 0.0.0.0", crlf("c=IN IP4 0.0.0.0", "m=audio 30000 RTP/AVP 0"), cur, Reject, ""},
+		{"video first with sendonly", crlf("c=IN IP4 198.51.100.9", "m=video 5000 RTP/AVP 96", "a=sendonly", "m=audio 30000 RTP/AVP 0"), cur, Refresh, "198.51.100.9:30000"},
 		{"garbage", []byte("zzz"), cur, Reject, ""},
 	}
 	for _, tc := range cases {
