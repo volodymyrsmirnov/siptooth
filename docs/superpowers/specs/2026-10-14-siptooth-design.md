@@ -1,7 +1,7 @@
 # Siptooth — Design Specification
 
 **Date:** 2026-10-14
-**Status:** Approved; implemented (revision 4, 2026-10-14: implementation decisions folded in, see Appendix A)
+**Status:** Approved; implemented (revision 4, 2026-10-14: implementation decisions folded in, see Appendix A). Revision 5 (2026-10-14): SMS forwarding to hooks over Bluetooth MAP, section 17.
 **Predecessor:** allochka (`~/Projects/Personal/allochka`), spec `docs/superpowers/specs/2026-10-04-allochka-design.md`. Allochka is retired once siptooth is proven on real calls.
 
 Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspberry Pi 5 acts as a Bluetooth hands-free unit for the phone, exactly as allochka does. When the phone rings, siptooth places a SIP call to one configured target, answers the phone only once the far end answers, and bridges the audio both ways until either side hangs up. Siptooth has no AI, no conversation logic, no web UI and no call store.
@@ -14,6 +14,7 @@ Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspbe
 - Forward every incoming call on the phone to one configured SIP target, with caller ID passed through.
 - Work from a home network behind NAT, toward targets on the internet (STUN) and on the LAN.
 - Generic SIP forwarding: the target is whatever the config names. Two **qualified** v1 targets, both first-class and used independently: **ElevenLabs Agents** SIP trunking (called directly) and the owner's **Zadarma** cloud PBX (an extension account; the PBX then rings people, plays a menu, takes voicemail, or forwards to an external SIP URI such as an ElevenLabs agent). Other standards-based trunks and LAN PBXs are best effort; siptooth is a deliberately small UAC, not a general-purpose softphone.
+- Incoming SMS forwarded to shell hooks (sender and text) over Bluetooth MAP, section 17.
 - Shell hooks on call lifecycle events, so later work (for example a separate service that accepts OpenAI SIP calls) can attach without changing siptooth.
 
 **Non-goals (v1)**
@@ -24,6 +25,7 @@ Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspbe
 - Recording, call store, transcripts, web UI, metrics endpoint.
 - Wideband (mSBC / G.722), Opus, ICE, TURN, DTLS-SRTP, RTCP, RFC 4733 DTMF events, SIP UPDATE, codec or key renegotiation mid-call.
 - Live config reload (restart to apply).
+- Sending SMS, MMS/RCS, catch-up of messages received while disconnected (section 17.1).
 
 **Success criteria**
 
@@ -45,7 +47,7 @@ Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspbe
 | NAT | Per call, the advertised address depends on the destination: LAN targets get the local interface address, internet targets the STUN-mapped (or configured public) address. Symmetric RTP with latching. TCP/TLS signaling connection kept open with keepalives for the whole dialog. |
 | Answer policy | SIP first: on ring, dial immediately; answer the phone (`ATA`) only after the far end's `2xx`. Any SIP failure leaves the phone ringing. No answer delay. |
 | Audio path | No resampling: SCO PCM16 8 kHz ↔ G.711 8 kHz. No echo gate, no processing. Startup audio buffered losslessly; latency recovered by dropping silence only. |
-| Observability | `log/slog` to the journal. Shell hooks on `call.ringing`, `call.connected`, `call.ended`, `system.error`. No call store. |
+| Observability | `log/slog` to the journal. Shell hooks on `call.ringing`, `call.connected`, `call.ended`, `sms.received` (section 17), `system.error`. No call store. |
 | Config | YAML at `~/.siptooth/config.yaml`, validated at startup; secrets in `~/.siptooth/env` (0600). Restart to reload. |
 | Service | systemd **user** unit, runs as the current user (in group `bluetooth`), everything under `~/.siptooth/`. |
 | Dependencies | Direct: `godbus/dbus/v5`, `golang.org/x/sys`, `gopkg.in/yaml.v3` (from allochka), `emiago/sipgo` v1.6.0, `pion/rtp` v1.10.5, `pion/srtp/v3` v3.1.3, pinned. Their transitive modules are accepted. No other direct dependency without the owner's approval. `coder/websocket` is dropped. The resolved graph must build with Go 1.24 (`make check`). |
@@ -91,6 +93,8 @@ internal/
   stun/       # new: Binding Request encode, response decode, address selection
   sip/        # new: sipgo wrapper: Dial (INVITE ownership), Hangup, in-dialog server, keepalive
   bridge/     # new: call coordinator state machine + media pump
+  obex/       # new (rev 5): OBEX subset for MAP (section 17)
+  sms/        # new (rev 5): MAP client, MNS server, bMessage, SMS service (section 17)
   defaults/   # embedded example config.yaml
   buildinfo/  # copied
 config/hooks/ # example hook scripts
@@ -479,6 +483,9 @@ calls:
 control:
   socket: siptooth.sock
 
+sms:
+  enabled: false               # SMS to sms.received hooks over Bluetooth MAP (section 17)
+
 hooks: []
 #   - id: notify
 #     events: [call.ended]
@@ -503,7 +510,8 @@ Allochka's dispatcher and runner: one worker goroutine, bounded queue of 100 eve
 - `call.ringing`: before the INVITE (fields above). For side processes that prepare for the call (for example a future OpenAI-accept service correlating by `X-CALL-ID`).
 - `call.connected`: audio bridged; adds `sip_call_id`, `codec`, `srtp`, `remote_media` (latched ip:port, or SDP address before latching), `advertised_media` (ip:port), `nat_mode`, `connected_at`.
 - `call.ended`: exactly once per call; adds `outcome` (`completed`, `sip_rejected`, `sip_timeout`, `sip_error`, `sip_media_failed`, `caller_abandoned`, `owner_answered`, `answer_failed`, `far_end_ended`, `signaling_lost`, `media_timeout`, `audio_lost`, `media_error`, `max_duration`, `bluetooth_lost`, `shutdown`), `hangup_by` (`caller`, `far_end`, `siptooth`, or null), `sip_status` and `sip_reason` (last final response to the INVITE, null if none), `error` (string or null), `ringing_seconds`, `bridged_seconds` (null if never bridged), `media` (`{"sent","received","lost","late","duplicate","overflow","discarded_silence","srtp_fail"}`).
-- `system.error`: `{"error":{"code","detail"}}`, codes `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed`, `sip_registration`. Same once-per-outage rules as allochka.
+- `system.error`: `{"error":{"code","detail"}}`, codes `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed`, `sip_registration`, `sms_unavailable` (section 17.6).
+- `sms.received`: an incoming SMS (section 17.8): `{"sms":{"id","from","from_name","text","type","handle"}}`. Same once-per-outage rules as allochka.
 
 The `target` in payloads is the expanded URI; credentials and SRTP keys never appear in payloads or logs.
 
@@ -515,9 +523,9 @@ The `target` in payloads is the expanded URI; credentials and SRTP keys never ap
 | --- | --- |
 | `siptooth run` | the daemon (systemd runs this) |
 | `siptooth pair` | interactive pairing (copied; daemon must be stopped) |
-| `siptooth doctor [--fix]` | setup checks: config valid, env file mode, group `bluetooth`, BlueZ, adapter, conflicting HFP handlers (PipeWire, bluealsa, a running allochka service), linger, DNS of the next hop, TCP/TLS connect and certificate check, NAT observations (section 7.4). `--fix` creates `~/.siptooth/`, default config, env file. Never runs sudo. |
+| `siptooth doctor [--fix]` | setup checks: config valid, env file mode, group `bluetooth`, BlueZ, adapter, conflicting HFP handlers (PipeWire, bluealsa, a running allochka service), linger, DNS of the next hop, TCP/TLS connect and certificate check, NAT observations (section 7.4), SMS checks when enabled (section 17.9). `--fix` creates `~/.siptooth/`, default config, env file. Never runs sudo. |
 | `siptooth install` | writes and enables the systemd user unit (copied) |
-| `siptooth status` | daemon state via control socket: Bluetooth ready, phone connected, SIP registration (when enabled: state, Contact, expiry), current call (state, caller, duration), last call outcome |
+| `siptooth status` | daemon state via control socket: Bluetooth ready, phone connected, SIP registration (when enabled: state, Contact, expiry), current call (state, caller, duration), last call outcome, SMS service state (section 17.9) |
 | `siptooth config check` | validate and print the effective config (password redacted) |
 | `siptooth hooks test --event E` | run hooks with a sample payload |
 | `siptooth sip test [--caller N] [--seconds 20] [--tone] [--wait-remote-hangup]` | a real SIP call to the target without Bluetooth (registers first when `sip.register` is on, unregisters at the end): prints the NAT decision and mapping, the OPTIONS `received`/`rport`, every SIP response, the negotiated codec and SRTP state; then for `--seconds` sends silence (or a 1 kHz tone at −20 dBFS with `--tone`) and reports packets received, loss, max inter-packet gap, latched source, received audio level. With `--wait-remote-hangup` it does not hang up and instead reports whether the far end's BYE arrived (and on which connection), or whether only RTP stopped. Exit 0 only when answered and audio packets were received. Runs while the daemon runs (separate SIP and RTP ports). |
@@ -546,6 +554,7 @@ Control socket: HTTP over `~/.siptooth/siptooth.sock`, `GET /status` (JSON) only
 | Bluetooth link lost mid-call | BYE, `bluetooth_lost` |
 | Hook fails / times out / queue full | logged, never affects calls |
 | Panic in a call goroutine | recovered, both sides hung up per the ownership rule, `call.ended` with `error`, daemon keeps running |
+| MAP (SMS) connection fails or drops | retried with backoff while the phone is connected; `sms_unavailable` after 5 min; calls unaffected (section 17.6) |
 | Invalid config | startup fails listing all errors with exit code 2; the unit's `RestartPreventExitStatus=2` stops restart loops (also used when another daemon already owns the control socket) |
 
 ## 14. Testing
@@ -568,6 +577,7 @@ TDD throughout; tests never touch real Bluetooth, real networks beyond loopback,
 2. **M2 — real call through Zadarma.** Stop allochka (`systemctl --user disable --now allochka`), install siptooth with allochka's `phone_address`, call the phone; verify criteria 1 and 3.
 3. **M3 — ElevenLabs direct.** Switch `sip.target` to the agent number; verify criterion 2 (full greeting heard, caller number received, hang-up propagation).
 4. **M4 — soak.** A week of normal use (criterion 4). Then allochka is archived.
+5. **M5 — SMS (revision 5).** Enable `sms.enabled`, restart, allow message access on the phone, send a text from another phone; verify `sms.received` reaches a hook with sender and text, the message stays unread on the phone, and calls still work. Then a power cycle and a reconnect.
 
 Each hardware step is run by the owner, one command at a time.
 
@@ -603,7 +613,165 @@ Known from Zadarma's docs: `sip.zadarma.com`, UDP 5060 and TLS 5061, PCMA/PCMU, 
 - **No RTCP.** Some media servers time out calls without RTCP; neither v1 target does. RTCP sender reports later are contained in `rtp`.
 - **Media timeout vs silence suppression.** A far end that stops RTP during silence would trip the 10 s timeout. Neither v1 target does (LiveKit sends every 20 ms; Asterisk without VAD likewise); other trunks may need a larger value.
 - **Narrowband only.** CVSD 8 kHz is the audio ceiling; mSBC/G.722 is a later iteration.
+- **MAP on Android / BlueZ (revision 5).** Unverified on hardware: that BlueZ's client-role external profile connects the phone's MAS (RFCOMM or L2CAP), that the phone shows the message-access prompt and then opens the MNS channel, and whether the MAS instance BlueZ picks is the SMS one when a phone has several. RCS chats and MMS are not forwarded by design. If BlueZ cannot connect the MAS through `ConnectProfile`, a fallback is siptooth's own SDP lookup and socket (larger change).
 - **OpenAI path (later).** OpenAI's SIP endpoint needs TLS + SRTP (supported here) plus a public webhook and an `accept` call per call; a separate service that siptooth's `call.ringing` hook (with `X-CALL-ID` correlation) can feed.
+
+## 17. SMS forwarding (Bluetooth MAP)
+
+Added 2026-10-14 (revision 5, owner request). The owner wants text messages that reach the phone to reach siptooth's hooks as well, the same way calls do, with no third-party integration: siptooth only hands the sender and the text to `sms.received` hooks; what a hook does with them is up to the owner.
+
+### 17.1 Scope
+
+**In scope:** incoming SMS (`SMS_GSM`, `SMS_CDMA`) that land in the phone's inbox while siptooth's MAP session is up; sender number, sender name when the phone has one (contact name), full text (concatenated SMS are joined by the phone); `sms.received` hook event; status and doctor reporting.
+
+**Out of scope (v1):** sending SMS; MMS (including Android group messages, which are MMS) and RCS chats (Google Messages "chat features" never appear in MAP); email and IM MAS instances; catching up on messages that arrived while the MAP session was down (no inbox listing at connect, so a reconnect never replays old messages); persistence across daemon restarts; any network integration.
+
+Delivery is **at most once**: a message is delivered to the hooks once, and a message that arrives while the link is down is not delivered.
+
+### 17.2 Why MAP
+
+HFP carries call control only; Android's Audio Gateway does not implement the SMS AT commands (`AT+CNMI`, `AT+CMGR`). Android exposes messages over the Bluetooth **Message Access Profile** (MAP 1.4): the phone runs a Message Access Server (MSE, SDP UUID `0x1132`; the owner's phone advertises it), and a car kit-style client (MCE) connects to it over OBEX, turns on notifications, and receives `NewMessage` event reports on a **Message Notification Server** (MNS, UUID `0x1133`) that the phone connects back to. siptooth implements the MCE side in pure Go; BlueZ only provides SDP records and the sockets through `Profile1` (as it does for HFP). BlueZ's `obexd` is not used (not installed on the Pi, needs the session bus and a package install).
+
+### 17.3 Components
+
+```
+internal/obex/   # OBEX 1.5 subset: packet + header codec, packet reader over stream or SEQPACKET,
+                 # client (Connect, Get with continuation, Put, Disconnect) and a server loop
+internal/sms/    # MAP over obex: MAS client ops, MNS server, event-report and bMessage parsers,
+                 # Service (lifecycle, retries, dedup, fetch, status), Message type
+internal/bluez/  # + MAP profile registration (MAS client, MNS server), ConnectMAS/DisconnectMAS
+internal/daemon/ # + wires sms.Service to the Bluetooth session and hooks; status
+internal/hooks/  # + sms.received payload and env
+```
+
+`obex` and `sms` are platform independent and fully testable over `net.Pipe`/in-memory connections; only the BlueZ glue is Linux-only.
+
+**Transport.** BlueZ hands each MAP connection to siptooth as a socket fd through `Profile1.NewConnection`, either RFCOMM (stream) or L2CAP ERTM (SEQPACKET, GOEP 2.0) depending on the SDP records. The OBEX reader accumulates reads into a buffer and cuts packets by their 16-bit length field, so the same code serves both: a SEQPACKET read with a 64 KiB buffer returns one whole SDU, a stream read returns arbitrary chunks, and bytes beyond one packet are kept for the next. Writes are one `Write` per packet (siptooth's requests and responses are small, under 1 KiB). The fd is set non-blocking and wrapped in `os.File`, so read/write deadlines work (as for HFP).
+
+### 17.4 OBEX subset (`internal/obex`)
+
+- Packets: opcode (1 byte), length (2 bytes, big endian, whole packet), Connect/its response add version `0x10`, flags `0x00`, max packet length (2 bytes); SetPath is not used.
+- Opcodes: Connect `0x80`, Disconnect `0x81`, Put `0x02`/final `0x82`, Get final `0x83`, Abort `0xFF`. Responses: Continue `0x90`, Success `0xA0`, and the error classes `0xC0`–`0xDF` reported as a typed error carrying the code.
+- Headers by the two high bits of the ID: Unicode (UTF-16BE, null terminated, 2-byte length), byte sequence (2-byte length), 1-byte, 4-byte. Used: Name `0x01`, Type `0x42` (ASCII, null terminated), Target `0x46`, Who `0x4A`, Body `0x48`, End-of-Body `0x49`, App-Parameters `0x4C` (TLV: tag 1 byte, length 1 byte, value), Connection-ID `0xCB`. Unknown headers are skipped by their encoded length; a header that runs past the packet is a protocol error.
+- siptooth advertises a maximum packet length of 8192 and never sends a packet larger than the peer's advertised maximum; SRM (single response mode) is not offered, so every exchange is strictly request/response.
+- Client: `Connect(target UUID)` stores the Connection-ID from the response and puts it first in every later request; `Get` sends the request headers in one final Get and repeats an empty final Get (Connection-ID only) while the answer is Continue, collecting Body/End-of-Body; `Put` sends headers plus End-of-Body in one final Put. Each exchange has a 10 s deadline; a deadline or protocol error closes the connection (OBEX has no resynchronisation).
+- Server loop (for MNS): answers Connect (checking the Target), collects a Put across Continue packets (answering `0x90` to each non-final packet, then the handler's result to the final one), answers Disconnect with Success and returns, Abort with Success (discarding the partial Put), anything else with `0xD1` Not Implemented. A request body larger than 1 MiB is answered `0xCD` Request Entity Too Large and discarded.
+- A received Get answer is capped at 1 MiB (then Abort and an error).
+
+### 17.5 MAP operations (`internal/sms`)
+
+Constants: MAS target `BB582B40-420C-11DB-B0DE-0800200C9A66`, MNS target `BB582B41-420C-11DB-B0DE-0800200C9A66`.
+
+| Operation | Request |
+| --- | --- |
+| Connect MAS | Connect, Target = MAS UUID; no `MapSupportedFeatures` app parameter, so the phone uses the MAP 1.0 default features and event reports version 1.0 |
+| SetNotificationRegistration | final Put, Type `x-bt/MAP-NotificationRegistration`, App-Params `NotificationStatus (0x0E) = 1`, End-of-Body `0x30` |
+| GetMessage | final Get, Name = handle, Type `x-bt/message`, App-Params `Attachment (0x0A) = 0`, `Charset (0x14) = 1` (UTF-8) |
+| SetMessageStatus | final Put, Name = handle, Type `x-bt/messageStatus`, App-Params `StatusIndicator (0x17) = 0` (read), `StatusValue (0x18) = 0` (unread), End-of-Body `0x30` |
+| MNS event | the phone's Put, Type `x-bt/MAP-event-report`, App-Params `MASInstanceID (0x0F)`, body = event report XML |
+
+GetMessage and SetMessageStatus address a message by handle alone (handles are unique within a MAS instance), so no SetPath is needed.
+
+**Event report.** `<MAP-event-report version="1.0"><event type="NewMessage" handle="…" folder="TELECOM/MSG/INBOX" msg_type="SMS_GSM"/>…</MAP-event-report>`, parsed with `encoding/xml`; extra attributes (version 1.1 `datetime`, `sender_name`, …) are ignored. One report may hold several events. An event is **forwarded** when `type` is `NewMessage`, `msg_type` is `SMS_GSM` or `SMS_CDMA`, and the folder's last path element is `inbox` (case-insensitive; `INBOX`, `telecom/msg/inbox` and `TELECOM/MSG/INBOX` all match). Every other event is logged at debug and ignored (MMS `NewMessage` events at info, so the owner sees why a message did not arrive). A malformed report is answered with Success anyway (the phone must not retry it) and logged as a warning.
+
+**bMessage.** The GetMessage body:
+
+```
+BEGIN:BMSG
+VERSION:1.0
+STATUS:UNREAD
+TYPE:SMS_GSM
+FOLDER:TELECOM/MSG/INBOX
+BEGIN:VCARD            <- originator (zero or one, before BENV)
+VERSION:2.1
+N:Doe;Jane
+TEL:+380501234567
+END:VCARD
+BEGIN:BENV
+BEGIN:VCARD ... END:VCARD   <- recipients, ignored
+BEGIN:BBODY
+CHARSET:UTF-8
+LENGTH:28
+BEGIN:MSG
+Hello
+END:MSG
+END:BBODY
+END:BENV
+END:BMSG
+```
+
+Parser rules: lines end in CRLF or LF; property names are case-insensitive and may carry parameters (`TEL;TYPE=CELL:…`); vCard 2.1 and 3.0 are both accepted, including folded continuation lines in the vCard (a line starting with a space or tab). The originator is the first vCard after the BMSG properties and before `BEGIN:BENV`. `from` is its first `TEL` value, trimmed (it may be alphanumeric for service senders); `from_name` is `FN`, else `N` turned into "Given Family" (components 2 then 1, empty parts dropped), else none. A vCard name equal to the number is reported as no name. The text is everything between a `BEGIN:MSG` line and the matching `END:MSG` line inside `BBODY`, with the final line break before `END:MSG` removed and CRLF normalised to LF; several MSG blocks are concatenated. `LENGTH` is ignored (Android's value is not reliable). `STATUS` is read (`READ`/`UNREAD`). A `BBODY` with an `ENCODING` property or a `CHARSET` other than `UTF-8` is rejected as unsupported (siptooth asked for UTF-8). A missing BBODY or MSG block is a parse error.
+
+### 17.6 Service lifecycle
+
+`sms.Service` owns the MAP state. It runs one goroutine and gets everything as messages, with an injected clock (as `bridge`). Inputs come from the daemon:
+
+- `PhoneUp()` and `PhoneDown()`: the HFP service-level connection came up or went away (`btHandler` calls them next to `Attach`/`Detach`). MAP follows the HFP link, so the hourly power cycle, bluetoothd restarts and phone reconnects are all handled by the HFP machinery that already handles them.
+- `MASConnection(conn)` and `MNSConnection(conn)`: fds from `Profile1.NewConnection` on the MAS and MNS profile objects (returned to BlueZ at once; the work happens on the service's goroutines).
+- `MASDisconnected()` / `MNSDisconnected()`: `RequestDisconnection` or `Release` on those profile objects.
+
+States: `disabled` (config off), `waiting` (no HFP link), `connecting`, `ready` (MAS connected, notifications on), `retrying` (waiting for the next attempt).
+
+Sequence once the phone is up:
+
+1. Wait 3 s (HFP SLC and the phone's own setup settle first), then call `Device1.ConnectProfile(MAS UUID)` with a 15 s timeout through the `Connector` interface. BlueZ looks up the phone's MAS record, connects, and delivers the socket through `NewConnection`. A `ConnectProfile` error, or no MAS connection within 15 s, is a failed attempt.
+2. OBEX Connect with the MAS target, then SetNotificationRegistration on. Both must succeed.
+3. The service is `ready`. The phone then connects to siptooth's MNS record and sends event reports on it. If no MNS connection arrives within 30 s of registration, the attempt failed ("phone did not open the notification channel"): the MAS connection is closed (`Device1.DisconnectProfile(MAS UUID)` too) and retried.
+4. For each forwarded event: if the handle was delivered or is already queued (dedup memory of the last 256 handles, in RAM only), skip it; otherwise queue it. The fetch queue holds at most 32 handles (oldest dropped with a warning). Fetches run one at a time on the MAS connection: GetMessage, parse, emit `sms.received`, then SetMessageStatus(unread) when the bMessage said `UNREAD`, so siptooth never changes what the owner sees on the phone (Android may mark a message read when it is downloaded). A failed SetMessageStatus is only logged.
+5. A fetch that fails with a connection-level error (deadline, EOF, protocol error) closes the MAS connection; the handle stays queued and is fetched after the next successful connect. A handle is dropped after 3 failed attempts, or immediately on an OBEX error response for that message (for example Not Found because it was deleted) or a parse error (logged with the handle, never with the text).
+
+**Retries.** Any failed attempt or lost MAS connection while the phone is up schedules the next attempt after a backoff of 10 s, 30 s, 60 s, 120 s, then 300 s, reset by a successful `ready`. An OBEX Connect refused with Unauthorized/Forbidden or a socket refusal also logs the hint "allow message access for siptooth on the phone (Bluetooth device settings, Text messages / Message access)". `PhoneDown` closes both connections, empties nothing from the fetch queue (handles stay for the next connection, subject to the 3-attempt rule), cancels timers, and goes to `waiting`.
+
+**MNS without MAS.** An MNS connection is accepted whenever it arrives, even before or between MAS connections, and at most one is kept (a new one replaces the old). Events received while MAS is down are queued and fetched after the next connect.
+
+**system.error.** `sms_unavailable` is emitted once when the service has not been `ready` for 5 minutes while the phone is up (detail: the last error); it is re-armed by the next `ready`. Short gaps (the hourly power cycle) therefore emit nothing.
+
+**Isolation from calls.** The service shares nothing with the call coordinator except the Bluetooth link. It never blocks the coordinator or the Bluetooth session goroutine, and a MAP failure never affects calls. MAP traffic during a call is allowed (a few hundred bytes on the ACL link next to SCO).
+
+### 17.7 BlueZ integration
+
+When `sms.enabled`, the Bluetooth session's `register()` also registers two `Profile1` objects after the HFP one:
+
+| Object | UUID | Options |
+| --- | --- | --- |
+| `/com/siptooth/mas` | `00001132-0000-1000-8000-00805f9b34fb` | `Role: client`, `AutoConnect: false`, `RequireAuthentication: true`, `RequireAuthorization: false` |
+| `/com/siptooth/mns` | `00001133-0000-1000-8000-00805f9b34fb` | `Role: server`, `Name: Siptooth MNS`, `RequireAuthentication: true`, `RequireAuthorization: false` (BlueZ publishes its default MNS SDP record and listens on RFCOMM and L2CAP) |
+
+Registering MAP is best effort: a failure is logged (`AlreadyExists` counts as success, as for HFP), retried with the HFP registration retry, and never blocks HFP registration or calls. `NewConnection` from a device other than the configured phone is rejected (as for HFP). `ConnectMAS`/`DisconnectMAS` call `Device1.ConnectProfile`/`DisconnectProfile` with the MAS UUID. With `sms.enabled: false` nothing MAP-related is registered and the service stays `disabled`.
+
+### 17.8 Hook event `sms.received`
+
+```json
+{"schema_version":1,"event":"sms.received","occurred_at":"2026-10-14T09:43:31Z","test":false,
+ "sms":{"id":"20261014T094331Z-7c1e","from":"+380501234567","from_name":"Jane Doe",
+        "text":"Hello","type":"SMS_GSM","handle":"0400000000000012"}}
+```
+
+`id` uses the call ID format (UTC timestamp and 4 random hex digits). `from` and `from_name` are null when unknown. `occurred_at` is when siptooth fetched the message (version 1.0 event reports carry no time). Environment: `SIPTOOTH_EVENT=sms.received`, `SIPTOOTH_SMS_FROM` (empty when unknown); `SIPTOOTH_CALL_ID` and `SIPTOOTH_CALLER` are set empty. Delivery uses the same dispatcher, queue and ordering as call events. `siptooth hooks test --event sms.received` sends a sample (`from` `+380501234567`, `from_name` `Test Sender`, `text` `Test message from siptooth`).
+
+### 17.9 Logging, status, doctor
+
+- Logs never contain message text. One info line per delivered message: `msg="sms received" sms_id=… from=… type=… text_chars=…`. Service state changes are logged at info, failed attempts at warning with the error and the next retry delay.
+- `GET /status` gains `"sms":{"enabled":…,"state":"…","notifications":…,"received":N,"last_error":"…"}` (`notifications`: an MNS connection is open; `received`: messages delivered since start; `last_error` omitted when empty). `siptooth status` prints `sms: <state>, notifications <yes|no>, <N> received` (or `sms: disabled`).
+- `siptooth doctor` with `sms.enabled`: warns when no hook subscribes to `sms.received` (`sms_hooks`), and fails when an `obexd` process is running (`sms_obexd`, it may own the MNS profile; hint: stop it).
+
+### 17.10 Configuration
+
+```yaml
+sms:
+  enabled: false               # forward incoming SMS to sms.received hooks over Bluetooth MAP (spec 17)
+```
+
+Default off: turning it on makes the phone ask for message access. No other keys; timings are constants.
+
+### 17.11 Testing
+
+- **obex:** golden bytes for each request and header type; header decode table (truncated header, length past packet, unknown header skipped); packet reader fed 1-byte chunks, whole packets, and two packets in one read; client Get across several Continue responses; error response codes; deadline closes the connection; 1 MiB caps; server loop for Connect/Put (multi-packet)/Abort/Disconnect/unknown opcode, over `net.Pipe`.
+- **sms parsers:** bMessage table (vCard 2.1 and 3.0, FN vs N vs none, name equal to number, alphanumeric sender, missing originator, TEL with parameters, folded lines, LF-only, multiple MSG blocks, empty text, unsupported charset/encoding, missing MSG); event report table (v1.0, v1.1 attributes, several events, MMS, sent folder, malformed XML).
+- **sms client/MNS:** a scripted fake MSE on `net.Pipe` (exact request bytes asserted, scripted answers) for connect, registration, fetch, unread restore; a fake phone driving the MNS server.
+- **Service:** fake clock, fake `Connector`, in-memory connections: phone up → connect → ready; MNS timeout → retry; backoff sequence and reset; refused connect hint; dedup; queue cap; fetch failure keeps the handle, third failure drops it; Not Found drops it; `PhoneDown` mid-fetch; MNS before MAS; `sms_unavailable` after 5 minutes only, once per outage; no hook text in logs (log capture asserts the text never appears).
+- **hooks, config, control, cli, doctor:** payload golden, env, `hooks test` sample, `sms.enabled` default and unknown-key error, status JSON and text, doctor checks.
+- BlueZ glue is vetted by the linux/arm64 build only; its behaviour is qualified on hardware (section 15, M5).
 
 ## Appendix A — Review log (revision 2)
 
@@ -634,3 +802,5 @@ Reviewed by Fable 5.1 (Claude subagent), gpt-6.1-sol and gpt-6-astra (Codex CLI)
 Revision 4 (implementation): the owner-answer ownership rule was tightened (a definite ATA failure means the call is never siptooth's even if CallActive arrives first; outgoing call setup invalidates any pending answer); CallSetupCleared after ATA waits for CallActive (above); SCO loss latches no-CHUP; the far-end BYE drain bypasses jitter priming; re-INVITE 2xx is retransmitted on every transport (§5.6); `sip.local_port` must be 0 for TCP/TLS and maps to 5060 for UDP; the UDP Contact advertises the real bound port; transient RTP send errors are tolerated for 5 s.
 
 Revision 3 (owner input): the LAN PBX is replaced by the owner's Zadarma cloud PBX as a qualified target next to ElevenLabs direct (both first-class); optional REGISTER (section 5.7) because Zadarma documents only registered extensions or static-IP trunks, which also gives far-end BYEs a flow to arrive on; Zadarma recipe with its documented facts and the M1 qualification list.
+
+2026-10-14 (revision 5, owner request): SMS forwarding to hooks over Bluetooth MAP (section 17): new `sms.enabled` key (default off), `sms.received` hook event, `sms_unavailable` system error, `internal/obex` and `internal/sms`, two more BlueZ profiles, status and doctor additions, rollout step M5.
