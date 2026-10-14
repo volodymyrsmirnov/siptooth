@@ -236,6 +236,8 @@ func Validate(c Config, password string) []error {
 	inRange("media.jitter_ms", c.Media.JitterMs, 20, 500)
 	inRange("media.silence_rms", c.Media.SilenceRMS, 0, 5000)
 	inRange("media.min_pause_ms", c.Media.MinPauseMs, 0, 2000)
+	inRange("media.echo_threshold_db", c.Media.EchoThresholdDB, -30, 20)
+	inRange("media.echo_window_ms", c.Media.EchoWindowMs, 100, 2000)
 
 	// NAT.
 	switch c.NAT.Mode {

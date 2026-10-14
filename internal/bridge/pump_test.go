@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/volodymyrsmirnov/siptooth/internal/echo"
 	"github.com/volodymyrsmirnov/siptooth/internal/rtp"
 	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 )
@@ -99,11 +101,16 @@ type pumpRun struct {
 
 func startPump(t *testing.T, settle time.Duration, r *fakeRTP) *pumpRun {
 	t.Helper()
+	return startPumpGate(t, settle, r, nil)
+}
+
+func startPumpGate(t *testing.T, settle time.Duration, r *fakeRTP, gate *echo.Gate) *pumpRun {
+	t.Helper()
 	pumpSide, phone := sco.NewPipe(60)
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &pumpRun{end: make(chan PumpEnd, 1), cancel: cancel, phone: phone, clk: newFakeClock(), rtp: r}
 	r.clk = run.clk
-	go func() { run.end <- RunPump(ctx, pumpSide, r, settle, run.clk, nil) }()
+	go func() { run.end <- RunPump(ctx, pumpSide, r, settle, gate, run.clk, nil) }()
 	t.Cleanup(func() { cancel(); phone.Close(); pumpSide.Close() })
 	want := 2 // stall and RTP silence tickers
 	if settle > 0 {
@@ -514,7 +521,7 @@ func TestBlockedLinkStalls(t *testing.T) {
 	b := blockedLink{block: make(chan struct{})}
 	t.Cleanup(func() { close(b.block) })
 	end := make(chan PumpEnd, 1)
-	go func() { end <- RunPump(context.Background(), b, r, 0, clk, nil) }()
+	go func() { end <- RunPump(context.Background(), b, r, 0, nil, clk, nil) }()
 	waitFor(t, "pump timers", func() bool { return clk.armed() >= 3 })
 	var got PumpEnd
 	for i := 0; i < 400 && got == ""; i++ {
@@ -543,5 +550,57 @@ func TestPumpPanicBecomesEnd(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("pump did not return")
+	}
+}
+
+func sine(n int, amp float64) []int16 {
+	out := make([]int16, n)
+	for i := range out {
+		out[i] = int16(amp * 32767 * math.Sin(2*math.Pi*440*float64(i)/8000))
+	}
+	return out
+}
+
+// The far end's voice played to the phone and returned 10 dB quieter (line echo)
+// is sent to the far end as silence; caller speech louder than it gets through.
+func TestUplinkEchoGated(t *testing.T) {
+	r := newFakeRTP(0)
+	played := sine(8000, 0.3)
+	for off := 0; off < len(played); off += 160 {
+		r.pl.Push(uint32(off), 1, played[off:off+160])
+	}
+	p := startPumpGate(t, 0, r, echo.NewGate(6, 600))
+	for i := 0; i < 16; i++ { // the echo arrives 60 ms late: three frames of silence
+		p.exchange(t, toBytes(make([]int16, 30)))
+	}
+	echoed := sine(30*16*4, 0.3*0.316) // -10 dB
+	for i := 0; i < 16*4; i++ {
+		p.exchange(t, toBytes(echoed[i*30:(i+1)*30]))
+	}
+	if r.frameCount() != 15 {
+		t.Fatalf("frames = %d", r.frameCount())
+	}
+	for i := 3; i < 15; i++ {
+		for _, s := range r.frame(i) {
+			if s != 0 {
+				t.Fatalf("echo frame %d reached the far end", i)
+			}
+		}
+	}
+	loud := sine(30*16*5, 0.9) // +9.5 dB over the played audio
+	for i := 0; i < 16*5; i++ {
+		p.exchange(t, toBytes(loud[i*30:(i+1)*30]))
+	}
+	passed := 0
+	for i := 15; i < r.frameCount(); i++ {
+		for _, s := range r.frame(i) {
+			if s != 0 {
+				passed++
+				break
+			}
+		}
+	}
+	if passed < 13 { // two-block onset
+		t.Fatalf("caller speech frames passed = %d of %d", passed, r.frameCount()-15)
 	}
 }

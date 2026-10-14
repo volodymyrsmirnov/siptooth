@@ -68,11 +68,30 @@ All in `~/.siptooth/config.yaml`; restart after changing (`systemctl --user rest
 | `media.jitter_ms` (20..500) | 60 | Playout buffer depth for audio from the far end. Raise it when the far end sounds choppy and `late` or `lost` in the summary line are high; lower it to reduce delay on a clean path. |
 | `media.silence_rms` (0..5000) | 200 | Catch-up threshold: after a burst, frames quieter than this RMS may be skipped to bring the buffer back to `jitter_ms`. Lower it, or set `0` to disable catch-up, if you hear clipped quiet words (watch `discarded_silence`); raise it for more aggressive catch-up on a noisy line. |
 | `media.min_pause_ms` (0..2000) | 200 | Catch-up keeps this much of every pause and skips only the rest, so short gaps between words are never squeezed (a greeting buffered while the phone answers would otherwise sound rushed). `0` lets catch-up skip any silence. |
+| `media.echo_suppression` | true | Gate the line echo of the far end's own voice (see "Echo" below). Turn it off only to compare. |
+| `media.echo_threshold_db` (-30..20) | 6 | How much louder than the audio played to the phone the caller must be to get through while the far end talks. Lower it (for example 0) if callers cannot interrupt the agent; raise it if `diff_db_max` in the `echo gate` line comes close to it. |
+| `media.echo_window_ms` (100..2000) | 600 | How long after played audio its echo is expected. Keep it above `echo_delay_ms` plus about 200 ms. |
 | `calls.media_timeout_seconds` (5..300) | 10 | How long without RTP before siptooth hangs up. See "Far-end hang-up delayed". Raise it for a trunk that stops sending during silence. |
 | `calls.sco_settle_ms` (0..5000) | 800 | Pause after the SCO link comes up before audio is bridged. Raise it if the first words of calls are lost or garbled. |
 | `sip.dial_timeout_seconds` (5..120) | 30 | How long the SIP side may ring before siptooth gives up and lets the phone ring. Keep it shorter than the carrier's voicemail timeout. |
 | `calls.caller_id_wait_ms` (0..3000) | 2500 | How long to wait for the caller number after the first ring. Raise it if `caller=withheld` appears for calls that should show a number; `0` dials at once. |
 | `bluetooth.power_cycle_minutes` | 60 | Idle power cycle of the controller (see below). |
+
+## Echo
+
+Part of the far end's own voice comes back on the phone call: from the network, or acoustically at the caller's side (a laptop or speakerphone is the worst case). A browser client cancels its own echo; on the phone path nothing does, and an AI agent hears its own words as the caller ("Hi, Raj" after it said "This is Raj") and interrupts itself. siptooth compares every 20 ms of caller audio with what it played to the phone within `media.echo_window_ms` and sends it as silence unless it is `media.echo_threshold_db` louder; real speech over the agent passes after 40 ms and is not chopped until 300 ms of quiet (spec 6.6).
+
+After each call a second line describes the gate:
+
+```
+msg="echo gate" call_id=... blocks_gated=812 blocks_passed=40 diff_db_median=-14.2 diff_db_p90=-8.1 diff_db_max=-2.3 echo_delay_ms=340 echo_corr=0.71
+```
+
+| Field | Meaning |
+| --- | --- |
+| `blocks_gated` / `blocks_passed` | 20 ms blocks silenced / passed while far-end audio was in the window |
+| `diff_db_*` | caller level minus played level over the gated blocks that carried sound; how loud the echo is. Near `echo_threshold_db` means the echo is close to getting through. |
+| `echo_delay_ms`, `echo_corr` | the lag at which the caller audio best follows the played audio (0..1000 ms), and how closely (0..1). A high `echo_corr` confirms echo; a delay under about 60 ms points at the phone or Bluetooth link, a few hundred ms at the network or the caller's device. |
 
 ## NAT modes
 
@@ -110,6 +129,7 @@ Every `bluetooth.power_cycle_minutes` (default 60; `0` = off, otherwise 10..1440
 | `sip_timeout` | The far end never answered within `sip.dial_timeout_seconds`. Check the route on the provider side; with `register: true`, `siptooth status` must show `registered=yes`. |
 | `sip_media_failed` | The SDP answer was refused. Check `media.codecs` against what the provider supports, and `sip.srtp` against its media-encryption setting. |
 | One-way audio, or none | NAT checklist below. |
+| The agent interrupts itself or answers its own words | Echo; see "Echo" above and the `echo gate` line of the call. |
 | Far-end hang-up delayed | The far end's BYE did not reach siptooth; see below. |
 | Hooks fail | `siptooth hooks test --event call.ended` shows exit code, stdout and stderr; hooks run as you with a minimal environment. See `docs/hooks.md`. |
 | DNS fails only on a host with Tailscale MagicDNS | MagicDNS misplaces the EDNS0 OPT record in queries. siptooth's resolver (`internal/dnsv4`) sends queries without EDNS0, so lookups work; if `dns` still fails, test with `dig +noedns <host>`. |

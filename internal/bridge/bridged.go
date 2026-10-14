@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/volodymyrsmirnov/siptooth/internal/echo"
 	"github.com/volodymyrsmirnov/siptooth/internal/hfp"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
@@ -29,12 +30,16 @@ const (
 func (c *Coordinator) startBridged(call *activeCall) {
 	media, link, gen := call.prepared.Media, call.link, call.gen
 	settle := time.Duration(c.d.Config.Calls.SCOSettleMs) * time.Millisecond
+	if m := c.d.Config.Media; m.EchoSuppression {
+		call.echo = echo.NewGate(float64(m.EchoThresholdDB), m.EchoWindowMs)
+	}
+	gate := call.echo
 	c.bg.Add(1)
 	go func() {
 		defer c.bg.Done()
 		defer c.recoverGo(gen)
 		<-call.silenceDone
-		end := RunPump(call.ctx, link, media, settle, c.d.Clock, c.d.Logger.With("call_id", call.id))
+		end := RunPump(call.ctx, link, media, settle, gate, c.d.Clock, c.d.Logger.With("call_id", call.id))
 		c.post(msg{kind: mPumpEnd, gen: gen, pumpEnd: end})
 	}()
 	if d := time.Duration(c.d.Config.Calls.MaxDurationSeconds) * time.Second; d > 0 {

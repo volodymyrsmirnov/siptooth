@@ -130,6 +130,9 @@ func newE2E(t *testing.T) *e2e {
 	cfg.Calls.CallerIDWaitMs = 500 // +CLIP arrives at once, so this is never waited out
 	cfg.Calls.SCOSettleMs = 0
 	cfg.Media.JitterMs = 20
+	// The fake far end returns the phone's audio at the same level, which the
+	// echo gate would rightly take for echo; the media path is tested here.
+	cfg.Media.EchoSuppression = false
 
 	ua, err := sip.NewUA(sip.Options{Transport: "udp", NextHop: tr.HostPort(), UserAgent: "siptooth/e2e", Logger: logger})
 	if err != nil {

@@ -42,6 +42,7 @@ Development happens on macOS; Linux-only code (`*_linux.go`) is compiled by `mak
 | `internal/dnsv4` | IPv4-only DNS resolver (never sends AAAA upstream; installed as `net.DefaultResolver` in `main`) |
 | `internal/sipaddr` | next-hop rule shared by the daemon and doctor |
 | `internal/sdp` | offer/answer/re-offer, SDES crypto, redaction |
+| `internal/echo` | echo gate for the uplink (copied from allochka `audio.EchoGate`), echo delay estimate |
 | `internal/rtp` | RTP session (socket, latching, send), SRTP, playout, stats |
 | `internal/sip` | sipgo wrapper: UA, dial, call, server, register, contact, keepalive |
 | `internal/hooks` | owner shell hooks on lifecycle events |

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/volodymyrsmirnov/siptooth/internal/echo"
 	"github.com/volodymyrsmirnov/siptooth/internal/rtp"
 	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 )
@@ -59,9 +60,10 @@ func pumpPanic(v any) PumpEnd { return PumpEnd(pumpPrefix + fmt.Sprint(v)) }
 // at most once a second, and never skip the downlink write, and only failures
 // lasting 5 s without a single success return PumpRTPError. For the first settle after start the pump writes
 // silence to SCO and leaves the playout in startup mode, then ends startup mode
-// once. A blocked link.Write delays the reaction to ctx; the caller unblocks it
+// once. A non-nil gate (spec 6.6) sees every block written to SCO as its
+// reference and gates every uplink frame before it is sent. A blocked link.Write delays the reaction to ctx; the caller unblocks it
 // (and the reader goroutine, after RunPump returns) by closing the link.
-func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock, log *slog.Logger) (end PumpEnd) {
+func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, gate *echo.Gate, clk Clock, log *slog.Logger) (end PumpEnd) {
 	defer func() {
 		if v := recover(); v != nil {
 			end = pumpPanic(v)
@@ -79,7 +81,7 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 				res <- pumpPanic(v)
 			}
 		}()
-		res <- runPump(ctx, link, r, settle, clk, log, &progress)
+		res <- runPump(ctx, link, r, settle, gate, clk, log, &progress)
 	}()
 
 	// The loop's own stall check runs on the goroutine that may be blocked in a
@@ -113,7 +115,7 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 	}
 }
 
-func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock, log *slog.Logger, progress *atomic.Int64) PumpEnd {
+func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, gate *echo.Gate, clk Clock, log *slog.Logger, progress *atomic.Int64) PumpEnd {
 	mtu := link.MTU()
 	frames := make(chan []byte, 8)
 	readErr := make(chan error, 1)
@@ -194,12 +196,15 @@ func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 	// down writes n bytes of downlink audio to SCO.
 	down := func(n int) error {
 		out := make([]byte, n&^1)
+		pcm := make([]int16, len(out)/2)
 		if settled {
-			pcm := make([]int16, len(out)/2)
 			pl.Read(pcm)
 			for i, s := range pcm {
 				binary.LittleEndian.PutUint16(out[2*i:], uint16(s))
 			}
+		}
+		if gate != nil {
+			gate.Reference(pcm) // silence while settling, as written
 		}
 		_, err := link.Write(out)
 		if err == nil {
@@ -229,7 +234,11 @@ func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 				pending = append(pending, int16(binary.LittleEndian.Uint16(frame[i:])))
 			}
 			for len(pending) >= rtpFrameSamples {
-				stop := rtpResult("frame", r.WriteFrame(pending[:rtpFrameSamples]))
+				up := pending[:rtpFrameSamples]
+				if gate != nil {
+					up = gate.Process(up)
+				}
+				stop := rtpResult("frame", r.WriteFrame(up))
 				pending = append(pending[:0], pending[rtpFrameSamples:]...)
 				if stop {
 					return PumpRTPError

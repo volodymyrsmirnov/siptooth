@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/volodymyrsmirnov/siptooth/internal/echo"
 	"github.com/volodymyrsmirnov/siptooth/internal/hfp"
 	"github.com/volodymyrsmirnov/siptooth/internal/hooks"
 	"github.com/volodymyrsmirnov/siptooth/internal/placeholder"
@@ -103,6 +104,7 @@ type activeCall struct {
 	ringEnd        time.Time // when callActive was observed; ringing_seconds stops here
 	mediaStartedAt time.Time
 	link           sco.Link
+	echo           *echo.Gate      // nil with media.echo_suppression off; set when bridged
 	acceptCtx      context.Context // SCO accept and dial; cancelled at SCO up or call end
 	acceptCancel   context.CancelFunc
 	silenceStop    chan struct{} // closed when SCO is up: the pump takes over the uplink
@@ -504,6 +506,13 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 		"sip_status", call.sipStat, "ringing_s", ringing, "bridged_s", bridgedS,
 		"codec", codec, "nat_mode", natMode,
 		"lost", stats.Lost, "late", stats.Late, "discarded_silence", stats.DiscardedSilence)
+	if call.echo != nil {
+		st := call.echo.Stats()
+		c.d.Logger.Info("echo gate",
+			"call_id", call.id, "blocks_gated", st.Gated, "blocks_passed", st.Passed,
+			"diff_db_median", st.DiffMedianDB, "diff_db_p90", st.DiffP90DB, "diff_db_max", st.DiffMaxDB,
+			"echo_delay_ms", st.DelayMs, "echo_corr", st.DelayCorr)
+	}
 
 	c.lastOutcome = e.outcome
 	c.cur = nil

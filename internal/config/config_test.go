@@ -170,6 +170,8 @@ func TestValidateRanges(t *testing.T) {
 		{"jitter", func(c *Config, v int) { c.Media.JitterMs = v }, []int{20, 500}, []int{19, 501}, "jitter_ms"},
 		{"silence_rms", func(c *Config, v int) { c.Media.SilenceRMS = v }, []int{0, 5000}, []int{-1, 5001}, "silence_rms"},
 		{"min_pause", func(c *Config, v int) { c.Media.MinPauseMs = v }, []int{0, 2000}, []int{-1, 2001}, "min_pause_ms"},
+		{"echo_threshold", func(c *Config, v int) { c.Media.EchoThresholdDB = v }, []int{-30, 20}, []int{-31, 21}, "echo_threshold_db"},
+		{"echo_window", func(c *Config, v int) { c.Media.EchoWindowMs = v }, []int{100, 2000}, []int{99, 2001}, "echo_window_ms"},
 		{"caller_id_wait", func(c *Config, v int) { c.Calls.CallerIDWaitMs = v }, []int{0, 3000}, []int{-1, 3001}, "caller_id_wait_ms"},
 		{"sco_settle", func(c *Config, v int) { c.Calls.SCOSettleMs = v }, []int{0, 5000}, []int{-1, 5001}, "sco_settle_ms"},
 		{"media_timeout", func(c *Config, v int) { c.Calls.MediaTimeoutSeconds = v }, []int{5, 300}, []int{4, 301}, "media_timeout_seconds"},

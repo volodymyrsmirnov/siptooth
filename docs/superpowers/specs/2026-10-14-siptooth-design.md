@@ -376,6 +376,16 @@ a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64 30 bytes>    (only with srtp)
 
 `sip.srtp: true` is allowed only with `sip.transport: tls`. Per call siptooth generates a fresh 30-byte master key‖salt from `crypto/rand`. The send context uses our offered key, the receive context the key from the answer (`srtp.CreateContext(key16, salt14, ProtectionProfileAes128CmHmacSha1_80, srtp.SRTPReplayProtection(64))`). Authentication or replay failures are counted and dropped. Key material is redacted (`inline:<redacted>`) in every log line, error and CLI output that includes SDP.
 
+### 6.6 Echo gate
+
+(2026-10-14, hardware test.) The phone call returns part of the far end's own voice on the line (allochka measured it at up to +2.4 dB over the played audio; a caller on a laptop adds acoustic echo), and siptooth, the hands-free side, has no echo canceller. An ElevenLabs agent took its own echo for the caller and interrupted itself. `internal/echo.Gate`, copied from allochka's `audio.EchoGate` (allochka spec section 4, 2026-10-05 iterations 4 and 5), sits in the media pump with `media.echo_suppression: true` (default):
+
+- Reference: every block the pump writes to SCO (playout audio, silence included), as RMS per 20 ms block; the expected echo level is the loudest reference block of the last `media.echo_window_ms` (default 600, 100..2000).
+- Each 160-sample uplink frame, before encoding: while the window holds far-end audio (reference RMS at least 50), a frame passes only when its RMS is at least 50 and above the reference level × 10^(`media.echo_threshold_db`/20) (default 6, -30..20); otherwise it is sent as silence. Two frames above open the gate, 15 frames (300 ms) below close it, so double-talk is not chopped. Without far-end audio in the window every frame passes.
+- At call end an `echo gate` log line gives the gated/passed counts, caller-minus-played dB (median, p90, max) over gated frames with sound, and the lag (0..1 s, 20 ms steps) and Pearson correlation at which the caller level envelope best follows the played envelope over the first 3 minutes, to locate the echo source.
+
+A gate is half-duplex while the agent talks: a caller must be `echo_threshold_db` louder than the played audio to interrupt. An adaptive canceller would allow full duplex but needs a gate as its last stage anyway on a cellular line; it is left until barge-in proves to matter.
+
 ## 7. NAT and addressing
 
 ### 7.1 Local address
@@ -447,6 +457,9 @@ media:
   jitter_ms: 60                # 20..500
   silence_rms: 200             # catch-up threshold, 0..5000 (0 disables catch-up)
   min_pause_ms: 200            # catch-up keeps this much of every pause, 0..2000
+  echo_suppression: true       # gate the line echo of the far end's own voice (spec 6.6)
+  echo_threshold_db: 6         # caller audio must be this much louder than the played audio, -30..20
+  echo_window_ms: 600          # how long after played audio its echo is expected, 100..2000
 
 nat:
   mode: auto                   # auto | local | stun | public_ip
@@ -610,6 +623,8 @@ Reviewed by Fable 5.1 (Claude subagent), gpt-6.1-sol and gpt-6-astra (Codex CLI)
 - `pion/stun` dropped for a hand-rolled Binding Request (the unsuffixed module is v0.6.1 with a parser panic; Fable, gpt-6.1-sol); versions pinned (all three).
 - URIs: `sip:` only, explicit port honored, component-aware escaping, CR/LF rejected; `{call_id}` placeholder; provider recipes (all three).
 - Hooks back to allochka's single worker (Fable, gpt-6.1-sol); claims narrowed to two qualified targets (gpt-6-astra).
+
+2026-10-14 (hardware test, ElevenLabs direct, later): the agent heard its own echo from the phone line and interrupted itself; the allochka echo gate is ported as section 6.6 with `media.echo_suppression`, `media.echo_threshold_db` and `media.echo_window_ms`.
 
 2026-10-14 (hardware test, ElevenLabs direct): the agent's greeting sounded faster than the rest of its speech. ElevenLabs starts speaking on its 200 OK, so 1–2 s of greeting is buffered while the phone answers and SCO settles, and catch-up then removed the short silences between its words to drain that backlog. Catch-up now keeps the first `media.min_pause_ms` (200) of every pause (§6.3), so the backlog drains in the first long pause instead.
 
