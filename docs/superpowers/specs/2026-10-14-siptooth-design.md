@@ -1,7 +1,7 @@
 # Siptooth — Design Specification
 
 **Date:** 2026-10-14
-**Status:** Draft for review (revision 2: findings from Fable 5.1, gpt-6.1-sol and gpt-6-astra merged; see Appendix A)
+**Status:** Draft for review (revision 3: review findings merged, see Appendix A; Zadarma cloud PBX replaces the LAN PBX as a qualified target, optional REGISTER added)
 **Predecessor:** allochka (`~/Projects/Personal/allochka`), spec `docs/superpowers/specs/2026-10-04-allochka-design.md`. Allochka is retired once siptooth is proven on real calls.
 
 Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspberry Pi 5 acts as a Bluetooth hands-free unit for the phone, exactly as allochka does. When the phone rings, siptooth places a SIP call to one configured target, answers the phone only once the far end answers, and bridges the audio both ways until either side hangs up. Siptooth has no AI, no conversation logic, no web UI and no call store.
@@ -13,13 +13,13 @@ Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspbe
 - Keep allochka's proven Bluetooth layer: BlueZ over D-Bus, HFP hands-free AT protocol, SCO audio, in-app pairing, adapter power cycling, `doctor`, `install`.
 - Forward every incoming call on the phone to one configured SIP target, with caller ID passed through.
 - Work from a home network behind NAT, toward targets on the internet (STUN) and on the LAN.
-- Two **qualified** v1 targets: the owner's existing PBX (Asterisk/PJSIP-class, on the LAN) and ElevenLabs Agents SIP trunking. Other standards-based trunks are best effort; siptooth is a deliberately small UAC, not a general-purpose softphone.
+- Generic SIP forwarding: the target is whatever the config names. Two **qualified** v1 targets, both first-class and used independently: **ElevenLabs Agents** SIP trunking (called directly) and the owner's **Zadarma** cloud PBX (an extension account; the PBX then rings people, plays a menu, takes voicemail, or forwards to an external SIP URI such as an ElevenLabs agent). Other standards-based trunks and LAN PBXs are best effort; siptooth is a deliberately small UAC, not a general-purpose softphone.
 - Shell hooks on call lifecycle events, so later work (for example a separate service that accepts OpenAI SIP calls) can attach without changing siptooth.
 
 **Non-goals (v1)**
 
 - OpenAI Realtime SIP (needs a public webhook and an `accept` call per call; a later, separate component).
-- Calls from SIP to the phone, SIP REGISTER, answering unsolicited INVITEs, accepting inbound TCP/TLS connections.
+- Calls from SIP to the phone, answering unsolicited INVITEs, accepting inbound TCP/TLS connections. (REGISTER is supported only to authorize and keep a flow for outgoing calls, section 5.7.)
 - Call waiting, hold, transfer (REFER), conferencing, multiple phones, multiple targets or routing rules.
 - Recording, call store, transcripts, web UI, metrics endpoint.
 - Wideband (mSBC / G.722), Opus, ICE, TURN, DTLS-SRTP, RTCP, RFC 4733 DTMF events, SIP UPDATE, codec or key renegotiation mid-call.
@@ -27,8 +27,8 @@ Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspbe
 
 **Success criteria**
 
-1. A call to the phone reaches the configured PBX extension with two-way audio, caller ID visible on the PBX, and hang-up propagating in both directions within 2 s.
-2. The same works against an ElevenLabs agent: the agent greets the caller, the caller hears the whole greeting, and an agent-side hang-up reaches the caller within 2 s (or within `calls.media_timeout_seconds` if M1 shows ElevenLabs cannot reach siptooth's connection; section 5.5).
+1. **Zadarma:** a call to the phone reaches the configured Zadarma destination with two-way audio and hang-up propagating in both directions within 2 s. The original caller's number reaches the hooks and the SIP request (display name, `X-CALLER-ID`); whether Zadarma shows it to the destination is a qualification item (section 15.1).
+2. **ElevenLabs direct:** the agent greets the caller, the caller hears the whole greeting, the agent receives the caller's number (`X-CALLER-ID`), and an agent-side hang-up reaches the caller within 2 s (or within `calls.media_timeout_seconds` if M1 shows ElevenLabs cannot reach siptooth's connection; section 5.5).
 3. When the SIP target is unreachable, rejects, or does not answer, the phone keeps ringing as if siptooth were not there (the caller never hears silence or an error from siptooth).
 4. Runs unattended for a week behind a home NAT without a restart.
 
@@ -39,7 +39,7 @@ Siptooth turns an Android phone that stays at home into a SIP endpoint. A Raspbe
 | Language / build | Go, single binary `siptooth`, `CGO_ENABLED=0`, module `github.com/volodymyrsmirnov/siptooth`, `go 1.24` directive (Raspberry Pi OS trixie ships Go 1.24), built on the Pi. |
 | Code origin | New repository. Allochka's hardware packages are copied in (not shared as a module) and trimmed; allochka is retired afterwards, so the copies never need to stay in sync. |
 | Bluetooth | Unchanged from allochka: BlueZ 5.82 via D-Bus, app-owned HFP AT protocol over RFCOMM, CVSD narrowband SCO (16-bit PCM, 8 kHz), Broadcom routing check, periodic adapter power cycle. |
-| SIP signaling | `github.com/emiago/sipgo` **v1.6.0** (pure Go; UDP, TCP, TLS; digest auth), wrapped by `internal/sip`, which owns the INVITE transaction outcome (section 5.3). UAC only: one INVITE per incoming phone call. No REGISTER. |
+| SIP signaling | `github.com/emiago/sipgo` **v1.6.0** (pure Go; UDP, TCP, TLS; digest auth), wrapped by `internal/sip`, which owns the INVITE transaction outcome (section 5.3). UAC only: one INVITE per incoming phone call; optional REGISTER for providers that require it (section 5.7). |
 | Media | Own small RTP layer on one UDP socket per call: G.711 PCMU/PCMA, 20 ms transmit packets, packet structs from `github.com/pion/rtp` **v1.10.5**. Optional SDES-SRTP (`AES_CM_128_HMAC_SHA1_80`) via `github.com/pion/srtp/v3` **v3.1.3**. |
 | STUN | Hand-rolled Binding Request/Response (RFC 5389, XOR-MAPPED-ADDRESS only, about 100 lines in `internal/stun`) on the RTP socket. No STUN module. |
 | NAT | Per call, the advertised address depends on the destination: LAN targets get the local interface address, internet targets the STUN-mapped (or configured public) address. Symmetric RTP with latching. TCP/TLS signaling connection kept open with keepalives for the whole dialog. |
@@ -94,7 +94,7 @@ internal/
   defaults/   # embedded example config.yaml
   buildinfo/  # copied
 config/hooks/ # example hook scripts
-docs/         # setup.md, operations.md, hooks.md, providers.md (PBX and ElevenLabs recipes)
+docs/         # setup.md, operations.md, hooks.md, providers.md (ElevenLabs, Zadarma, generic PBX recipes)
 ```
 
 Dropped from allochka: `realtime`, `prompt`, `library`, `summary`, `web`, `store`, `export`, `probe`, `audio` (except μ-law), `call` (replaced by `bridge`).
@@ -297,7 +297,7 @@ The same sipgo `UserAgent` hosts the client and a `sipgo.Server` (handlers `OnBy
 
 - **TCP/TLS:** the connection used for the INVITE stays open until Ending, with an RFC 5626 CRLF keepalive (`\r\n\r\n`) every 25 s to hold the NAT mapping. Siptooth's own BYE/ACK go to the dialog's remote target (the `2xx` Contact, honoring Record-Route), opening a new connection if needed (sipgo default; ElevenLabs requires the node Contact, not the shared host, or the BYE gets 481).
 - **UDP:** sipgo `WithClientNAT()` (adds `rport`), local SIP port `sip.local_port` (default 5060 for UDP, ephemeral for TCP/TLS), CRLF keepalive every 25 s during a dialog.
-- **Far-end requests are only reachable if the far end reuses siptooth's connection or flow.** Siptooth helps by advertising the address the far end actually sees (section 7.3). For the PBX the providers recipe configures connection reuse (`rewrite_contact=yes`, `force_rport=yes`, `rtp_symmetric=yes`, `direct_media=no` on the PJSIP endpoint). For ElevenLabs, whether its BYE reuses the open connection is a qualification item of milestone M1 (`siptooth sip test --wait-remote-hangup`, section 11). If it does not, an agent-side hang-up is detected by RTP loss: ElevenLabs (LiveKit) sends a packet every 20 ms including silence, so `calls.media_timeout_seconds` (default 10) bounds the delay.
+- **Far-end requests are only reachable if the far end reuses siptooth's connection or flow.** Siptooth helps by advertising the address the far end actually sees (section 7.3). With `sip.register: true` (Zadarma) the registered Contact is the flow siptooth keeps open, and a registrar-aware far end sends in-dialog requests through it (section 5.7). For a self-hosted PBX the providers recipe configures connection reuse (`rewrite_contact=yes`, `force_rport=yes`, `rtp_symmetric=yes`, `direct_media=no` on an Asterisk PJSIP endpoint). For ElevenLabs, whether its BYE reuses the open connection is a qualification item of milestone M1 (`siptooth sip test --wait-remote-hangup`, section 11). If it does not, an agent-side hang-up is detected by RTP loss: ElevenLabs (LiveKit) sends a packet every 20 ms including silence, so `calls.media_timeout_seconds` (default 10) bounds the delay.
 
 ### 5.6 In-dialog requests from the far end
 
@@ -311,6 +311,17 @@ The same sipgo `UserAgent` hosts the client and a `sipgo.Server` (handlers `OnBy
   - over UDP the wrapper retransmits the `2xx` (T1 doubling to T2) until the ACK arrives or 32 s pass (then BYE, `signaling_lost`).
 - `UPDATE`, `INFO`, `NOTIFY`, `REFER`, `MESSAGE`, `PRACK` → `501 Not Implemented`.
 - Requests that match no dialog (including new INVITEs) → `481` (in-dialog) or `403` (dialog-creating). Siptooth never answers a new incoming SIP call.
+
+### 5.7 Registration (optional)
+
+`sip.register: true` (needed for Zadarma extensions, whose docs only describe registered extensions or a static-IP trunk; harmless elsewhere):
+
+- At daemon start, and again after any failure, siptooth sends `REGISTER` to the registrar (`sip.registrar`, default the target host) on the same transport and next hop as the INVITEs, with digest credentials, `Expires: sip.register_expires_seconds` (default 120). It refreshes at half the granted expiry (Zadarma's examples: 120 s expiry, 60 s refresh). Failures are retried every 30 s with one rate-limited `system.error` `sip_registration` per outage.
+- AOR and From user: `sip.username`'s user part (e.g. `1234-100`) unless `sip.from` overrides; the Contact is the flow address learned from the REGISTER response's top `Via` `received`/`rport` (this replaces the pre-INVITE OPTIONS of section 7.3 while registered), re-registered when it changes.
+- Over TCP/TLS the registration and every INVITE share one long-lived connection with the CRLF keepalive; over UDP the same local port, so the NAT binding stays open between calls and the far end's in-dialog requests can reach siptooth.
+- Calls are attempted whether or not registration currently succeeds (the INVITE carries its own credentials); `siptooth status` shows the registration state.
+- Incoming INVITEs that arrive on the registered Contact (someone calling the extension) are answered `603 Decline`; siptooth never answers SIP calls. Incoming `OPTIONS` (registrar qualify) → `200 OK`.
+- Shutdown: `REGISTER` with `Expires: 0`, bounded to 2 s.
 
 ## 6. Media
 
@@ -374,7 +385,7 @@ The local address is the source address the kernel picks for the next hop (a con
 ### 7.2 Media address (`nat.mode`)
 
 - `auto` (default): if the resolved SIP next hop is a private, loopback, link-local or CGNAT-shared (100.64/10) address, use `local`; otherwise `stun`.
-- `local`: advertise the local address and port. For the LAN PBX (no hairpin through the router needed).
+- `local`: advertise the local address and port. For a PBX on the LAN (no hairpin through the router needed).
 - `stun`: send a Binding Request from the RTP socket to each of `nat.stun_servers` in order (default `stun.l.google.com:19302`, `stun.cloudflare.com:3478`), 500 ms timeout, 2 attempts per server, last successful server tried first; advertise the XOR-MAPPED-ADDRESS. While Dialing, re-send a Binding Request every 10 s to the same server (keepalive; a changed mapping is logged as a warning). All servers failing: warning, rate-limited `system.error` `stun_failed` (once per hour), advertise `nat.public_ip` if set, else the local address.
 - `public_ip`: advertise `nat.public_ip` with the local port (for a router port-forward of the RTP range), no STUN.
 
@@ -383,6 +394,7 @@ The mapping describes traffic to the STUN server; with an address-dependent NAT 
 ### 7.3 Signaling address (Contact)
 
 - `local` mode: local address and the local SIP port.
+- registered (section 5.7): the flow address from the last REGISTER response.
 - otherwise: before each INVITE over TCP/TLS (or UDP), siptooth sends an `OPTIONS` to the next hop on the connection the INVITE will use, and reads `received`/`rport` from the top `Via` of the response (any status code). That address — the far end's view of siptooth's flow — becomes the Contact host and port, which makes a far end that reuses connections by remote address find the open connection. No usable `received`/`rport`: the media address IP with the local SIP port. The OPTIONS costs one round trip (≤ 1 s budget; timeout → fallback).
 
 ### 7.4 Diagnostics
@@ -422,6 +434,9 @@ sip:
   display_name: "{caller}"
   anonymous_user: anonymous    # {caller} when the number is withheld
   username: ""                 # digest username; password: SIPTOOTH_SIP_PASSWORD in ~/.siptooth/env
+  register: false              # REGISTER and keep the flow open (Zadarma); requires username
+  registrar: ""                # default: target host (with sip.proxy as next hop)
+  register_expires_seconds: 120   # 60..3600
   headers: {}                  # extra INVITE headers, values may use placeholders
                                # ElevenLabs: {X-CALLER-ID: "{caller}", X-CALL-ID: "{call_id}"}
   srtp: false                  # SDES SRTP; requires transport tls
@@ -456,7 +471,7 @@ hooks: []
 #     timeout_seconds: 10
 ```
 
-Validation (startup fails on any error; `siptooth config check` prints all of them): required fields; MAC format; known placeholders; `{number}` ⇒ `phone.number`; target parses as a `sip:` URI after a trial expansion; transport agrees with `;transport=`; `srtp` ⇒ `tls`; `mode: public_ip` ⇒ `public_ip`; `public_ip` is an IPv4 address; RTP range even-aligned, min < max, within 1024–65534; `username` ⇒ `SIPTOOTH_SIP_PASSWORD` present; forbidden header names and CR/LF/NUL in header names or values; hook events known; numeric ranges as noted. Unknown keys are errors (`yaml.v3` `KnownFields`).
+Validation (startup fails on any error; `siptooth config check` prints all of them): required fields; MAC format; known placeholders; `{number}` ⇒ `phone.number`; target parses as a `sip:` URI after a trial expansion; transport agrees with `;transport=`; `srtp` ⇒ `tls`; `mode: public_ip` ⇒ `public_ip`; `public_ip` is an IPv4 address; RTP range even-aligned, min < max, within 1024–65534; `username` ⇒ `SIPTOOTH_SIP_PASSWORD` present; `register` ⇒ `username`; forbidden header names and CR/LF/NUL in header names or values; hook events known; numeric ranges as noted. Unknown keys are errors (`yaml.v3` `KnownFields`).
 
 ## 10. Hooks
 
@@ -473,7 +488,7 @@ Allochka's dispatcher and runner: one worker goroutine, bounded queue of 100 eve
 - `call.ringing`: before the INVITE (fields above). For side processes that prepare for the call (for example a future OpenAI-accept service correlating by `X-CALL-ID`).
 - `call.connected`: audio bridged; adds `sip_call_id`, `codec`, `srtp`, `remote_media` (latched ip:port, or SDP address before latching), `advertised_media` (ip:port), `nat_mode`, `connected_at`.
 - `call.ended`: exactly once per call; adds `outcome` (`completed`, `sip_rejected`, `sip_timeout`, `sip_error`, `sip_media_failed`, `caller_abandoned`, `owner_answered`, `answer_failed`, `far_end_ended`, `signaling_lost`, `media_timeout`, `audio_lost`, `media_error`, `max_duration`, `bluetooth_lost`, `shutdown`), `hangup_by` (`caller`, `far_end`, `siptooth`, or null), `sip_status` and `sip_reason` (last final response to the INVITE, null if none), `error` (string or null), `ringing_seconds`, `bridged_seconds` (null if never bridged), `media` (`{"sent","received","lost","late","duplicate","overflow","discarded_silence","srtp_fail"}`).
-- `system.error`: `{"error":{"code","detail"}}`, codes `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed`. Same once-per-outage rules as allochka.
+- `system.error`: `{"error":{"code","detail"}}`, codes `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed`, `sip_registration`. Same once-per-outage rules as allochka.
 
 The `target` in payloads is the expanded URI; credentials and SRTP keys never appear in payloads or logs.
 
@@ -487,10 +502,10 @@ The `target` in payloads is the expanded URI; credentials and SRTP keys never ap
 | `siptooth pair` | interactive pairing (copied; daemon must be stopped) |
 | `siptooth doctor [--fix]` | setup checks: config valid, env file mode, group `bluetooth`, BlueZ, adapter, conflicting HFP handlers (PipeWire, bluealsa, a running allochka service), linger, DNS of the next hop, TCP/TLS connect and certificate check, NAT observations (section 7.4). `--fix` creates `~/.siptooth/`, default config, env file. Never runs sudo. |
 | `siptooth install` | writes and enables the systemd user unit (copied) |
-| `siptooth status` | daemon state via control socket: Bluetooth ready, phone connected, current call (state, caller, duration), last call outcome |
+| `siptooth status` | daemon state via control socket: Bluetooth ready, phone connected, SIP registration (when enabled: state, Contact, expiry), current call (state, caller, duration), last call outcome |
 | `siptooth config check` | validate and print the effective config (password redacted) |
 | `siptooth hooks test --event E` | run hooks with a sample payload |
-| `siptooth sip test [--caller N] [--seconds 20] [--tone] [--wait-remote-hangup]` | a real SIP call to the target without Bluetooth: prints the NAT decision and mapping, the OPTIONS `received`/`rport`, every SIP response, the negotiated codec and SRTP state; then for `--seconds` sends silence (or a 1 kHz tone at −20 dBFS with `--tone`) and reports packets received, loss, max inter-packet gap, latched source, received audio level. With `--wait-remote-hangup` it does not hang up and instead reports whether the far end's BYE arrived (and on which connection), or whether only RTP stopped. Exit 0 only when answered and audio packets were received. Runs while the daemon runs (separate SIP and RTP ports). |
+| `siptooth sip test [--caller N] [--seconds 20] [--tone] [--wait-remote-hangup]` | a real SIP call to the target without Bluetooth (registers first when `sip.register` is on, unregisters at the end): prints the NAT decision and mapping, the OPTIONS `received`/`rport`, every SIP response, the negotiated codec and SRTP state; then for `--seconds` sends silence (or a 1 kHz tone at −20 dBFS with `--tone`) and reports packets received, loss, max inter-packet gap, latched source, received audio level. With `--wait-remote-hangup` it does not hang up and instead reports whether the far end's BYE arrived (and on which connection), or whether only RTP stopped. Exit 0 only when answered and audio packets were received. Runs while the daemon runs (separate SIP and RTP ports). |
 | `siptooth version` | build info |
 
 Control socket: HTTP over `~/.siptooth/siptooth.sock`, `GET /status` (JSON) only.
@@ -527,16 +542,16 @@ TDD throughout; tests never touch real Bluetooth, real networks beyond loopback,
 - **sdp:** offer golden files (with and without SRTP); answer validation table (codec choice, both codecs kept for receive, session vs media `c=`, port 0, direction attributes, profile mismatch both ways, crypto tag/suite/length/MKI/lifetime, IPv6 rejection, malformed input); re-offer classification (refresh, address change, hold, codec change, key change); redaction.
 - **stun:** encode/decode against RFC 5769 test vectors; loopback server; timeout, ordering, last-good-first, keepalive cadence; demux with RTP on one socket.
 - **rtp:** packetization, shared seq/timestamp counter across startup/pump/stall, early-media drop, latching (first valid source, rejection of others after latch, reset on update), mixed PCMU/PCMA receive, timestamp-based playout with 10/20/30/60 ms packets, wrap of seq and timestamp, duplicates, gaps, startup buffer keeps everything for 13 s, catch-up skips only silence, SRTP round trip with replay rejection.
-- **sip:** a real sipgo UAS on loopback (UDP, TCP, and TLS with a test CA) acting as the trunk: 200; 486; 503; 401 and 407 challenges; stale-nonce second challenge; three challenges → failure; no answer → CANCEL after 1xx; Abandon before any 1xx; 200 crossing CANCEL → ACK + BYE; two forked 200s → second ACKed + BYEd; unacceptable SDP → ACK + BYE; far-end BYE on the same connection; BYE challenged; re-INVITE refresh, address change, hold → 488, offerless; OPTIONS; unsolicited INVITE → 403; Contact from OPTIONS `received`/`rport`; CRLF keepalive; header expansion and escaping; forbidden headers; TLS ServerName per destination (two hostnames with distinct certs).
+- **sip:** a real sipgo UAS on loopback (UDP, TCP, and TLS with a test CA) acting as the trunk: 200; 486; 503; 401 and 407 challenges; stale-nonce second challenge; three challenges → failure; no answer → CANCEL after 1xx; Abandon before any 1xx; 200 crossing CANCEL → ACK + BYE; two forked 200s → second ACKed + BYEd; unacceptable SDP → ACK + BYE; far-end BYE on the same connection; BYE challenged; re-INVITE refresh, address change, hold → 488, offerless; OPTIONS; unsolicited INVITE → 403; Contact from OPTIONS `received`/`rport`; REGISTER with challenge, refresh at half expiry, Contact update on a changed `received`/`rport`, retry after failure, unregister on shutdown, INVITE on the registered Contact → 603; CRLF keepalive; header expansion and escaping; forbidden headers; TLS ServerName per destination (two hostnames with distinct certs).
 - **bridge:** state machine with fake HFP client, fake SIP dialer, in-memory SCO pair, fake clock: every row of the tables in sections 4.3–4.5, `ATA` error classes, owner answering during Dialing and during Answering, generation discards late results, exactly one `call.ended` per call, no `AT+CHUP` for unowned calls or on SCO loss, settle delay, drain before CHUP on far-end BYE.
 - **End-to-end (loopback):** fake AG + in-memory SCO + sipgo UAS that echoes RTP: a tone written on the SCO side comes back on the SCO side; hang-up from either end.
 - **CI:** `make check` = `go vet ./...`, `go test -race ./...`, `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./...`.
 
 ## 15. Rollout
 
-1. **M1 — SIP from the Pi without Bluetooth.** `siptooth sip test --tone` against the PBX (an echo or record extension), then against ElevenLabs with `--wait-remote-hangup` (end the conversation from the agent side). Confirms DNS, TLS, auth, NAT mode, latching, codec, SRTP, and whether the far end's BYE reaches siptooth. Record the result in `docs/providers.md`.
-2. **M2 — real call to the PBX.** Stop allochka (`systemctl --user disable --now allochka`), install siptooth with allochka's `phone_address`, call the phone; verify criteria 1 and 3.
-3. **M3 — ElevenLabs.** Point `sip.target` at the agent number; verify criterion 2 (full greeting heard, hang-up propagation).
+1. **M1 — SIP from the Pi without Bluetooth.** `siptooth sip test --tone --wait-remote-hangup` against Zadarma (a test extension or the echo test number, first without then with `register`, over UDP and TLS) and against ElevenLabs (end the conversation from the agent side). Confirms DNS, TLS, auth, whether Zadarma needs REGISTER, NAT mode, latching, codec, SRTP, caller-ID presentation at the destination, and whether the far end's BYE reaches siptooth. Record the results in `docs/providers.md`.
+2. **M2 — real call through Zadarma.** Stop allochka (`systemctl --user disable --now allochka`), install siptooth with allochka's `phone_address`, call the phone; verify criteria 1 and 3.
+3. **M3 — ElevenLabs direct.** Switch `sip.target` to the agent number; verify criterion 2 (full greeting heard, caller number received, hang-up propagation).
 4. **M4 — soak.** A week of normal use (criterion 4). Then allochka is archived.
 
 Each hardware step is run by the owner, one command at a time.
@@ -545,11 +560,29 @@ Each hardware step is run by the owner, one command at a time.
 
 **ElevenLabs.** Import the phone number as a SIP trunk number with exactly the string siptooth puts in the Request-URI user part (including the leading `+`); assign the agent; inbound transport TLS (TCP acceptable, UDP is experimental on their side); inbound authentication: digest username/password (their IP allowlist does not suit a dynamic home IP); media encryption `Disabled` with `srtp: false`, or `Allowed`/`Required` with `srtp: true`. Config: `target: "sip:{number}@sip.rtc.elevenlabs.io;transport=tls"`, `headers: {X-CALLER-ID: "{caller}", X-CALL-ID: "{call_id}"}`.
 
-**Asterisk/PJSIP (owner's PBX on the LAN).** An endpoint for siptooth with `identify_by=auth_username` (or `ip`) so a From user carrying the caller number still matches; `auth` with the username/password; `rewrite_contact=yes`, `force_rport=yes`, `rtp_symmetric=yes`, `direct_media=no`; `allow=ulaw,alaw`; context routing the request user (for example extension `600`) where wanted. Config: `target: "sip:600@<pbx ip>"`, `transport: udp` or `tcp`, `nat.mode: auto` (resolves to `local`). Other PBXs: the equivalent settings (connection reuse, symmetric RTP, identify by auth username or source IP).
+**Zadarma (cloud PBX).** Create a PBX extension for siptooth (login `<account>-<ext>`, e.g. `1234-100`, password from the PBX settings) and route what it dials in the PBX: another extension, a voice menu, voicemail, or the extension's "Forward to: External server (SIP URI)" (e.g. an ElevenLabs agent number; REFER-based transfer is not supported by Zadarma, forwarding is). Config:
+
+```yaml
+sip:
+  target: "sip:200@sip.zadarma.com"        # what the siptooth extension dials; transport tls → port 5061
+  transport: tls                           # udp also documented by Zadarma; TLS preferred
+  username: "1234-100"
+  register: true
+  from: "sip:1234-100@sip.zadarma.com"     # Zadarma identifies the extension by its login
+  display_name: "{caller}"                 # original caller's number, shown where Zadarma passes it through
+  headers: {X-CALLER-ID: "{caller}", X-CALL-ID: "{call_id}"}
+  srtp: false                              # SRTP is not documented by Zadarma; test in M1 before enabling
+media: {codecs: [PCMA, PCMU]}              # Zadarma documents alaw/ulaw only
+```
+
+Known from Zadarma's docs: `sip.zadarma.com`, UDP 5060 and TLS 5061, PCMA/PCMU, `P-Asserted-Identity` only for numbers attached to the account (so it cannot carry an arbitrary caller's number). Not documented and verified in M1: INVITE without REGISTER, TCP, SRTP, TLS certificate validity (Zadarma's own Asterisk guide disables verification; siptooth never does — if the certificate fails, use UDP), display-name presentation on internal calls and on forwarding, whether custom `X-` headers survive a forward to an external SIP URI, NAT latching, and in-dialog request routing to a registered flow.
+
+**Self-hosted PBX (best effort, e.g. Asterisk/PJSIP).** An endpoint with `identify_by=auth_username` (or `ip`) so a From user carrying the caller number still matches; `rewrite_contact=yes`, `force_rport=yes`, `rtp_symmetric=yes`, `direct_media=no`; `allow=ulaw,alaw`. On the LAN, `nat.mode: auto` resolves to `local`.
 
 ## 16. Risks and open questions
 
 - **ElevenLabs far-end BYE.** If M1 shows ElevenLabs opens a new connection to the Contact or top Via for its BYE, the hang-up arrives only through `media_timeout` (10 s of silence for the caller). Mitigations if that is unacceptable: a router port-forward plus a TLS listener (out of v1 scope), or a shorter media timeout once the gap statistics from `sip test` are known.
+- **Caller ID through Zadarma.** If Zadarma drops the display name and `X-` headers, the original caller's number is available only to siptooth's hooks (and on the ElevenLabs-direct path). A fallback, if needed, is a per-caller target such as `sip:{caller}@...` routed by a Zadarma scenario; decided after M1.
 - **Line echo.** The phone network returns an echo of the far end's own voice (allochka needed an echo gate against OpenAI). ElevenLabs and PBX endpoints have their own echo handling, so siptooth ships without one; if M3 shows the agent interrupting itself, allochka's echo gate can be ported as an option.
 - **NAT variants.** CGNAT or an address-dependent NAT toward a far end that does not latch breaks media; the doctor observations and `sip test` make this visible early.
 - **No RTCP.** Some media servers time out calls without RTCP; neither v1 target does. RTCP sender reports later are contained in `rtp`.
@@ -576,3 +609,5 @@ Reviewed by Fable 5.1 (Claude subagent), gpt-6.1-sol and gpt-6-astra (Codex CLI)
 - `pion/stun` dropped for a hand-rolled Binding Request (the unsuffixed module is v0.6.1 with a parser panic; Fable, gpt-6.1-sol); versions pinned (all three).
 - URIs: `sip:` only, explicit port honored, component-aware escaping, CR/LF rejected; `{call_id}` placeholder; provider recipes (all three).
 - Hooks back to allochka's single worker (Fable, gpt-6.1-sol); claims narrowed to two qualified targets (gpt-6-astra).
+
+Revision 3 (owner input): the LAN PBX is replaced by the owner's Zadarma cloud PBX as a qualified target next to ElevenLabs direct (both first-class); optional REGISTER (section 5.7) because Zadarma documents only registered extensions or static-IP trunks, which also gives far-end BYEs a flow to arrive on; Zadarma recipe with its documented facts and the M1 qualification list.
