@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -93,7 +94,11 @@ type activeCall struct {
 	answerSent bool        // ATA was sent (spec 4.1)
 
 	// Answering and Bridged.
-	callActive     bool      // CallActive observed after our ATA: the phone call is ours
+	callActive     bool     // CallActive observed
+	ata            ataState // result of our ATA; with callActive it decides ownership
+	setupCleared   bool     // callsetup=0 seen while ATA/CallActive were still open
+	noCHUP         bool     // SCO was lost: the owner may hold the call, never AT+CHUP
+	latched        netip.AddrPort
 	ringEnd        time.Time // when callActive was observed; ringing_seconds stops here
 	mediaStartedAt time.Time
 	link           sco.Link
@@ -119,13 +124,29 @@ type endSpec struct {
 	farEndGone bool
 }
 
-// ours reports whether the phone call is siptooth's to hang up (spec 4.1).
-func (call *activeCall) ours() bool { return call.callActive }
+// ataState is the progress of our ATA command.
+type ataState int
+
+const (
+	ataPending   ataState = iota
+	ataOK                 // the phone accepted ATA
+	ataAmbiguous          // sent, no final result in time: the phone may have answered
+	ataFailed             // definitely not answered by us
+)
+
+// ours reports whether the phone call is siptooth's to hang up (spec 4.1):
+// CallActive was observed and our ATA succeeded or may have succeeded. A
+// failed or still unknown ATA means the owner could have answered on the
+// handset, and a lost SCO link means the call may have moved there.
+func (call *activeCall) ours() bool {
+	return call.callActive && (call.ata == ataOK || call.ata == ataAmbiguous) && !call.noCHUP
+}
 
 // ---- Idle -> Dialing (spec 4.2) ----
 
 func (c *Coordinator) startCall(ctx context.Context) {
 	c.clearLate()
+	c.cancelChups()
 	now := c.d.Clock.Now()
 	c.nextGen++
 	call := &activeCall{
@@ -395,6 +416,7 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 	call.state = stateEnding
 	call.cancel()
 	now := c.d.Clock.Now()
+	e.hangupPhone = e.hangupPhone && call.ours() // the ownership rule holds for every ending
 
 	if call.attempt != nil {
 		att := call.attempt
@@ -416,7 +438,7 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 	var stats mediaCounters
 	if call.prepared != nil {
 		m := call.prepared.Media
-		c.safely("media stats", func() { stats = readCounters(m) })
+		c.safely("media stats", func() { stats = readCounters(m); call.latched = stats.Latched })
 		media = &hooks.MediaStats{
 			Sent: stats.Sent, Received: stats.Received, Lost: stats.Lost, Late: stats.Late,
 			Duplicate: stats.Duplicate, Overflow: stats.Overflow,
@@ -425,10 +447,11 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 		c.safely("close media", func() { closeMedia(c.d.Logger, m) })
 	}
 
-	// A call that ended before call.ringing went out still gets one, so every
-	// call.ended has its call.ringing.
-	c.resolveIdentity(call)
-	c.emitRinging(call)
+	// ATA went out, the phone was not seen answering and ATA did not
+	// definitely fail: a CallActive soon after is still our ATA's doing.
+	if call.answerSent && !call.callActive && call.ata != ataFailed && !noLateWindow(e.outcome) {
+		c.armLate(call)
+	}
 
 	// Ringing stops when the phone call was answered, bridging runs to the end.
 	ringEnd := now
@@ -442,13 +465,32 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 		bridgedS = now.Sub(call.bridgedAt).Seconds()
 		bridged = &bridgedS
 	}
-	info := c.callInfo(call)
-	info.Outcome, info.HangupBy, info.Error = e.outcome, e.hangupBy, e.errText
-	info.SIPStatus, info.SIPReason = call.sipStat, call.sipRsn
-	info.RingingSeconds = ringing
-	info.BridgedSeconds = bridged
-	info.Media = media
-	c.d.Hooks.Emit("call.ended", info)
+	emitted := false
+	var codec, natMode string
+	c.safely("call.ended payload", func() {
+		// A call that ended before call.ringing went out still gets one, so
+		// every call.ended has its call.ringing.
+		c.resolveIdentity(call)
+		c.emitRinging(call)
+		info := c.callInfo(call)
+		info.Outcome, info.HangupBy, info.Error = e.outcome, e.hangupBy, e.errText
+		info.SIPStatus, info.SIPReason = call.sipStat, call.sipRsn
+		info.RingingSeconds = ringing
+		info.BridgedSeconds = bridged
+		info.Media = media
+		codec, natMode = info.Codec, info.NATMode
+		c.d.Hooks.Emit("call.ended", info)
+		emitted = true
+	})
+	if !emitted { // building the payload failed: the single call.ended still goes out
+		c.safely("call.ended fallback", func() {
+			c.d.Hooks.Emit("call.ended", hooks.CallInfo{
+				ID: call.id, Number: c.d.Config.Phone.Number, Target: call.target, CallerWithheld: call.withheld,
+				Outcome: e.outcome, HangupBy: e.hangupBy, Error: e.errText, RingingSeconds: ringing,
+				BridgedSeconds: bridged, Media: media, SIPStatus: call.sipStat, SIPReason: call.sipRsn,
+			})
+		})
+	}
 
 	caller := call.caller
 	if call.withheld {
@@ -457,7 +499,7 @@ func (c *Coordinator) finish(call *activeCall, e endSpec) {
 	c.d.Logger.Info("call ended",
 		"call_id", call.id, "caller", caller, "outcome", e.outcome, "hangup_by", e.hangupBy,
 		"sip_status", call.sipStat, "ringing_s", ringing, "bridged_s", bridgedS,
-		"codec", info.Codec, "nat_mode", info.NATMode,
+		"codec", codec, "nat_mode", natMode,
 		"lost", stats.Lost, "late", stats.Late, "discarded_silence", stats.DiscardedSilence)
 
 	c.lastOutcome = e.outcome
@@ -473,6 +515,15 @@ func (c *Coordinator) safely(what string, fn func()) {
 		}
 	}()
 	fn()
+}
+
+// noLateWindow: endings after which a CallActive is certainly not our ATA's.
+func noLateWindow(outcome string) bool {
+	switch outcome {
+	case OutcomeCallerAbandoned, OutcomeOwnerAnswered, OutcomeBluetoothLost, OutcomeShutdown:
+		return true
+	}
+	return false
 }
 
 // callInfo is the hook payload view of call as far as it is known.
@@ -499,18 +550,27 @@ func (c *Coordinator) callInfo(call *activeCall) hooks.CallInfo {
 		if rm.Addr.IsValid() {
 			info.RemoteMedia = rm.Addr.String()
 		}
+		// The latched RTP source is what the call really talks to (spec 10).
+		lat := call.latched
+		if !lat.IsValid() && call.state != stateEnding && call.prepared != nil && call.prepared.Media != nil {
+			c.safely("latched address", func() { lat = call.prepared.Media.Stats().Latched })
+		}
+		if lat.IsValid() {
+			info.RemoteMedia = lat.String()
+		}
 		info.SRTP = rm.SRTP
 	}
 	return info
 }
 
 type mediaCounters struct {
+	Latched                                                                     netip.AddrPort
 	Sent, Received, Lost, Late, Duplicate, Overflow, DiscardedSilence, SRTPFail uint64
 }
 
 func readCounters(m Media) mediaCounters {
 	s := m.Stats()
-	return mediaCounters{Sent: s.Sent, Received: s.Received, Lost: s.Lost, Late: s.Late,
+	return mediaCounters{Latched: s.Latched, Sent: s.Sent, Received: s.Received, Lost: s.Lost, Late: s.Late,
 		Duplicate: s.Duplicate, Overflow: s.Overflow, DiscardedSilence: s.DiscardedSilence, SRTPFail: s.SRTPFail}
 }
 
@@ -541,17 +601,42 @@ func (c *Coordinator) byeNow(sc sip.Call, callID string) {
 	}
 }
 
-// hangupPhone sends AT+CHUP in the background, bounded by cleanupTimeout.
+// hangupPhone sends AT+CHUP in the background, bounded by cleanupTimeout. The
+// command is cancelled when the phone reports the call over (CallEnded,
+// CallSetupCleared) or a new call rings, so a CHUP stuck behind a slow queue
+// can never hit a later call (see cancelChups).
 func (c *Coordinator) hangupPhone(t Telephony, callID string) {
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	c.chupMu.Lock()
+	c.chupN++
+	id := c.chupN
+	if c.chups == nil {
+		c.chups = map[int]context.CancelFunc{}
+	}
+	c.chups[id] = cancel
+	c.chupMu.Unlock()
 	c.bg.Add(1)
 	go func() {
 		defer c.bg.Done()
+		defer func() {
+			c.chupMu.Lock()
+			delete(c.chups, id)
+			c.chupMu.Unlock()
+			cancel()
+		}()
 		c.safely("AT+CHUP", func() {
-			ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
-			defer cancel()
 			if err := t.Hangup(ctx); err != nil {
 				c.d.Logger.Warn("AT+CHUP failed", "call_id", callID, "error", err)
 			}
 		})
 	}()
+}
+
+// cancelChups aborts AT+CHUPs that are still queued or in flight.
+func (c *Coordinator) cancelChups() {
+	c.chupMu.Lock()
+	defer c.chupMu.Unlock()
+	for _, cancel := range c.chups {
+		cancel()
+	}
 }

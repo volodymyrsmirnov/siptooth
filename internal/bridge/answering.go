@@ -92,10 +92,14 @@ func (c *Coordinator) enterAnswering(call *activeCall, res sip.DialResult) {
 	// counts as answered once CallActive is observed (spec 4.1).
 	call.answerSent = true
 	tel := c.tel
+	// The ATA belongs to this call: teardown cancels it, and a command that was
+	// still queued then reports ErrNotSent instead of reaching a later call.
+	ctx, cancel := context.WithTimeout(call.ctx, 10*time.Second)
+	c.bg.Add(1)
 	go func() {
-		defer c.recoverGo(gen)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer c.bg.Done()
 		defer cancel()
+		defer c.recoverGo(gen)
 		err := tel.Answer(ctx)
 		c.post(msg{kind: mAnswer, gen: gen, err: err})
 	}()
@@ -122,42 +126,62 @@ func (c *Coordinator) runSilence(call *activeCall, m Media) {
 	}
 }
 
-// ataAmbiguous: the command was sent but no final result arrived in time, so
+// ataTimedOut: the command was sent but no final result arrived in time, so
 // the phone may have answered anyway. ErrNotSent wraps ErrTimeout but means
 // the phone never saw the command.
-func ataAmbiguous(err error) bool {
+func ataTimedOut(err error) bool {
 	return errors.Is(err, hfp.ErrTimeout) && !errors.Is(err, hfp.ErrNotSent)
+}
+
+// ataDefinite: the phone was certainly not answered by our ATA. A context
+// error alone (our own cancellation at teardown) says nothing either way.
+func ataDefinite(err error) bool {
+	if err == nil || ataTimedOut(err) {
+		return false
+	}
+	if errors.Is(err, hfp.ErrNotSent) {
+		return true
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func (c *Coordinator) onAnswerResult(m msg) {
 	if w := c.late; w != nil && w.gen == m.gen {
-		// The SIP side ended before this result. A definite failure means the
+		// The call ended before this result. A definite failure means the
 		// phone was never answered, so a later CallActive is not ours.
-		if m.err != nil && !ataAmbiguous(m.err) {
+		if ataDefinite(m.err) {
 			c.d.Logger.Info("late ATA failure, late CallActive window closed", "call_id", w.id, "error", m.err)
 			c.clearLate()
 		}
 		return
 	}
 	call := c.current(m.gen)
-	if call == nil || call.state != stateAnswering {
+	if call == nil || (call.state != stateAnswering && call.state != stateBridged) {
 		c.discard(m, "call over")
 		return
 	}
 	switch {
 	case m.err == nil:
-	case ataAmbiguous(m.err):
+		call.ata = ataOK
+	case !ataDefinite(m.err):
+		call.ata = ataAmbiguous
 		c.d.Logger.Warn("ATA timed out, waiting for CallActive", "call_id", call.id, "error", m.err)
 	default:
-		if call.callActive {
-			c.d.Logger.Warn("ATA failed but the phone reports the call active", "call_id", call.id, "error", m.err)
-			return
+		call.ata = ataFailed
+		switch {
+		case call.callActive:
+			// The CallActive was the owner answering on the handset while our
+			// ATA was still queued: the phone call is never touched.
+			c.finish(call, endSpec{outcome: OutcomeOwnerAnswered, errText: "ATA: " + m.err.Error()})
+		case call.setupCleared:
+			c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
+		default:
+			// Definite failure: the phone is left alone (still ringing, or ending).
+			c.finish(call, endSpec{outcome: OutcomeAnswerFailed, hangupBy: HangupSiptooth, errText: "ATA: " + m.err.Error()})
 		}
-		// Definite failure: the phone is left alone (still ringing, or ending).
-		c.finish(call, endSpec{outcome: OutcomeAnswerFailed, hangupBy: HangupSiptooth, errText: "ATA: " + m.err.Error()})
 		return
 	}
-	if !call.callActive {
+	if call.state == stateAnswering && !call.callActive {
 		c.startTimer(call, timerCallActive, callActiveTimeout)
 	}
 }
@@ -177,7 +201,9 @@ func (c *Coordinator) onTelAnswering(call *activeCall, ev hfp.Event) {
 		if call.callActive {
 			return // not emitted while active
 		}
-		c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
+		// callsetup=0 can arrive before call=1 after ATA (allochka): the
+		// CallActive window decides.
+		call.setupCleared = true
 	case hfp.CallEnded:
 		c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
 	}
@@ -200,14 +226,10 @@ func (c *Coordinator) onSIPEnded(m msg) {
 }
 
 func (c *Coordinator) sipEndedAnswering(call *activeCall, cause sip.EndCause) {
-	active := call.callActive
+	// Before CallActive the phone is left alone; finish arms the late-CallActive
+	// window (spec 4.4). After CallActive it hangs up if the call is ours.
 	c.finish(call, endSpec{outcome: OutcomeFarEndEnded, hangupBy: HangupFarEnd, farEndGone: true,
-		errText: "sip " + string(cause), hangupPhone: active})
-	if !active {
-		// Before CallActive the phone is left alone, but our ATA may still
-		// answer it: a CallActive within 5 s is ours to hang up.
-		c.armLate(call)
-	}
+		errText: "sip " + string(cause), hangupPhone: true})
 }
 
 // ---- late CallActive window (spec 4.4, last paragraph) ----
@@ -281,7 +303,9 @@ func (c *Coordinator) acceptSCO(call *activeCall) {
 	if lis == nil {
 		return
 	}
+	c.bg.Add(1) // joined at shutdown before the final inbox drain
 	go func() {
+		defer c.bg.Done()
 		defer c.recoverGo(gen)
 		l, err := lis.Accept(ctx)
 		c.postLink(gen, l, err)
@@ -294,7 +318,9 @@ func (c *Coordinator) dialSCO(call *activeCall) {
 		return
 	}
 	ctx, gen, adapter, phone := call.acceptCtx, call.gen, c.adapterAddr, c.d.Config.Bluetooth.PhoneAddress
+	c.bg.Add(1)
 	go func() {
+		defer c.bg.Done()
 		defer c.recoverGo(gen)
 		l, err := d.Dial(ctx, adapter, phone)
 		c.postLink(gen, l, err)
@@ -312,6 +338,10 @@ func (c *Coordinator) onCallTimer(call *activeCall, name string) {
 	switch name {
 	case timerCallActive:
 		if call.state == stateAnswering && !call.callActive {
+			if call.setupCleared {
+				c.finish(call, endSpec{outcome: OutcomeCallerAbandoned, hangupBy: HangupCaller})
+				return
+			}
 			c.finish(call, endSpec{outcome: OutcomeAnswerFailed, hangupBy: HangupSiptooth, errText: "no CallActive after ATA"})
 		}
 	case timerSCODial:

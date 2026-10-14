@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/rtp"
@@ -20,6 +21,8 @@ const (
 	stallLimit      = 5 * time.Second
 	rtpFailLimit    = 5 * time.Second // transient RTP send failures tolerated before giving up
 	rtpWarnEvery    = time.Second
+	watchdogEvery   = 250 * time.Millisecond
+	unblockWait     = 500 * time.Millisecond // real time to let a closed link release the loop
 )
 
 // RTP is the part of an RTP session the pump uses.
@@ -51,7 +54,47 @@ const (
 // silence to SCO and leaves the playout in startup mode, then ends startup mode
 // once. A blocked link.Write delays the reaction to ctx; the caller unblocks it
 // (and the reader goroutine, after RunPump returns) by closing the link.
-func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock) PumpEnd {
+func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock, log *slog.Logger) PumpEnd {
+	if log == nil {
+		log = slog.Default()
+	}
+	var progress atomic.Int64 // clock time of the last completed SCO read or write
+	progress.Store(clk.Now().UnixNano())
+	res := make(chan PumpEnd, 1)
+	go func() { res <- runPump(ctx, link, r, settle, clk, log, &progress) }()
+
+	// The loop's own stall check runs on the goroutine that may be blocked in a
+	// link write; this watchdog does not. Without any completed read or write
+	// for stallLimit it closes the link and ends the pump.
+	wd := clk.NewTicker(watchdogEvery)
+	defer wd.Stop()
+	for {
+		select {
+		case end := <-res:
+			return end
+		case <-ctx.Done():
+			select {
+			case end := <-res:
+				return end
+			case <-time.After(unblockWait):
+				return PumpCtx // blocked in the link; the caller closes it
+			}
+		case <-wd.C():
+			if clk.Now().Sub(time.Unix(0, progress.Load())) < stallLimit {
+				continue
+			}
+			log.Warn("SCO link made no progress, closing it", "for", stallLimit)
+			_ = link.Close()
+			select {
+			case <-res:
+			case <-time.After(unblockWait):
+			}
+			return PumpSCOStall
+		}
+	}
+}
+
+func runPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, clk Clock, log *slog.Logger, progress *atomic.Int64) PumpEnd {
 	mtu := link.MTU()
 	frames := make(chan []byte, 8)
 	readErr := make(chan error, 1)
@@ -61,6 +104,9 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 		for {
 			buf := make([]byte, mtu)
 			n, err := link.Read(buf)
+			if err == nil {
+				progress.Store(clk.Now().UnixNano())
+			}
 			if err != nil {
 				readErr <- err
 				return
@@ -116,7 +162,7 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 		}
 		if lastWarn.IsZero() || now.Sub(lastWarn) >= rtpWarnEvery {
 			lastWarn = now
-			slog.Warn("rtp send failing", "op", op, "for", now.Sub(failSince).Round(time.Millisecond), "error", err)
+			log.Warn("rtp send failing", "op", op, "for", now.Sub(failSince).Round(time.Millisecond), "error", err)
 		}
 		return false
 	}
@@ -132,6 +178,9 @@ func RunPump(ctx context.Context, link sco.Link, r RTP, settle time.Duration, cl
 			}
 		}
 		_, err := link.Write(out)
+		if err == nil {
+			progress.Store(clk.Now().UnixNano())
+		}
 		return err
 	}
 

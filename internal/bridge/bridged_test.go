@@ -114,7 +114,7 @@ func TestCallerHangsUp(t *testing.T) {
 func TestBridgedSecondsNullWhenNeverBridged(t *testing.T) {
 	r := newRig(t, nil).start()
 	r.answer()
-	r.tel.send(hfp.CallSetupCleared, "")
+	r.tel.send(hfp.CallEnded, "")
 	if e := r.waitEnded(); e.BridgedSeconds != nil {
 		t.Errorf("bridged_seconds = %v", *e.BridgedSeconds)
 	}

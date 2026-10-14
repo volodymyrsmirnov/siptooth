@@ -362,3 +362,29 @@ func TestStartupRebaseBounded(t *testing.T) {
 		t.Fatalf("depth = %v", d)
 	}
 }
+
+func TestFlushPlaysRemnantBelowTarget(t *testing.T) {
+	pl := NewPlayout(Config{JitterMs: 60})
+	pcm := make([]int16, 320) // 40 ms
+	for i := range pcm {
+		pcm[i] = 7
+	}
+	pl.Push(0, 1, pcm)
+	out := make([]int16, 160)
+	pl.Read(out)
+	if out[0] != 0 {
+		t.Fatal("below-target audio played without Flush (priming expected)")
+	}
+	pl.Flush()
+	pl.Read(out)
+	if out[0] != 7 {
+		t.Fatalf("Flush did not release the remnant: %d", out[0])
+	}
+	pl.SetStartup(true)
+	pl.SetStartup(false) // priming stays off for the rest of the playout's life
+	pl.Push(320, 1, pcm)
+	pl.Read(out)
+	if out[0] != 7 {
+		t.Fatal("playout re-primed after SetStartup(false)")
+	}
+}

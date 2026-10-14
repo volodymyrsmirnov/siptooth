@@ -39,6 +39,7 @@ type Playout struct {
 	size   int64
 
 	startup bool
+	flushed bool // priming disabled for good (Flush)
 
 	haveEpoch bool
 	ssrc      uint32
@@ -90,6 +91,16 @@ func (p *Playout) SetStartup(on bool) {
 		p.primed = false // re-prime to the jitter target after startup
 	}
 	p.enforceLimit()
+}
+
+// Flush disables priming for the rest of the playout's life: Read plays any
+// buffered audio at once, however little. It is for the end of a call, when no
+// more audio will come to reach the jitter target (SetStartup keeps it).
+func (p *Playout) Flush() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.flushed = true
+	p.primed = true
 }
 
 // Depth is the buffered audio from the playout point to the newest sample.
@@ -219,7 +230,7 @@ func (p *Playout) Read(out []int16) {
 					p.readPos++
 				}
 			}
-			if p.depth() < int64(p.cfg.JitterMs)*samplesPerMilli {
+			if !p.flushed && p.depth() < int64(p.cfg.JitterMs)*samplesPerMilli {
 				clear(out) // priming: wait for the jitter target
 				return
 			}

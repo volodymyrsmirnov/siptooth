@@ -19,6 +19,10 @@ func (r *rig) answer() *fakeCall {
 	r.t.Helper()
 	fc := r.answerAny()
 	r.waitState("answering")
+	// Let the ATA result be processed, so ownership is settled.
+	r.waitFor("ATA result", func() bool {
+		return r.clock.hasTimer(5*time.Second) || r.tel.gate != nil || r.c.Status().State != "answering"
+	})
 	return fc
 }
 
@@ -223,25 +227,6 @@ func TestATAOKWaitsForCallActive(t *testing.T) {
 	r.wantHangups(fc, 1, 0)
 }
 
-// CallActive can race ahead of the ATA result (and the result may even be an
-// error): the indicator decides.
-func TestCallActiveBeforeATAResult(t *testing.T) {
-	r := newRig(t, nil)
-	r.tel.gate = make(chan struct{})
-	r.tel.setAnswerErr(hfp.ErrResponse)
-	r.start()
-	r.answer()
-	r.callActive()
-	close(r.tel.gate)
-	r.settle()
-	if r.c.Status().State != "answering" {
-		t.Fatalf("state %s: an ATA error after CallActive must not end the call", r.c.Status().State)
-	}
-	a, _ := sco.NewPipe(60)
-	r.lis.links <- a
-	r.waitState("bridged")
-}
-
 func TestNoSCOChupAndBye(t *testing.T) {
 	r := newRig(t, nil).start()
 	fc := r.answer()
@@ -394,17 +379,6 @@ func TestFarEndByeAfterCallActive(t *testing.T) {
 		t.Errorf("ended = %+v", e)
 	}
 	r.wantHangups(fc, 0, 1)
-}
-
-func TestCallerAbandonedBeforeCallActive(t *testing.T) {
-	r := newRig(t, nil).start()
-	fc := r.answer()
-	r.tel.send(hfp.CallSetupCleared, "")
-	e := r.waitEnded()
-	if e.Outcome != OutcomeCallerAbandoned || e.HangupBy != HangupCaller {
-		t.Errorf("ended = %+v", e)
-	}
-	r.wantHangups(fc, 1, 0)
 }
 
 func TestCallEndedAfterCallActiveBeforeSCO(t *testing.T) {

@@ -451,9 +451,10 @@ func TestAnsweredEntersAnswering(t *testing.T) {
 	r.waitState("answering")
 	r.waitFor("ATA", func() bool { a, _ := r.tel.counts(); return a == 1 })
 	r.tel.send(hfp.CallActive, "")
-	a, _ := sco.NewPipe(60)
+	a, phone := sco.NewPipe(60)
 	r.lis.links <- a
 	r.waitState("bridged")
+	feed(t, phone)
 	r.clock.Advance(time.Minute) // the dial timer no longer applies
 	r.settle()
 	if r.c.Status().State != "bridged" {
@@ -491,7 +492,7 @@ func TestExactlyOneCallEnded(t *testing.T) {
 		{"disconnected", OutcomeBluetoothLost, false, func(r *rig) { r.tel.send(hfp.Disconnected, "") }},
 		{"shutdown", OutcomeShutdown, true, func(r *rig) { r.cancel() }},
 		{"answered then far end", OutcomeFarEndEnded, false, func(r *rig) { answered(r).ended <- sip.RemoteBye }},
-		{"answered then caller", OutcomeCallerAbandoned, false, func(r *rig) { answered(r); r.tel.send(hfp.CallSetupCleared, "") }},
+		{"answered then caller", OutcomeCallerAbandoned, false, func(r *rig) { answered(r); r.tel.send(hfp.CallEnded, "") }},
 		{"answered then shutdown", OutcomeShutdown, true, func(r *rig) { answered(r); r.cancel() }},
 	}
 	for _, s := range scenarios {
@@ -593,7 +594,7 @@ func TestSummaryLogLine(t *testing.T) {
 func TestFinishHangsUpPhoneOnceInBackground(t *testing.T) {
 	r := newRig(t, nil)
 	r.c.tel = r.tel
-	call := &activeCall{id: "call-x", gen: 1, state: stateAnswering, timerGen: map[string]int{}, ringAt: r.clock.Now()}
+	call := &activeCall{id: "call-x", gen: 1, state: stateAnswering, callActive: true, ata: ataOK, timerGen: map[string]int{}, ringAt: r.clock.Now()}
 	call.ctx, call.cancel = t.Context(), func() {}
 	r.c.cur = call
 	e := endSpec{outcome: OutcomeFarEndEnded, hangupBy: HangupFarEnd, hangupPhone: true}

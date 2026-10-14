@@ -154,6 +154,9 @@ type Coordinator struct {
 	lastOutcome  string
 	nextGen      int
 	cur          *activeCall
+	chupMu       sync.Mutex
+	chups        map[int]context.CancelFunc // in-flight AT+CHUPs
+	chupN        int
 	late         *lateWatch // late-CallActive window of the last call (spec 4.4)
 
 	statusMu sync.RWMutex
@@ -278,6 +281,8 @@ func (c *Coordinator) dispatch(ctx context.Context, m msg) {
 	switch m.kind {
 	case mAttach:
 		c.telGen++
+		c.clearLate()
+		c.cancelChups()
 		c.tel, c.listener, c.adapterAddr = m.telRef, m.lis, m.addr
 		gen := c.telGen
 		go func(t Telephony) {
@@ -429,6 +434,10 @@ func (c *Coordinator) dropPhone() {
 }
 
 func (c *Coordinator) onTel(ctx context.Context, ev hfp.Event) {
+	switch ev.Kind {
+	case hfp.CallEnded, hfp.CallSetupCleared:
+		c.cancelChups() // the phone call is over; a queued AT+CHUP is stale
+	}
 	switch ev.Kind {
 	case hfp.Connected:
 		// PhoneConnected follows Attach.

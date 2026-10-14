@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
@@ -32,23 +33,42 @@ type fakeTel struct {
 	// answerErr is what Answer returns; gate, when set, holds Answer until closed.
 	answerErr error
 	gate      chan struct{}
+	// hangupGate, when set, holds Hangup like a slow command queue.
+	hangupGate chan struct{}
 }
 
 func newFakeTel() *fakeTel { return &fakeTel{events: make(chan hfp.Event, 32)} }
 
 func (f *fakeTel) Events() <-chan hfp.Event { return f.events }
-func (f *fakeTel) Answer(context.Context) error {
+func (f *fakeTel) Answer(ctx context.Context) error {
 	f.mu.Lock()
 	f.answer++
 	err, gate := f.answerErr, f.gate
 	f.mu.Unlock()
 	if gate != nil {
-		<-gate
+		select {
+		case <-gate:
+		case <-ctx.Done(): // like hfp: a command cancelled before it was written was not sent
+			return fmt.Errorf("%w: %v", hfp.ErrNotSent, ctx.Err())
+		}
 	}
 	return err
 }
 func (f *fakeTel) setAnswerErr(err error) { f.mu.Lock(); f.answerErr = err; f.mu.Unlock() }
-func (f *fakeTel) Hangup(context.Context) error {
+
+// Hangup counts only commands that reach the "wire": with hangupGate set it
+// waits for the gate, and a cancelled context aborts it unsent.
+func (f *fakeTel) Hangup(ctx context.Context) error {
+	f.mu.Lock()
+	gate := f.hangupGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return fmt.Errorf("%w: %v", hfp.ErrNotSent, ctx.Err())
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hangup++
@@ -83,7 +103,7 @@ type fakeMedia struct {
 }
 
 func newFakeMedia() *fakeMedia {
-	return &fakeMedia{errCh: make(chan error, 1), pl: rtp.NewPlayout(rtp.Config{})}
+	return &fakeMedia{errCh: make(chan error, 1), pl: rtp.NewPlayout(rtp.Config{JitterMs: 60})}
 }
 
 func (m *fakeMedia) Start(r sdp.Media, key []byte) error {
@@ -138,17 +158,26 @@ func (m *fakeMedia) startCount() int  { m.mu.Lock(); defer m.mu.Unlock(); return
 // --- SIP ---
 
 type fakeCall struct {
-	updates chan sdp.Media
-	ended   chan sip.EndCause
-	mu      sync.Mutex
-	hangup  int
+	updates     chan sdp.Media
+	panicRemote bool
+	ended       chan sip.EndCause
+	mu          sync.Mutex
+	hangup      int
 }
 
 func newFakeCall() *fakeCall {
 	return &fakeCall{ended: make(chan sip.EndCause, 1), updates: make(chan sdp.Media, 4)}
 }
 
+func (c *fakeCall) setPanicRemote() { c.mu.Lock(); c.panicRemote = true; c.mu.Unlock() }
+
 func (c *fakeCall) Remote() sdp.Media {
+	c.mu.Lock()
+	p := c.panicRemote
+	c.mu.Unlock()
+	if p {
+		panic("remote exploded")
+	}
 	return sdp.Media{Addr: netip.MustParseAddrPort("203.0.113.9:4000"), SendCodec: g711.PCMU}
 }
 func (c *fakeCall) MediaUpdates() <-chan sdp.Media { return c.updates }
@@ -307,9 +336,10 @@ func (s *syncBuffer) String() string { s.mu.Lock(); defer s.mu.Unlock(); return 
 
 // fakeListener hands out links pushed with offer; Accept honors ctx.
 type fakeListener struct {
-	links   chan sco.Link
-	mu      sync.Mutex
-	accepts int
+	links    chan sco.Link
+	lateLink sco.Link // returned when ctx ends
+	mu       sync.Mutex
+	accepts  int
 }
 
 func newFakeListener() *fakeListener { return &fakeListener{links: make(chan sco.Link, 4)} }
@@ -322,6 +352,9 @@ func (l *fakeListener) Accept(ctx context.Context) (sco.Link, error) {
 	case k := <-l.links:
 		return k, nil
 	case <-ctx.Done():
+		if l.lateLink != nil { // accepted just as the call ended
+			return l.lateLink, nil
+		}
 		return nil, ctx.Err()
 	}
 }

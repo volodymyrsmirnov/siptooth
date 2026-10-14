@@ -33,7 +33,7 @@ func (c *Coordinator) startBridged(call *activeCall) {
 		defer c.bg.Done()
 		defer c.recoverGo(gen)
 		<-call.silenceDone
-		end := RunPump(call.ctx, link, media, settle, c.d.Clock)
+		end := RunPump(call.ctx, link, media, settle, c.d.Clock, c.d.Logger.With("call_id", call.id))
 		c.post(msg{kind: mPumpEnd, gen: gen, pumpEnd: end})
 	}()
 	if d := time.Duration(c.d.Config.Calls.MaxDurationSeconds) * time.Second; d > 0 {
@@ -76,6 +76,11 @@ func (c *Coordinator) sipEndedBridged(call *activeCall, cause sip.EndCause) {
 func (c *Coordinator) startDrain(call *activeCall) {
 	call.draining, call.sipGone = true, true
 	c.d.Logger.Info("far end hung up, draining downlink", "call_id", call.id)
+	// Play out what is left, however little: priming would withhold a remnant
+	// below the jitter target and the caller would lose the last fragment.
+	if pl := call.prepared.Media.Playout(); pl != nil {
+		pl.Flush()
+	}
 	c.startTimer(call, timerDrainMax, drainMax)
 	c.drainCheck(call)
 }
@@ -128,6 +133,9 @@ func (c *Coordinator) onPumpEnd(m msg) {
 	case PumpRTPError:
 		c.finish(call, endSpec{outcome: OutcomeMediaError, hangupBy: HangupSiptooth, hangupPhone: true, errText: "rtp send failed"})
 	case PumpSCOEOF, PumpSCOStall:
+		// From here on the call may be on the handset: no ending of this call
+		// sends AT+CHUP any more, not even a timeout inside the grace period.
+		call.noCHUP = true
 		if call.draining {
 			// Nothing left to play to; the far end is gone either way.
 			c.finishDrain(call)

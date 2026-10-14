@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -101,7 +102,7 @@ func startPump(t *testing.T, settle time.Duration, r *fakeRTP) *pumpRun {
 	ctx, cancel := context.WithCancel(context.Background())
 	run := &pumpRun{end: make(chan PumpEnd, 1), cancel: cancel, phone: phone, clk: newFakeClock(), rtp: r}
 	r.clk = run.clk
-	go func() { run.end <- RunPump(ctx, pumpSide, r, settle, run.clk) }()
+	go func() { run.end <- RunPump(ctx, pumpSide, r, settle, run.clk, nil) }()
 	t.Cleanup(func() { cancel(); phone.Close(); pumpSide.Close() })
 	want := 2 // stall and RTP silence tickers
 	if settle > 0 {
@@ -494,5 +495,35 @@ func TestPermanentRTPErrorEndsAtOnce(t *testing.T) {
 				t.Fatal("clock moved")
 			}
 		})
+	}
+}
+
+// blockedLink never completes a Read or a Write, like a wedged SCO socket.
+type blockedLink struct{ block chan struct{} }
+
+func (b blockedLink) Read([]byte) (int, error)  { <-b.block; return 0, io.EOF }
+func (b blockedLink) Write([]byte) (int, error) { <-b.block; return 0, io.EOF }
+func (b blockedLink) Close() error              { return nil } // does not unblock
+func (b blockedLink) MTU() int                  { return 60 }
+func (b blockedLink) Remote() string            { return "11:11:11:11:11:11" }
+
+func TestBlockedLinkStalls(t *testing.T) {
+	clk := newFakeClock()
+	r := newFakeRTP(0)
+	b := blockedLink{block: make(chan struct{})}
+	t.Cleanup(func() { close(b.block) })
+	end := make(chan PumpEnd, 1)
+	go func() { end <- RunPump(context.Background(), b, r, 0, clk, nil) }()
+	waitFor(t, "pump timers", func() bool { return clk.armed() >= 3 })
+	var got PumpEnd
+	for i := 0; i < 400 && got == ""; i++ {
+		clk.Advance(50 * time.Millisecond)
+		select {
+		case got = <-end:
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if got != PumpSCOStall {
+		t.Fatalf("end = %q, want %q", got, PumpSCOStall)
 	}
 }
