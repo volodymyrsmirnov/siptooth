@@ -83,6 +83,8 @@ func TestValidate(t *testing.T) {
 		{"bad ipv4", func(c *Config) { c.NAT.PublicIP = "999.1.1.1" }, "", "nat.public_ip"},
 		{"ipv6 public ip", func(c *Config) { c.NAT.PublicIP = "2001:db8::1" }, "", "nat.public_ip"},
 		{"bad nat mode", func(c *Config) { c.NAT.Mode = "x" }, "", "nat.mode"},
+		{"unspecified rtp_bind v4", func(c *Config) { c.NAT.RTPBind = "0.0.0.0" }, "", "nat.rtp_bind"},
+		{"unspecified rtp_bind v6", func(c *Config) { c.NAT.RTPBind = "::" }, "", "nat.rtp_bind"},
 		{"bad rtp_bind", func(c *Config) { c.NAT.RTPBind = "nope" }, "", "nat.rtp_bind"},
 		{"bad stun server", func(c *Config) { c.NAT.StunServers = []string{"nohostport"} }, "", "nat.stun_servers"},
 		{"odd port min", func(c *Config) { c.NAT.RTPPortMin = 10001 }, "", "even"},

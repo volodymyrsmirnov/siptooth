@@ -16,37 +16,22 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/nat"
 	"github.com/volodymyrsmirnov/siptooth/internal/placeholder"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
+	"github.com/volodymyrsmirnov/siptooth/internal/sipaddr"
 	"github.com/volodymyrsmirnov/siptooth/internal/stun"
 )
 
-// nextHop returns "host:port" of sip.proxy, else of the sip.target host (default port 5061
-// for TLS, else 5060), and the trial-expanded target URI. It mirrors the daemon's rule.
+// nextHop returns the next hop "host:port" (the daemon's rule, internal/sipaddr) and the
+// trial-expanded target URI.
 func nextHop(cfg config.Config) (hostPort, target string, err error) {
 	target, err = placeholder.ExpandURI(cfg.SIP.Target, placeholder.Values{Caller: "doctor", Number: cfg.Phone.Number, CallID: "doctor"})
 	if err != nil {
 		return "", "", fmt.Errorf("sip.target: %w", err)
 	}
-	if cfg.SIP.Proxy != "" {
-		return cfg.SIP.Proxy, target, nil
+	hostPort, err = sipaddr.NextHop(cfg)
+	if err != nil {
+		return "", "", err
 	}
-	rest := strings.TrimPrefix(strings.TrimPrefix(target, "sips:"), "sip:")
-	if at := strings.LastIndexByte(rest, '@'); at >= 0 {
-		rest = rest[at+1:]
-	}
-	if i := strings.IndexAny(rest, ";?"); i >= 0 {
-		rest = rest[:i]
-	}
-	if rest == "" {
-		return "", "", fmt.Errorf("sip.target %q has no host", cfg.SIP.Target)
-	}
-	if h, p, err := net.SplitHostPort(rest); err == nil {
-		return net.JoinHostPort(strings.Trim(h, "[]"), p), target, nil
-	}
-	port := "5060"
-	if strings.EqualFold(cfg.SIP.Transport, "tls") {
-		port = "5061"
-	}
-	return net.JoinHostPort(strings.Trim(rest, "[]"), port), target, nil
+	return hostPort, target, nil
 }
 
 // networkChecks runs the observations against the next hop. Without a usable target they
@@ -164,6 +149,7 @@ func natCheck(ctx context.Context, cfg config.Config, opts Options) Check {
 		return warn("nat_mapping", "cannot open a UDP socket: "+err.Error(), "")
 	}
 	defer conn.Close()
+	defer context.AfterFunc(ctx, func() { conn.Close() })() // cancel aborts a pending query
 	return natObservation(conn, servers[:2], networkTimeout)
 }
 

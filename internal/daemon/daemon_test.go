@@ -18,6 +18,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
 	"github.com/volodymyrsmirnov/siptooth/internal/control"
+	"github.com/volodymyrsmirnov/siptooth/internal/hooks"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip/siptest"
 )
@@ -194,28 +195,46 @@ func TestRegistrationErrorEmittedOncePerOutage(t *testing.T) {
 	}
 }
 
-func TestNextHopAddress(t *testing.T) {
-	cases := []struct {
-		name      string
-		mod       func(*config.Config)
-		want      string
-		wantError bool
+func TestLocalSIPPort(t *testing.T) {
+	for _, tc := range []struct {
+		transport  string
+		port, want int
 	}{
-		{"tls default port", func(c *config.Config) { c.SIP.Transport, c.SIP.Target = "tls", "sip:{caller}@pbx.example.com" }, "pbx.example.com:5061", false},
-		{"udp default port", func(c *config.Config) { c.SIP.Transport, c.SIP.Target = "udp", "sip:agent@pbx.example.com" }, "pbx.example.com:5060", false},
-		{"target port", func(c *config.Config) { c.SIP.Target = "sip:agent@10.0.0.5:5080;transport=tcp" }, "10.0.0.5:5080", false},
-		{"proxy wins", func(c *config.Config) { c.SIP.Proxy = "proxy.example.com:5070" }, "proxy.example.com:5070", false},
-		{"ipv6", func(c *config.Config) { c.SIP.Target = "sip:agent@[2001:db8::1]:5060" }, "[2001:db8::1]:5060", false},
+		{"udp", 0, 5060}, {"UDP", 0, 5060}, {"udp", 5070, 5070}, {"tcp", 0, 0}, {"tls", 0, 0}, {"tls", 5071, 5071},
+	} {
+		cfg := config.Default()
+		cfg.SIP.Transport, cfg.SIP.LocalPort = tc.transport, tc.port
+		if got := localSIPPort(cfg); got != tc.want {
+			t.Errorf("%s/%d: got %d, want %d", tc.transport, tc.port, got, tc.want)
+		}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := config.Default()
-			cfg.SIP.Target = "sip:x@example.com"
-			tc.mod(&cfg)
-			got, err := nextHopAddress(cfg)
-			if (err != nil) != tc.wantError || got != tc.want {
-				t.Fatalf("got %q, %v; want %q", got, err, tc.want)
-			}
-		})
+}
+
+func TestRegistrationErrorSuppressedWhileStopping(t *testing.T) {
+	var errs recordedErrors
+	rep := &registrationReporter{user: "alice", transport: "udp", errors: &errs, log: quietLogger(),
+		status: func(bridge.RegistrationStatus) {}}
+	rep.stopping.Store(true) // shutdown began: the unregister failing is not an outage
+	rep.onState(sip.RegState{Err: errors.New("unregister timed out")})
+	if got := errs.list(); len(got) != 0 {
+		t.Fatalf("emitted during shutdown: %v", got)
+	}
+}
+
+// The coordinator ends the call in progress at shutdown and emits call.ended;
+// the stop sequence must deliver it before the dispatcher ends.
+func TestShutdownDeliversCallEnded(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "events")
+	d, stopHooks := startHooks([]config.Hook{{
+		ID: "h", Events: []string{"call.ended"}, TimeoutSeconds: 5,
+		Command: "cat >> " + out,
+	}}, quietLogger())
+	nop := func() {}
+	st := stops{coord: func() { d.Emit("call.ended", hooks.CallInfo{ID: "c1"}) },
+		bt: nop, reg: nop, hooks: stopHooks, ctl: nop, ua: nop}
+	st.run()
+	b, err := os.ReadFile(out)
+	if err != nil || !strings.Contains(string(b), `"call.ended"`) {
+		t.Fatalf("call.ended not delivered: %q %v", b, err)
 	}
 }

@@ -9,23 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
-	"net/netip"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	gosip "github.com/emiago/sipgo/sip"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
 	"github.com/volodymyrsmirnov/siptooth/internal/buildinfo"
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
 	"github.com/volodymyrsmirnov/siptooth/internal/control"
 	"github.com/volodymyrsmirnov/siptooth/internal/hooks"
-	"github.com/volodymyrsmirnov/siptooth/internal/placeholder"
 	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
+	"github.com/volodymyrsmirnov/siptooth/internal/sipaddr"
 )
 
 // coordinator is the part of *bridge.Coordinator the Bluetooth glue uses.
@@ -67,40 +62,21 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 	// call.ended is delivered) and finally the control socket and the user
 	// agent. Each stop is a no-op until its component started.
 	nop := func() {}
-	stopCoord, stopBT, stopReg, stopHooks, stopCtl, stopUA := nop, nop, nop, nop, nop, nop
-	defer func() {
-		stopCoord()
-		stopBT()
-		stopReg()
-		stopHooks()
-		stopCtl()
-		stopUA()
-	}()
+	var st stops
+	st.coord, st.bt, st.reg, st.hooks, st.ctl, st.ua = nop, nop, nop, nop, nop, nop
+	defer st.run()
 
-	hookCtx, hookCancel := context.WithCancel(context.Background())
-	dispatcher := hooks.NewDispatcher(cfg.Hooks, logger)
-	hookDone := make(chan struct{})
-	go func() { defer close(hookDone); dispatcher.Run(hookCtx) }()
-	stopHooks = func() {
-		deadline := time.Now().Add(hooksDrainTimeout)
-		for dispatcher.Outstanding() > 0 && time.Now().Before(deadline) {
-			time.Sleep(10 * time.Millisecond)
-		}
-		if n := dispatcher.Outstanding(); n > 0 {
-			logger.Warn("daemon: hook events undelivered at shutdown", "count", n)
-		}
-		hookCancel()
-		<-hookDone
-	}
+	dispatcher, stopHooks := startHooks(cfg.Hooks, logger)
+	st.hooks = stopHooks
 
-	nextHop, err := nextHopAddress(cfg)
+	nextHop, err := sipaddr.NextHop(cfg)
 	if err != nil {
 		return err
 	}
 	ua, err := sip.NewUA(sip.Options{
 		Transport: cfg.SIP.Transport,
 		NextHop:   nextHop,
-		LocalPort: cfg.SIP.LocalPort,
+		LocalPort: localSIPPort(cfg),
 		Username:  cfg.SIP.Username,
 		Password:  password,
 		UserAgent: "siptooth/" + buildinfo.Version,
@@ -109,7 +85,7 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 	if err != nil {
 		return err
 	}
-	stopUA = func() { _ = ua.Close() }
+	st.ua = func() { _ = ua.Close() }
 
 	var reg atomic.Pointer[sip.Registration]
 	adapter := bridge.NewSIPAdapter(bridge.AdapterDeps{
@@ -128,7 +104,7 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 	coordCtx, coordCancel := context.WithCancel(context.Background())
 	coordDone := make(chan struct{})
 	go func() { defer close(coordDone); _ = coord.Run(coordCtx) }()
-	stopCoord = func() {
+	st.coord = func() {
 		coordCancel()
 		select {
 		case <-coordDone:
@@ -146,7 +122,7 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 		regCtx, regCancel := context.WithCancel(context.Background())
 		reg.Store(ua.Register(regCtx, "", cfg.SIP.RegistrarHost(),
 			time.Duration(cfg.SIP.RegisterExpiresSeconds)*time.Second, rep.onState))
-		stopReg = func() {
+		st.reg = func() {
 			regCancel()
 			uctx, cancel := context.WithTimeout(context.Background(), unregisterTimeout)
 			defer cancel()
@@ -165,12 +141,12 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 			errCh <- fmt.Errorf("control socket: %w", err)
 		}
 	}()
-	stopCtl = func() { ctlCancel(); <-ctlDone }
+	st.ctl = func() { ctlCancel(); <-ctlDone }
 
 	btCtx, btCancel := context.WithCancel(context.Background())
 	btDone := make(chan struct{})
 	go func() { defer close(btDone); runBluetooth(btCtx, cfg, coord, dispatcher, logger) }()
-	stopBT = func() { btCancel(); <-btDone }
+	st.bt = func() { btCancel(); <-btDone }
 
 	logger.Info("daemon: started", "version", buildinfo.Version, "control", cfg.Control.Socket,
 		"transport", cfg.SIP.Transport, "next_hop", nextHop, "register", cfg.SIP.Register)
@@ -184,30 +160,47 @@ func Run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 	}
 }
 
-// nextHopAddress is "host:port" of sip.proxy, else of the sip.target host
-// (default port 5061 for TLS, else 5060).
-func nextHopAddress(cfg config.Config) (string, error) {
-	if cfg.SIP.Proxy != "" {
-		return cfg.SIP.Proxy, nil
+// localSIPPort is the SIP port the user agent binds: sip.local_port, which
+// defaults to 5060 for UDP (spec 5.5) so the advertised Contact is a known,
+// reachable port. TCP and TLS stay ephemeral at 0.
+func localSIPPort(cfg config.Config) int {
+	if cfg.SIP.LocalPort == 0 && strings.EqualFold(cfg.SIP.Transport, "udp") {
+		return 5060
 	}
-	uri, err := placeholder.ExpandURI(cfg.SIP.Target, placeholder.Values{Caller: "caller", Number: cfg.Phone.Number, CallID: "call"})
-	if err != nil {
-		return "", fmt.Errorf("sip.target: %w", err)
-	}
-	var u gosip.Uri
-	if err := gosip.ParseUri(uri, &u); err != nil || u.Host == "" {
-		return "", fmt.Errorf("sip.target %q has no host", cfg.SIP.Target)
-	}
-	port := u.Port
-	if port == 0 {
-		port = 5060
-		if strings.EqualFold(cfg.SIP.Transport, "tls") {
-			port = 5061
+	return cfg.SIP.LocalPort
+}
+
+// stops are the component shutdown steps, run in a fixed order: the
+// coordinator first (it ends the call in progress, which needs Bluetooth and
+// SIP), then Bluetooth, the registration, the hook dispatcher (so the final
+// call.ended is delivered) and finally the control socket and the user agent.
+type stops struct{ coord, bt, reg, hooks, ctl, ua func() }
+
+func (s *stops) run() {
+	s.coord()
+	s.bt()
+	s.reg()
+	s.hooks()
+	s.ctl()
+	s.ua()
+}
+
+// startHooks runs the hook dispatcher. stop lets it deliver the events already
+// queued (up to hooksDrainTimeout) before ending it.
+func startHooks(hs []config.Hook, logger *slog.Logger) (*hooks.Dispatcher, func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	d := hooks.NewDispatcher(hs, logger)
+	done := make(chan struct{})
+	go func() { defer close(done); d.Run(ctx) }()
+	return d, func() {
+		deadline := time.Now().Add(hooksDrainTimeout)
+		for d.Outstanding() > 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
 		}
+		if n := d.Outstanding(); n > 0 {
+			logger.Warn("daemon: hook events undelivered at shutdown", "count", n)
+		}
+		cancel()
+		<-done
 	}
-	host := strings.Trim(u.Host, "[]")
-	if ip, err := netip.ParseAddr(host); err == nil {
-		host = ip.String()
-	}
-	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }

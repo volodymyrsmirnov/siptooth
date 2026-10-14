@@ -55,7 +55,23 @@ func adapterConfig(tr *siptest.Trunk) config.Config {
 
 func adapterUA(t *testing.T, tr *siptest.Trunk) *sip.UA {
 	t.Helper()
-	o := sip.Options{Transport: tr.Transport(), NextHop: tr.HostPort(), UserAgent: "siptooth/test",
+	return adapterUAPort(t, tr, 0)
+}
+
+// freeUDPPort returns a loopback UDP port that was free a moment ago.
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port
+}
+
+func adapterUAPort(t *testing.T, tr *siptest.Trunk, localPort int) *sip.UA {
+	t.Helper()
+	o := sip.Options{Transport: tr.Transport(), NextHop: tr.HostPort(), UserAgent: "siptooth/test", LocalPort: localPort,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	if tr.Transport() == "tls" {
 		o.TLSConfig = tr.ClientTLSConfig()
@@ -81,7 +97,8 @@ func newAdapter(t *testing.T, tr *siptest.Trunk, mod func(*AdapterDeps)) (*SIPAd
 
 func TestPrepareLocalModeForLoopbackTarget(t *testing.T) {
 	tr := siptest.NewTrunk(t, "udp")
-	a, sink := newAdapter(t, tr, nil)
+	port := freeUDPPort(t)
+	a, sink := newAdapter(t, tr, func(d *AdapterDeps) { d.UA = adapterUAPort(t, tr, port) })
 
 	p, err := a.Prepare(context.Background(), "127.0.0.1")
 	if err != nil {
@@ -99,7 +116,8 @@ func TestPrepareLocalModeForLoopbackTarget(t *testing.T) {
 	if len(p.Offer.Codecs) != 2 || p.Offer.LocalKey != nil || p.LocalKey != nil {
 		t.Fatalf("offer %+v key %v", p.Offer, p.LocalKey)
 	}
-	if want := "sip:siptooth@127.0.0.1:5060;transport=udp"; p.Contact != want {
+	// The Contact carries the UA's real bound SIP port, not a default.
+	if want := fmt.Sprintf("sip:siptooth@127.0.0.1:%d;transport=udp", port); p.Contact != want {
 		t.Fatalf("contact = %q, want %q", p.Contact, want)
 	}
 	if n := len(tr.RequestsFor("OPTIONS")); n != 0 {

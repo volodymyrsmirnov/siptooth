@@ -87,6 +87,7 @@ type UA struct {
 	attempts map[string]*attempt      // INVITE attempts by Call-ID (see dial.go)
 	timers   map[*time.Timer]struct{} // registry linger timers, stopped by Close
 	calls    map[*sipgo.DialogClientSession]*call
+	bound    netip.AddrPort            // local address the client was bound to (zero when ephemeral)
 	hops     map[string]netip.AddrPort // resolved next hops by "host:port" (see hop.go)
 }
 
@@ -191,7 +192,11 @@ func NewUA(o Options) (*UA, error) {
 			sua.Close()
 			return nil, fmt.Errorf("sip: local address toward %s: %w", hop.Addr(), err)
 		}
-		copts = append(copts, sipgo.WithClientConnectionAddr(netip.AddrPortFrom(local, uint16(o.LocalPort)).String()))
+		bind := netip.AddrPortFrom(local, uint16(o.LocalPort))
+		if o.LocalPort > 0 {
+			u.bound = bind
+		}
+		copts = append(copts, sipgo.WithClientConnectionAddr(bind.String()))
 	}
 	if u.client, err = sipgo.NewClient(sua, copts...); err != nil {
 		sua.Close()
@@ -284,6 +289,32 @@ func (u *UA) NextHop() string { return u.opts.NextHop }
 // same address until a send to it fails (hop.go).
 func (u *UA) ResolveNextHop(ctx context.Context) (netip.AddrPort, error) {
 	return u.pinnedHop(ctx, u.opts.NextHop)
+}
+
+// LocalAddr is the local SIP address (IP and port) far-end requests reach:
+// the configured bind when LocalPort > 0, else the local address of the pooled
+// connection or UDP socket toward the next hop. ok is false when neither is
+// known yet (an ephemeral port before the first request).
+func (u *UA) LocalAddr() (netip.AddrPort, bool) {
+	if u.bound.IsValid() {
+		return u.bound, true
+	}
+	u.mu.Lock()
+	hop, ok := u.hops[u.opts.NextHop]
+	u.mu.Unlock()
+	if !ok {
+		return netip.AddrPort{}, false
+	}
+	conn, err := u.ua.TransportLayer().GetConnection(u.transport, hop.String())
+	if err != nil || conn == nil {
+		return netip.AddrPort{}, false
+	}
+	defer conn.TryClose()
+	ap, err := netip.ParseAddrPort(conn.LocalAddr().String())
+	if err != nil || ap.Port() == 0 {
+		return netip.AddrPort{}, false
+	}
+	return ap, true
 }
 
 // preferIPv4 returns the first IPv4 address (4-in-6 unmapped), else the first address.

@@ -24,6 +24,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
 	"github.com/volodymyrsmirnov/siptooth/internal/host"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip/siptest"
+	"github.com/volodymyrsmirnov/siptooth/internal/sipaddr"
 )
 
 // shortDir is a temporary directory short enough for a Unix socket path on macOS.
@@ -344,7 +345,7 @@ func TestRunReportsConfigEnvAndPassword(t *testing.T) {
 	dir := shortDir(t)
 	cfg := writeConfig(t, dir, "")
 	t.Setenv(config.PasswordVar, "")
-	checks := Run(context.Background(), Options{ConfigPath: cfg, NoNetwork: true, Identity: member,
+	checks := Run(context.Background(), Options{ConfigPath: cfg, NoNetwork: true, SkipPlatform: true, Identity: member,
 		Runner: &host.FakeRunner{Err: errors.New("inactive")}, UnitPath: filepath.Join(dir, "none.service"), Executable: "/bin/siptooth"})
 	for _, name := range []string{"config", "control_socket", "allochka_service"} {
 		if c := find(checks, name); c.Status != "ok" {
@@ -363,14 +364,14 @@ func TestRunReportsConfigEnvAndPassword(t *testing.T) {
 	// A config with a username and no password fails the password check and the config check.
 	cfg = writeConfig(t, dir, "")
 	os.WriteFile(cfg, append([]byte("sip: {username: bob, target: 'sip:x@127.0.0.1;transport=tls'}\nbluetooth: {phone_address: 'AA:BB:CC:DD:EE:FF'}\n"), nil...), 0o600)
-	checks = Run(context.Background(), Options{ConfigPath: cfg, NoNetwork: true, Identity: member, Runner: &host.FakeRunner{Err: errors.New("x")}})
+	checks = Run(context.Background(), Options{ConfigPath: cfg, NoNetwork: true, SkipPlatform: true, Identity: member, Runner: &host.FakeRunner{Err: errors.New("x")}})
 	if find(checks, "sip_password").Status != "fail" || find(checks, "config").Status != "fail" {
 		t.Errorf("%+v", checks)
 	}
 }
 
 func TestRunMissingConfigShortCircuits(t *testing.T) {
-	checks := Run(context.Background(), Options{ConfigPath: filepath.Join(shortDir(t), "config.yaml"), NoNetwork: true, Identity: member})
+	checks := Run(context.Background(), Options{ConfigPath: filepath.Join(shortDir(t), "config.yaml"), NoNetwork: true, SkipPlatform: true, Identity: member})
 	if len(checks) != 1 || checks[0].Status != "fail" || !strings.Contains(checks[0].Remedy, "doctor --fix") {
 		t.Fatalf("%+v", checks)
 	}
@@ -503,11 +504,17 @@ func TestNextHop(t *testing.T) {
 		{"sip:x@sip.example.com", "", "udp", "sip.example.com:5060"},
 		{"sip:x@sip.example.com:5070;transport=tcp", "", "tcp", "sip.example.com:5070"},
 		{"sip:x@sip.example.com", "proxy.example.com:5080", "udp", "proxy.example.com:5080"},
+		{"sip:x@192.0.2.9", "", "udp", "192.0.2.9:5060"},
+		{"sip:x@[2001:db8::1]:5060", "", "tcp", "[2001:db8::1]:5060"},
 	} {
 		cfg.SIP.Target, cfg.SIP.Proxy, cfg.SIP.Transport = c.target, c.proxy, c.transport
 		got, _, err := nextHop(cfg)
 		if err != nil || got != c.want {
 			t.Errorf("%s: %q %v, want %q", c.target, got, err, c.want)
+		}
+		// Doctor must test the address the daemon uses (both go through sipaddr).
+		if d, err := sipaddr.NextHop(cfg); err != nil || d != got {
+			t.Errorf("%s: daemon hop %q (%v) differs from doctor %q", c.target, d, err, got)
 		}
 	}
 }

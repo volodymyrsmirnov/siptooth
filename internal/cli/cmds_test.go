@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
+	"github.com/volodymyrsmirnov/siptooth/internal/control"
 	"github.com/volodymyrsmirnov/siptooth/internal/doctor"
 	"github.com/volodymyrsmirnov/siptooth/internal/host"
 )
@@ -186,6 +189,13 @@ func TestRunStartsDaemonWithPassword(t *testing.T) {
 	if code, _, errOut := runCLI("run", "--config", p); code != ExitError || !strings.Contains(errOut, "boom") {
 		t.Fatalf("exit %d: %s", code, errOut)
 	}
+	// Another daemon owns the socket: ExitUsage, so systemd does not restart-loop (exit 2).
+	daemonRun = func(context.Context, config.Config, string, *slog.Logger) error {
+		return fmt.Errorf("start: %w", control.ErrAlreadyRunning)
+	}
+	if code, _, errOut := runCLI("run", "--config", p); code != ExitUsage || !strings.Contains(errOut, "another daemon") {
+		t.Fatalf("already running: exit %d: %s", code, errOut)
+	}
 	t.Setenv(logLevelVar, "loud")
 	if code, _, errOut := runCLI("run", "--config", p); code != ExitUsage || !strings.Contains(errOut, logLevelVar) {
 		t.Fatalf("exit %d: %s", code, errOut)
@@ -231,6 +241,7 @@ func TestDoctorCommand(t *testing.T) {
 	oldOpts, oldEuid, oldID := doctorOptions, doctorEuid, doctorIdentity
 	doctorOptions = func(o doctor.Options) doctor.Options {
 		o.NoNetwork = true
+		o.SkipPlatform = true
 		o.Runner = &host.FakeRunner{Err: errors.New("inactive")}
 		o.UnitPath = filepath.Join(shortTempDir(t), "none.service")
 		return o
@@ -258,10 +269,21 @@ func TestDoctorCommand(t *testing.T) {
 	// A valid config passes; --json is machine readable.
 	good := writeTempConfig(t, "")
 	code, out, errOut = runCLI("doctor", "--json", "--config", good)
-	if !strings.Contains(out, `"name": "config"`) {
-		t.Fatalf("json: %s %s", out, errOut)
+	var report []doctor.Check
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("json does not parse: %v\n%s %s", err, out, errOut)
 	}
-	_ = code
+	if len(report) == 0 || report[0].Name != "config" || report[0].Status != "ok" {
+		t.Fatalf("json report: %+v", report)
+	}
+	// Exit status follows failures; the platform checks are skipped, so only the report decides.
+	wantCode := ExitOK
+	if doctor.HasFailures(report) {
+		wantCode = ExitError
+	}
+	if code != wantCode {
+		t.Fatalf("exit %d, want %d", code, wantCode)
+	}
 	// --fix refuses root.
 	doctorEuid = func() int { return 0 }
 	if code, _, errOut := runCLI("doctor", "--fix", "--config", cfg); code != ExitUsage || !strings.Contains(errOut, "root") {

@@ -237,8 +237,10 @@ func Validate(c Config, password string) []error {
 		}
 	}
 	if c.NAT.RTPBind != "" {
-		if _, err := netip.ParseAddr(c.NAT.RTPBind); err != nil {
+		if ip, err := netip.ParseAddr(c.NAT.RTPBind); err != nil {
 			add("nat.rtp_bind", "must be an IP address")
+		} else if ip.IsUnspecified() {
+			add("nat.rtp_bind", "must be a specific address, not 0.0.0.0 or :: (it is advertised to the far end)")
 		}
 	}
 	lo, hi := c.NAT.RTPPortMin, c.NAT.RTPPortMax

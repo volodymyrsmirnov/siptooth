@@ -37,6 +37,8 @@ type SIPClient interface {
 	Start(req sip.DialRequest) (sip.Attempt, error)
 	ResolveNextHop(ctx context.Context) (netip.AddrPort, error)
 	DiscoverContact(ctx context.Context, target string) (netip.AddrPort, bool)
+	// LocalAddr is the local SIP address far-end requests reach (sip.UA.LocalAddr).
+	LocalAddr() (netip.AddrPort, bool)
 }
 
 // ErrorSink receives system.error events (*hooks.Dispatcher).
@@ -240,7 +242,13 @@ func (a *SIPAdapter) contact(ctx context.Context, host string, dec nat.Decision)
 			}
 		}
 	}
+	// The port far-end requests reach is the UA's actual local SIP port. Only
+	// when it is not known yet (an ephemeral TCP/TLS port before the first
+	// connection) does the configured port, else 5060, stand in as a last resort.
 	port := uint16(cfg.LocalPort)
+	if ap, ok := a.d.UA.LocalAddr(); ok {
+		port = ap.Port()
+	}
 	if port == 0 {
 		port = defaultSIPPort
 	}

@@ -3,6 +3,7 @@ package daemon
 import (
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
@@ -18,6 +19,8 @@ type registrationReporter struct {
 	status    func(bridge.RegistrationStatus)
 	errors    errorSink
 	log       *slog.Logger
+
+	stopping atomic.Bool // shutdown has begun: no more system.error emissions
 
 	mu       sync.Mutex
 	reported bool // an error was emitted for the current outage
@@ -42,7 +45,7 @@ func (r *registrationReporter) onState(s sip.RegState) {
 		r.reported = false
 	} else if s.Err != nil {
 		st.Error = s.Err.Error()
-		if !r.reported {
+		if !r.reported && !r.stopping.Load() {
 			r.reported = true
 			r.log.Warn("sip: registration failed", "err", s.Err)
 			r.errors.EmitError("sip_registration", s.Err.Error())

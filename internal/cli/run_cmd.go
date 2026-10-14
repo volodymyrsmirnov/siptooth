@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
+	"github.com/volodymyrsmirnov/siptooth/internal/control"
 	"github.com/volodymyrsmirnov/siptooth/internal/daemon"
 )
 
@@ -88,6 +89,9 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	logger.Info("siptooth starting", "config", *cfgPath)
 	if err := daemonRun(ctx, cfg, password, logger); err != nil {
 		fmt.Fprintln(stderr, err)
+		if errors.Is(err, control.ErrAlreadyRunning) {
+			return ExitUsage // systemd's RestartPreventExitStatus: restarting cannot help
+		}
 		return ExitError
 	}
 	logger.Info("siptooth stopped")

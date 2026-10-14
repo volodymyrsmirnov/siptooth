@@ -48,7 +48,10 @@ type Options struct {
 	Identity   *Identity   // default: CurrentIdentity()
 	Runner     host.Runner // default: host.ExecRunner discarding output
 	NoNetwork  bool        // skip the DNS, TCP/TLS, NAT and OPTIONS checks
-	Resolver   *net.Resolver
+	// SkipPlatform omits the platform checks (bluetooth, D-Bus, /proc, linger, unit); tests set it
+	// to stay off the real system.
+	SkipPlatform bool
+	Resolver     *net.Resolver
 	// STUNServers overrides nat.stun_servers (tests point it at loopback servers).
 	STUNServers []string
 }
@@ -421,7 +424,9 @@ func Run(ctx context.Context, opts Options) []Check {
 	out = append(out, passwordCheck(cfg, password, perr, envPath))
 	out = append(out, controlSocketCheck(cfg.Control.Socket))
 	out = append(out, allochkaCheck(ctx, opts.Runner))
-	out = append(out, platformChecks(ctx, cfg, opts)...)
+	if !opts.SkipPlatform {
+		out = append(out, platformChecks(ctx, cfg, opts)...)
+	}
 	out = append(out, buildCheck())
 	if !opts.NoNetwork {
 		out = append(out, networkChecks(ctx, cfg, password, opts)...)

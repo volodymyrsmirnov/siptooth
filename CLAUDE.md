@@ -39,6 +39,7 @@ Development happens on macOS; Linux-only code (`*_linux.go`) is compiled by `mak
 | `internal/config` | config, validation, env file, embedded default `config.yaml` |
 | `internal/stun` | STUN Binding request encode/decode, query on a PacketConn |
 | `internal/nat` | local address probe, mode selection, STUN keepalive |
+| `internal/sipaddr` | next-hop rule shared by the daemon and doctor |
 | `internal/sdp` | offer/answer/re-offer, SDES crypto, redaction |
 | `internal/rtp` | RTP session (socket, latching, send), SRTP, playout, stats |
 | `internal/sip` | sipgo wrapper: UA, dial, call, server, register, contact, keepalive |
