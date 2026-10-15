@@ -19,6 +19,7 @@ const (
 type job struct {
 	event      string
 	call       CallInfo
+	sms        SMSInfo
 	errCode    string
 	errDetail  string
 	occurredAt time.Time
@@ -55,12 +56,12 @@ func (d *Dispatcher) Outstanding() int { return int(d.outstanding.Load()) }
 
 // enqueue never blocks. On overflow the event is dropped and a rate-limited warning
 // (hook_queue_full) is logged; it never triggers system.error hooks.
-func (d *Dispatcher) enqueue(j job) {
+func (d *Dispatcher) enqueue(j job) bool {
 	j.occurredAt = time.Now()
 	d.outstanding.Add(1)
 	select {
 	case d.queue <- j:
-		return
+		return true
 	default:
 	}
 	d.outstanding.Add(-1)
@@ -75,11 +76,18 @@ func (d *Dispatcher) enqueue(j job) {
 	if log {
 		d.log.Warn("hooks: queue full, dropping events", "code", "hook_queue_full", "event", j.event, "call_id", j.call.ID, "dropped", n)
 	}
+	return false
 }
 
 // Emit queues delivery of a call.* event to every subscribed hook. It never blocks.
 func (d *Dispatcher) Emit(event string, c CallInfo) {
 	d.enqueue(job{event: event, call: c.clone()})
+}
+
+// EmitSMS queues delivery of an sms.received event and reports whether the queue accepted it.
+// It never blocks.
+func (d *Dispatcher) EmitSMS(m SMSInfo) bool {
+	return d.enqueue(job{event: "sms.received", sms: m.clone()})
 }
 
 // EmitError queues a system.error delivery. It never blocks.
@@ -112,18 +120,24 @@ func contains(list []string, s string) bool {
 func (d *Dispatcher) process(ctx context.Context, j job) {
 	var payload []byte
 	var err error
-	if j.event == "system.error" {
+	switch j.event {
+	case "system.error":
 		payload, err = buildErrorPayload(j.errCode, j.errDetail, false, j.occurredAt)
-	} else {
+	case "sms.received":
+		payload, err = buildSMSPayload(j.sms, false, j.occurredAt)
+	default:
 		payload, err = buildPayload(j.event, j.call, false, j.occurredAt)
 	}
 	if err != nil {
 		d.log.Error("hooks: payload", "event", j.event, "err", err)
 		return
 	}
-	caller := ""
+	caller, smsFrom := "", ""
 	if j.call.Caller != nil {
 		caller = *j.call.Caller
+	}
+	if j.sms.From != nil {
+		smsFrom = *j.sms.From
 	}
 	for _, h := range d.hooks {
 		if !contains(h.Events, j.event) {
@@ -136,7 +150,13 @@ func (d *Dispatcher) process(ctx context.Context, j job) {
 		if timeout > maxHookTimeout {
 			timeout = maxHookTimeout
 		}
-		res := Run(ctx, h.Command, timeout, payload, Env(j.event, j.call.ID, caller))
+		res := Run(ctx, h.Command, timeout, payload, Env(j.event, j.call.ID, caller, smsFrom))
+		if j.event == "sms.received" {
+			// The streams may echo the message: log only exit status and sizes (spec 17.9).
+			d.log.Info("hooks: finished", "hook", h.ID, "event", j.event, "sms_id", j.sms.ID, "exit", res.ExitCode,
+				"timed_out", res.TimedOut, "stdout_bytes", res.StdoutBytes, "stderr_bytes", res.StderrBytes)
+			continue
+		}
 		d.log.Info("hooks: finished", "hook", h.ID, "event", j.event, "call_id", j.call.ID, "exit", res.ExitCode,
 			"timed_out", res.TimedOut, "stdout", res.Stdout, "stderr", res.Stderr, "truncated", res.Truncated)
 	}

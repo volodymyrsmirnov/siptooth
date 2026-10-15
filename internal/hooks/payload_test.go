@@ -85,3 +85,13 @@ func TestBuildPayloadIsUTC(t *testing.T) {
 		t.Fatalf("%s %v", b, err)
 	}
 }
+
+func TestPayloadSMS(t *testing.T) {
+	from, name := "+380501234567", "Jane Doe"
+	m := SMSInfo{ID: "20261014T094331Z-7c1e", From: &from, FromName: &name, Text: "Hello", Type: "SMS_GSM", Handle: "0400000000000012"}
+	b, err := buildSMSPayload(m, false, at)
+	check(t, b, err, `{"schema_version":1,"event":"sms.received","occurred_at":"2026-10-14T09:43:31Z","test":false,"sms":{"id":"20261014T094331Z-7c1e","from":"+380501234567","from_name":"Jane Doe","text":"Hello","type":"SMS_GSM","handle":"0400000000000012"}}`)
+	m.From, m.FromName = nil, nil
+	b, err = buildSMSPayload(m, true, at)
+	check(t, b, err, `{"schema_version":1,"event":"sms.received","occurred_at":"2026-10-14T09:43:31Z","test":true,"sms":{"id":"20261014T094331Z-7c1e","from":null,"from_name":null,"text":"Hello","type":"SMS_GSM","handle":"0400000000000012"}}`)
+}

@@ -290,3 +290,25 @@ func TestDoctorCommand(t *testing.T) {
 		t.Fatalf("root: %d %s", code, errOut)
 	}
 }
+
+func TestHooksTestSMSSample(t *testing.T) {
+	dir := shortTempDir(t)
+	got := filepath.Join(dir, "sms.json")
+	p := writeTempConfig(t, validConfigBody+"hooks:\n  - {id: s, events: [sms.received], command: 'cat > "+got+"; echo \"from=$SIPTOOTH_SMS_FROM call=[$SIPTOOTH_CALL_ID]\"'}\n")
+	code, out, errOut := runCLI("hooks", "test", "--event", "sms.received", "--config", p)
+	if code != ExitOK {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	b, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"event":"sms.received"`, `"test":true`, `"from":"+380501234567"`, `"from_name":"Test Sender"`, `"text":"Test message from siptooth"`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("payload lacks %s: %s", want, b)
+		}
+	}
+	if !strings.Contains(out, "from=+380501234567 call=[]") {
+		t.Fatalf("hook output not printed: %s", out)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -106,4 +107,70 @@ func TestOutstandingCoversQueuedAndInFlight(t *testing.T) {
 		t.Fatalf("one in flight: pending %d outstanding %d", d.Pending(), d.Outstanding())
 	}
 	waitFor(t, func() bool { return d.Outstanding() == 0 })
+}
+
+func TestEmitSMSAcceptance(t *testing.T) {
+	d := NewDispatcher(nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))
+	for i := 0; i < 100; i++ {
+		if !d.EmitSMS(SMSInfo{ID: "x"}) {
+			t.Fatal("rejected with room in the queue")
+		}
+	}
+	if d.EmitSMS(SMSInfo{ID: "x"}) {
+		t.Fatal("accepted on a full queue")
+	}
+}
+
+type syncBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestSMSHookOutputNeverLogged(t *testing.T) {
+	const secret = "SECRETSMSTEXT"
+	from := "+380501234567"
+	for name, cmd := range map[string]string{
+		"echo":  "tee /dev/stderr",
+		"large": "cat; head -c 10000 /dev/zero | tr '\\0' x",
+	} {
+		t.Run(name, func(t *testing.T) {
+			var logs syncBuf
+			d := NewDispatcher([]config.Hook{{ID: "h", Events: []string{"sms.received"}, Command: cmd, TimeoutSeconds: 5}},
+				slog.New(slog.NewTextHandler(&logs, nil)))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go d.Run(ctx)
+			if !d.EmitSMS(SMSInfo{ID: "sms-1", From: &from, Text: secret, Type: "SMS_GSM", Handle: "h1"}) {
+				t.Fatal("rejected")
+			}
+			waitFor(t, func() bool { return strings.Contains(logs.String(), "hooks: finished") })
+			out := logs.String()
+			if strings.Contains(out, secret) {
+				t.Fatalf("message text logged: %s", out)
+			}
+			for _, want := range []string{"sms_id=sms-1", "exit=0", "timed_out=false", "stdout_bytes=", "stderr_bytes="} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("log lacks %s: %s", want, out)
+				}
+			}
+			if strings.Contains(out, " stdout=") || strings.Contains(out, " stderr=") {
+				t.Fatalf("streams logged: %s", out)
+			}
+			if name == "large" && !strings.Contains(out, "stdout_bytes=10") {
+				t.Fatalf("byte counts: %s", out)
+			}
+		})
+	}
 }

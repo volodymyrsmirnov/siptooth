@@ -53,9 +53,16 @@ func runHooks(args []string, stdout, stderr io.Writer) int {
 		return ExitError
 	}
 	var payload []byte
-	if *event == "system.error" {
+	smsFrom := ""
+	switch *event {
+	case "system.error":
 		payload, err = hooks.BuildErrorPayload("test", "hooks test: sample system.error", true)
-	} else {
+	case "sms.received":
+		from, name := "+380501234567", "Test Sender"
+		smsFrom = from
+		payload, err = hooks.BuildSMSPayload(hooks.SMSInfo{ID: "test-sms", Handle: "0400000000000001", Type: "SMS_GSM",
+			Text: "Test message from siptooth", From: &from, FromName: &name}, true)
+	default:
 		payload, err = hooks.BuildPayload(*event, sampleCall(), true)
 	}
 	if err != nil {
@@ -63,7 +70,7 @@ func runHooks(args []string, stdout, stderr io.Writer) int {
 		return ExitError
 	}
 	callID, caller := "test-call", "+15551234567"
-	if *event == "system.error" {
+	if *event == "system.error" || *event == "sms.received" {
 		callID, caller = "", ""
 	}
 	code := ExitOK
@@ -74,7 +81,7 @@ func runHooks(args []string, stdout, stderr io.Writer) int {
 		}
 		matched++
 		fmt.Fprintf(stdout, "hook %s, event %s, command: %s\npayload:\n%s", h.ID, *event, h.Command, payload)
-		res := hooks.Run(context.Background(), h.Command, time.Duration(h.TimeoutSeconds)*time.Second, payload, hooks.Env(*event, callID, caller))
+		res := hooks.Run(context.Background(), h.Command, time.Duration(h.TimeoutSeconds)*time.Second, payload, hooks.Env(*event, callID, caller, smsFrom))
 		fmt.Fprintf(stdout, "exit code %d, timed out %v, duration %s\n--- stdout ---\n%s\n--- stderr ---\n%s\n",
 			res.ExitCode, res.TimedOut, res.FinishedAt.Sub(res.StartedAt).Round(time.Millisecond), res.Stdout, res.Stderr)
 		if res.ExitCode != 0 || res.TimedOut {

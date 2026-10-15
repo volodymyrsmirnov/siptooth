@@ -171,3 +171,48 @@ func marshalLine(v any) ([]byte, error) {
 	}
 	return append(b, '\n'), nil
 }
+
+// SMSInfo describes a forwarded SMS (spec 17.9). From and FromName are nil when unknown.
+type SMSInfo struct {
+	ID, Handle, Type, Text string
+	From, FromName         *string
+}
+
+type smsView struct {
+	ID       string  `json:"id"`
+	From     *string `json:"from"`
+	FromName *string `json:"from_name"`
+	Text     string  `json:"text"`
+	Type     string  `json:"type"`
+	Handle   string  `json:"handle"`
+}
+
+type smsEnvelope struct {
+	SchemaVersion int       `json:"schema_version"`
+	Event         string    `json:"event"`
+	OccurredAt    time.Time `json:"occurred_at"`
+	Test          bool      `json:"test"`
+	SMS           smsView   `json:"sms"`
+}
+
+// BuildSMSPayload renders the sms.received payload (newline terminated).
+func BuildSMSPayload(m SMSInfo, test bool) ([]byte, error) {
+	return buildSMSPayload(m, test, time.Now())
+}
+
+func buildSMSPayload(m SMSInfo, test bool, at time.Time) ([]byte, error) {
+	return marshalLine(smsEnvelope{SchemaVersion: SchemaVersion, Event: "sms.received", OccurredAt: at.UTC().Truncate(time.Second),
+		Test: test, SMS: smsView{ID: m.ID, From: m.From, FromName: m.FromName, Text: m.Text, Type: m.Type, Handle: m.Handle}})
+}
+
+func (m SMSInfo) clone() SMSInfo {
+	if m.From != nil {
+		v := *m.From
+		m.From = &v
+	}
+	if m.FromName != nil {
+		v := *m.FromName
+		m.FromName = &v
+	}
+	return m
+}
