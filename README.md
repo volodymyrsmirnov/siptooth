@@ -55,4 +55,8 @@ All commands that read the configuration accept `--config PATH` (default `~/.sip
 - Hooks: `docs/hooks.md`
 - Providers (ElevenLabs, Zadarma, generic PBX) and the M1 checklist: `docs/providers.md`
 - Design: `docs/superpowers/specs/2026-10-14-siptooth-design.md`
-- Plan: `docs/superpowers/plans/2026-10-14-siptooth.md`
+- Plans (historical): `docs/superpowers/plans/2026-10-14-siptooth.md`, `docs/superpowers/plans/2026-10-14-siptooth-sms.md`
+
+## License
+
+MIT, see `LICENSE`.
