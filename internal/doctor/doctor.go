@@ -364,6 +364,36 @@ func competingHandlersCheck(procDir string) Check {
 	return ok("competing_handlers", "none running")
 }
 
+// smsHooksCheck warns when SMS forwarding is on but no hook subscribes to sms.received (spec 17.10).
+func smsHooksCheck(cfg config.Config) Check {
+	if !cfg.SMS.Enabled {
+		return skip("sms_hooks", "sms.enabled is false")
+	}
+	for _, h := range cfg.Hooks {
+		if slices.Contains(h.Events, "sms.received") {
+			return ok("sms_hooks", "hook "+h.ID+" listens for sms.received")
+		}
+	}
+	return warn("sms_hooks", "no hook listens for sms.received; forwarded messages go nowhere",
+		"add a hook with events: [sms.received] (docs/hooks.md)")
+}
+
+// smsObexdCheck warns when an obexd process runs while SMS forwarding is on: it may hold the MNS
+// channel (spec 17.10). It scans procDir/*/comm (procDir is /proc in production).
+func smsObexdCheck(cfg config.Config, procDir string) Check {
+	if !cfg.SMS.Enabled {
+		return skip("sms_obexd", "sms.enabled is false")
+	}
+	matches, _ := filepath.Glob(filepath.Join(procDir, "[0-9]*", "comm"))
+	for _, p := range matches {
+		if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) == "obexd" {
+			return warn("sms_obexd", "obexd is running",
+				"it may hold the MNS channel (the phone then never opens the notification channel; `journalctl -u bluetooth` has the cause); stop it, e.g. `systemctl --user disable --now obex`")
+		}
+	}
+	return ok("sms_obexd", "obexd not running")
+}
+
 func (o *Options) fill() {
 	if o.UnitPath == "" {
 		home, _ := os.UserHomeDir()
@@ -424,6 +454,7 @@ func Run(ctx context.Context, opts Options) []Check {
 	out = append(out, passwordCheck(cfg, password, perr, envPath))
 	out = append(out, controlSocketCheck(cfg.Control.Socket))
 	out = append(out, allochkaCheck(ctx, opts.Runner))
+	out = append(out, smsHooksCheck(cfg))
 	if !opts.SkipPlatform {
 		out = append(out, platformChecks(ctx, cfg, opts)...)
 	}

@@ -20,6 +20,7 @@ func platformChecks(ctx context.Context, cfg config.Config, opts Options) []Chec
 	out = append(out, bluetoothdCheck(ctx))
 	out = append(out, adapterChecks(ctx, cfg)...)
 	out = append(out, competingHandlersCheck("/proc"))
+	out = append(out, smsObexdCheck(cfg, "/proc"))
 	unit, execDropIns, err := readUnit(opts.UnitPath)
 	out = append(out, serviceUnitCheck(opts.UnitPath, unit, err, execDropIns, opts.Executable, opts.ConfigPath))
 	out = append(out, lingerCheck(opts.LingerDir, opts.Identity.Username))

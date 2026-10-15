@@ -12,7 +12,7 @@ import (
 func platformChecks(ctx context.Context, cfg config.Config, opts Options) []Check {
 	var out []Check
 	for _, name := range []string{"bluetooth_group", "bluetoothd",
-		"adapter", "adapter_powered", "phone_bonded", "sco_routing", "competing_handlers", "service_unit", "linger"} {
+		"adapter", "adapter_powered", "phone_bonded", "sco_routing", "competing_handlers", "sms_obexd", "service_unit", "linger"} {
 		out = append(out, skip(name, "linux only"))
 	}
 	return out

@@ -587,3 +587,40 @@ func TestFixNeverRunsUsermod(t *testing.T) {
 		t.Fatalf("%s", out.String())
 	}
 }
+
+func TestSMSHooksCheck(t *testing.T) {
+	var cfg config.Config
+	if c := smsHooksCheck(cfg); c.Status != "skip" {
+		t.Fatalf("disabled: %+v", c)
+	}
+	cfg.SMS.Enabled = true
+	cfg.Hooks = []config.Hook{{ID: "calls", Events: []string{"call.ended"}}}
+	if c := smsHooksCheck(cfg); c.Status != "warn" || c.Remedy == "" {
+		t.Fatalf("no subscriber: %+v", c)
+	}
+	cfg.Hooks = append(cfg.Hooks, config.Hook{ID: "sms", Events: []string{"sms.received"}})
+	if c := smsHooksCheck(cfg); c.Status != "ok" {
+		t.Fatalf("subscriber: %+v", c)
+	}
+}
+
+func TestSMSObexdCheck(t *testing.T) {
+	proc := t.TempDir()
+	write := func(pid, comm string) {
+		os.MkdirAll(filepath.Join(proc, pid), 0o755)
+		os.WriteFile(filepath.Join(proc, pid, "comm"), []byte(comm+"\n"), 0o644)
+	}
+	write("1", "systemd")
+	write("2", "obexd")
+	var cfg config.Config
+	if c := smsObexdCheck(cfg, proc); c.Status != "skip" {
+		t.Fatalf("disabled: %+v", c)
+	}
+	cfg.SMS.Enabled = true
+	if c := smsObexdCheck(cfg, proc); c.Status != "warn" || c.Remedy == "" {
+		t.Fatalf("running: %+v", c)
+	}
+	if c := smsObexdCheck(cfg, t.TempDir()); c.Status != "ok" {
+		t.Fatalf("absent: %+v", c)
+	}
+}
