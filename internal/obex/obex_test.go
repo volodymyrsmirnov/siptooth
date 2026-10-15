@@ -199,3 +199,10 @@ func TestAppParams(t *testing.T) {
 		}
 	}
 }
+
+func TestParseResponseBareConnectRefusal(t *testing.T) {
+	p, err := ParseResponse([]byte{0xC3, 0x00, 0x03}, true)
+	if err != nil || p.Code != RespForbidden || p.Connect != nil {
+		t.Fatalf("got %+v, %v", p, err)
+	}
+}
