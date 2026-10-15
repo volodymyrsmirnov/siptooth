@@ -12,13 +12,17 @@ import (
 )
 
 const (
-	HFPHFUUID                   = "0000111e-0000-1000-8000-00805f9b34fb" // local HF profile (RegisterProfile)
-	HFPAGUUID                   = "0000111f-0000-1000-8000-00805f9b34fb" // remote AG service (ConnectProfile)
+	HFPHFUUID = "0000111e-0000-1000-8000-00805f9b34fb" // local HF profile (RegisterProfile)
+	HFPAGUUID = "0000111f-0000-1000-8000-00805f9b34fb" // remote AG service (ConnectProfile)
+	// MNSUUID is the Message Notification Server profile the phone's MSE connects back to (spec 17.8).
+	MNSUUID                     = "00001133-0000-1000-8000-00805f9b34fb"
+	mnsChannel                  = 16 // BlueZ's MNS default RFCOMM channel; obexd is not running
 	ManufacturerBroadcom uint16 = 15
 	profilePath                 = "/com/siptooth/hfp"
 	agentPath                   = "/com/siptooth/agent"
-	profileName                 = "Siptooth" // HFP profile Name in RegisterProfile
-	pairAlias                   = "siptooth" // adapter alias shown to the phone while pairing
+	mnsProfilePath              = "/com/siptooth/mns" // MAP MNS profile (spec 17.8)
+	profileName                 = "Siptooth"          // HFP profile Name in RegisterProfile
+	pairAlias                   = "siptooth"          // adapter alias shown to the phone while pairing
 )
 
 var ErrUnsupported = errors.New("bluez: not supported on this platform")
@@ -26,7 +30,11 @@ var ErrUnsupported = errors.New("bluez: not supported on this platform")
 // AlreadyRegistered reports a RegisterProfile error saying the profile is registered already,
 // for example by an earlier attempt that timed out on our side but completed in bluetoothd.
 func AlreadyRegistered(err error) bool {
-	const name = "org.bluez.Error.AlreadyExists"
+	return dbusErrorNamed(err, "org.bluez.Error.AlreadyExists")
+}
+
+// dbusErrorNamed reports whether err is the D-Bus error reply called name.
+func dbusErrorNamed(err error, name string) bool {
 	var pe *dbus.Error // what godbus returns for an error reply
 	if errors.As(err, &pe) {
 		return pe != nil && pe.Name == name
@@ -157,4 +165,31 @@ func AdapterIndexFromName(name string) (int, error) {
 		return 0, fmt.Errorf("adapter name %q must look like hci0", name)
 	}
 	return strconv.Atoi(strings.TrimPrefix(name, "hci"))
+}
+
+// mnsServiceRecord is the MNS SDP record of spec 17.8: MAP Notification Server (0x1133) on RFCOMM
+// channel 16, profile descriptor MAP 1.1 (0x1134, 0x0101). Keep the channel in sync with mnsChannel.
+const mnsServiceRecord = `<?xml version="1.0" encoding="UTF-8" ?>
+<record>
+  <attribute id="0x0001"><sequence><uuid value="0x1133"/></sequence></attribute>
+  <attribute id="0x0004"><sequence>
+    <sequence><uuid value="0x0100"/></sequence>
+    <sequence><uuid value="0x0003"/><uint8 value="0x10"/></sequence>
+    <sequence><uuid value="0x0008"/></sequence>
+  </sequence></attribute>
+  <attribute id="0x0005"><sequence><uuid value="0x1002"/></sequence></attribute>
+  <attribute id="0x0009"><sequence><sequence><uuid value="0x1134"/><uint16 value="0x0101"/></sequence></sequence></attribute>
+  <attribute id="0x0100"><text value="Siptooth MNS"/></attribute>
+</record>`
+
+// MNSProfileOptions returns the RegisterProfile options of the MNS profile (spec 17.8). Plain Go
+// values, converted to D-Bus variants by the Linux manager.
+func MNSProfileOptions() map[string]any {
+	return map[string]any{
+		"Role":                  "server",
+		"Channel":               uint16(mnsChannel),
+		"RequireAuthentication": true,
+		"RequireAuthorization":  false,
+		"ServiceRecord":         mnsServiceRecord,
+	}
 }

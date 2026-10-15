@@ -178,15 +178,17 @@ func (m *Manager) Powered() (bool, error) {
 
 // --- Profile1 ---
 
+// profileObject serves one Profile1 registration (HFP or MNS); label names it in logs.
 type profileObject struct {
-	m *Manager
-	h ProfileHandler
+	m     *Manager
+	h     ProfileHandler
+	label string
 }
 
 // Release is bluetoothd telling us the profile is gone (it is shutting down or we were unregistered):
 // tear down the live connection like a disconnect so the coordinator sees Disconnected.
 func (p *profileObject) Release() *dbus.Error {
-	p.m.log.Info("bluez: profile released")
+	p.m.log.Info("bluez: profile released", "profile", p.label)
 	p.h.Disconnected(string(p.m.phonePath))
 	return nil
 }
@@ -194,7 +196,7 @@ func (p *profileObject) Release() *dbus.Error {
 func (p *profileObject) NewConnection(device dbus.ObjectPath, fd dbus.UnixFD, props map[string]dbus.Variant) *dbus.Error {
 	if p.m.phonePath != "" && device != p.m.phonePath {
 		unix.Close(int(fd))
-		p.m.log.Warn("bluez: rejected HFP connection from unexpected device", "device", device)
+		p.m.log.Warn("bluez: rejected "+p.label+" connection from unexpected device", "device", device)
 		return dbus.MakeFailedError(fmt.Errorf("unexpected device %s", device))
 	}
 	if err := unix.SetNonblock(int(fd), true); err != nil {
@@ -209,6 +211,8 @@ func (p *profileObject) NewConnection(device dbus.ObjectPath, fd dbus.UnixFD, pr
 	return nil
 }
 
+// RequestDisconnection calls the handler synchronously, before the D-Bus reply: the MNS handler
+// closes its descriptor inside Disconnected (spec 17.8).
 func (p *profileObject) RequestDisconnection(device dbus.ObjectPath) *dbus.Error {
 	p.h.Disconnected(string(device))
 	return nil
@@ -216,7 +220,7 @@ func (p *profileObject) RequestDisconnection(device dbus.ObjectPath) *dbus.Error
 
 // RegisterProfile exports Profile1 and registers the HFP HF record with bluetoothd.
 func (m *Manager) RegisterProfile(ctx context.Context, h ProfileHandler) error {
-	p := &profileObject{m: m, h: h}
+	p := &profileObject{m: m, h: h, label: "HFP"}
 	if err := m.conn.Export(p, profilePath, profileIface); err != nil {
 		return fmt.Errorf("export profile: %w", err)
 	}
@@ -232,6 +236,38 @@ func (m *Manager) RegisterProfile(ctx context.Context, h ProfileHandler) error {
 		return fmt.Errorf("RegisterProfile: %w", call.Err)
 	}
 	m.log.Info("bluez: HFP HF profile registered", "path", profilePath)
+	return nil
+}
+
+// RegisterMNSProfile exports the MNS Profile1 object and registers the MAP notification record
+// with bluetoothd (spec 17.8). AlreadyExists counts as success. A successful call does not prove
+// the RFCOMM listener exists: BlueZ creates it afterwards and only logs a failure.
+func (m *Manager) RegisterMNSProfile(ctx context.Context, h ProfileHandler) error {
+	p := &profileObject{m: m, h: h, label: "MNS"}
+	if err := m.conn.Export(p, mnsProfilePath, profileIface); err != nil {
+		return fmt.Errorf("export MNS profile: %w", err)
+	}
+	raw := MNSProfileOptions()
+	opts := make(map[string]dbus.Variant, len(raw))
+	for k, v := range raw {
+		opts[k] = dbus.MakeVariant(v)
+	}
+	call := m.obj("/org/bluez").CallWithContext(ctx, profileMgrIface+".RegisterProfile", 0, dbus.ObjectPath(mnsProfilePath), MNSUUID, opts)
+	if call.Err != nil && !AlreadyRegistered(call.Err) {
+		return fmt.Errorf("RegisterProfile (MNS): %w", call.Err)
+	}
+	m.log.Info("bluez: MNS profile registered", "path", mnsProfilePath)
+	return nil
+}
+
+// UnregisterMNSProfile removes the MNS registration and unexports the object. DoesNotExist
+// (never registered, or bluetoothd restarted) counts as success.
+func (m *Manager) UnregisterMNSProfile(ctx context.Context) error {
+	call := m.obj("/org/bluez").CallWithContext(ctx, profileMgrIface+".UnregisterProfile", 0, dbus.ObjectPath(mnsProfilePath))
+	m.conn.Export(nil, mnsProfilePath, profileIface)
+	if call.Err != nil && !dbusErrorNamed(call.Err, "org.bluez.Error.DoesNotExist") {
+		return fmt.Errorf("UnregisterProfile (MNS): %w", call.Err)
+	}
 	return nil
 }
 

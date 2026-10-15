@@ -1,9 +1,12 @@
 package bluez
 
 import (
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -98,12 +101,75 @@ func TestAlreadyRegistered(t *testing.T) {
 
 func TestProfilePathsAreSiptooth(t *testing.T) {
 	for name, v := range map[string]string{
-		"profilePath": profilePath, "agentPath": agentPath,
+		"profilePath": profilePath, "mnsProfilePath": mnsProfilePath, "agentPath": agentPath,
 		"profileName": profileName, "pairAlias": pairAlias,
 	} {
 		l := strings.ToLower(v)
 		if !strings.Contains(l, "siptooth") || strings.Contains(l, "allochka") {
 			t.Errorf("%s = %q", name, v)
 		}
+	}
+}
+
+func TestMNSProfileOptions(t *testing.T) {
+	o := MNSProfileOptions()
+	if len(o) != 5 {
+		t.Fatalf("unexpected option set: %v", o)
+	}
+	want := map[string]any{"Role": "server", "Channel": uint16(16), "RequireAuthentication": true, "RequireAuthorization": false}
+	for k, v := range want {
+		if o[k] != v {
+			t.Errorf("%s = %#v, want %#v", k, o[k], v)
+		}
+	}
+	if MNSUUID != "00001133-0000-1000-8000-00805f9b34fb" {
+		t.Fatal(MNSUUID)
+	}
+	rec, ok := o["ServiceRecord"].(string)
+	if !ok {
+		t.Fatalf("ServiceRecord: %T", o["ServiceRecord"])
+	}
+	// The XML must parse and name the same RFCOMM channel as the Channel option.
+	type attr struct {
+		ID   string `xml:"id,attr"`
+		Body string `xml:",innerxml"`
+	}
+	var doc struct {
+		Attrs []attr `xml:"attribute"`
+	}
+	if err := xml.Unmarshal([]byte(rec), &doc); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]string{}
+	for _, a := range doc.Attrs {
+		byID[a.ID] = a.Body
+	}
+	for _, id := range []string{"0x0001", "0x0004", "0x0005", "0x0009", "0x0100"} {
+		if byID[id] == "" {
+			t.Errorf("attribute %s missing", id)
+		}
+	}
+	if !strings.Contains(byID["0x0001"], `value="0x1133"`) || !strings.Contains(byID["0x0009"], `value="0x1134"`) ||
+		!strings.Contains(byID["0x0009"], `value="0x0101"`) || !strings.Contains(byID["0x0100"], "Siptooth MNS") {
+		t.Errorf("record content: %v", byID)
+	}
+	m := regexp.MustCompile(`<uuid value="0x0003"/><uint8 value="(0x[0-9a-f]+)"/>`).FindStringSubmatch(byID["0x0004"])
+	if m == nil {
+		t.Fatalf("no RFCOMM channel in %s", byID["0x0004"])
+	}
+	ch, err := strconv.ParseUint(m[1], 0, 8)
+	if err != nil || uint16(ch) != o["Channel"] {
+		t.Fatalf("record channel %v vs Channel option %v", m[1], o["Channel"])
+	}
+}
+
+func TestDBusErrorNamed(t *testing.T) {
+	const n = "org.bluez.Error.DoesNotExist"
+	e := dbus.NewError(n, nil) // *dbus.Error, as godbus returns it
+	if !dbusErrorNamed(e, n) || !dbusErrorNamed(*e, n) || !dbusErrorNamed(fmt.Errorf("wrapped: %w", e), n) {
+		t.Fatal("error not recognised")
+	}
+	if dbusErrorNamed(errors.New("x"), n) || dbusErrorNamed(nil, n) || dbusErrorNamed(dbus.NewError("other", nil), n) {
+		t.Fatal("false positive")
 	}
 }
