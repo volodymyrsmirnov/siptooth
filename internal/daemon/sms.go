@@ -146,6 +146,11 @@ const (
 	mnsReregister         // unregister, then register
 )
 
+// errUnregister marks a reregister that failed at its unregister step; the retry then repeats
+// the whole reregister (a plain register would map AlreadyExists to success and leave the
+// stale registration in place).
+var errUnregister = errors.New("unregister MNS profile")
+
 type mnsResult struct {
 	gen  uint64
 	kind mnsKind
@@ -167,6 +172,7 @@ type mnsRegistrar struct {
 
 	res     chan mnsResult
 	retry   <-chan time.Time
+	retryAs mnsKind // the kind the next retry runs
 	gen     uint64
 	busy    bool
 	pending mnsKind
@@ -185,7 +191,13 @@ func (r *mnsRegistrar) Results() <-chan mnsResult { return r.res }
 func (r *mnsRegistrar) Retry() <-chan time.Time { return r.retry }
 
 // RetryDue starts the retry registration.
-func (r *mnsRegistrar) RetryDue() { r.Request(mnsRegister) }
+func (r *mnsRegistrar) RetryDue() {
+	kind := r.retryAs
+	if kind == 0 {
+		kind = mnsRegister
+	}
+	r.Request(kind)
+}
 
 // Invalidate discards the result of the worker in flight (call before requesting a fresh
 // registration after bluetoothd restarted).
@@ -234,6 +246,10 @@ func (r *mnsRegistrar) Handle(res mnsResult) {
 	if res.err != nil {
 		r.log.Warn("bluetooth: MNS profile registration failed, retrying in 10 s", "err", res.err)
 		r.report(res.err)
+		r.retryAs = mnsRegister
+		if res.kind == mnsReregister && errors.Is(res.err, errUnregister) {
+			r.retryAs = mnsReregister
+		}
 		r.retry = time.After(r.retryEvery)
 		return
 	}

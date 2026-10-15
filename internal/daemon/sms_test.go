@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -221,6 +222,35 @@ func TestRegistrarSuccessClearsError(t *testing.T) {
 	if len(h.link.regErrs) != 2 || h.link.regErrs[0] == nil || h.link.regErrs[1] != nil || h.r.Retry() != nil {
 		t.Fatalf("regErrs = %v", h.link.regErrs)
 	}
+}
+
+func TestRegistrarRetriesFailedUnregisterAsReregister(t *testing.T) {
+	h := newHarness(t)
+	h.errs <- fmt.Errorf("%w: busy", errUnregister)
+	h.gate <- struct{}{}
+	h.r.Request(mnsReregister)
+	<-h.calls
+	h.next(t)
+	<-h.r.Retry()
+	h.gate <- struct{}{}
+	h.r.RetryDue()
+	if k := <-h.calls; k != mnsReregister {
+		t.Fatalf("retry ran %v, want reregister", k)
+	}
+	h.next(t)
+	// A plain failure (or a failed register step) retries as a register.
+	h.errs <- errors.New("register failed")
+	h.gate <- struct{}{}
+	h.r.Request(mnsReregister)
+	<-h.calls
+	h.next(t)
+	<-h.r.Retry()
+	h.gate <- struct{}{}
+	h.r.RetryDue()
+	if k := <-h.calls; k != mnsRegister {
+		t.Fatalf("retry ran %v, want register", k)
+	}
+	h.next(t)
 }
 
 func TestRegistrarMergesRequestsWhileBusy(t *testing.T) {

@@ -5,6 +5,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -274,6 +275,7 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 			if kind == mnsReregister {
 				if err := m.UnregisterMNSProfile(rctx); err != nil {
 					logger.Warn("bluetooth: MNS profile unregister", "err", err)
+					return fmt.Errorf("%w: %w", errUnregister, err)
 				}
 			}
 			return m.RegisterMNSProfile(rctx, mnsH)
@@ -303,6 +305,9 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 	}()
 	defer func() {
 		h.Disconnected("") // shutdown: release the phone link before the bus connection closes
+		if smsb != nil {
+			smsb.link.MNSDisconnected()
+		}
 		cancel()
 		bg.Wait()
 	}()
@@ -353,6 +358,9 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 			logger.Error("bluetooth: system bus connection lost, reconnecting in 10 s")
 			d.EmitError("bluetooth_unavailable", "system bus connection lost")
 			coord.SetAudioRouting(false)
+			if smsb != nil {
+				smsb.link.SetRegistrationError(errors.New("system bus connection lost"))
+			}
 			return true
 		case <-routingRetry:
 			if !cycling { // powerOn runs routing itself
