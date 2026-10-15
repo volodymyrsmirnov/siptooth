@@ -112,6 +112,32 @@ siptooth relies on the far end latching onto the source address of the first RTP
 
 With `sip.register: true` (needs `sip.username`; used for Zadarma) siptooth REGISTERs, refreshes at half of `sip.register_expires_seconds`, keeps the flow open with CRLF keepalives, and unregisters on shutdown. The Contact used in INVITEs is the flow address seen by the registrar. `siptooth status` shows `registration: registered=yes contact=... expires=...` or the last error; a failure emits `system.error` code `sip_registration` once per outage. Without registration, siptooth learns its signalling address with an OPTIONS on the INVITE's connection before each call.
 
+## SMS forwarding
+
+Off by default. With `sms.enabled: true` (restart the service after editing) siptooth reads incoming text messages from the phone over Bluetooth MAP (the Message Access Profile) and hands each one to the `sms.received` hooks (`docs/hooks.md`). Nothing else is done with the text: siptooth does not store it, send it anywhere or log it. Add a hook with `events: [sms.received]`, for example `config/hooks/sms-log.sh`; `siptooth doctor` warns `sms_hooks` when none exists.
+
+**On the phone.** The first connection makes Android ask whether the Pi may access messages; answer Allow (tick "Always allow" if offered). If you missed the prompt, enable it under Settings -> Connected devices -> (the Pi, "siptooth") -> Text messages (the exact path varies by vendor). siptooth waits up to 40 s for the answer and retries with a growing delay.
+
+**Status.** `siptooth status` shows:
+
+```
+sms:             ready, notifications yes, 3 received
+```
+
+The state is `disabled`, `waiting` (no phone connected), `connecting`, `ready` (message access granted and the phone opened its notification channel) or `retrying` (the last attempt failed; the next one is scheduled). `received` counts messages the hook dispatcher accepted since the daemon started. After a failure a second line `sms error:       ...` shows the last error until the next `ready`. With SMS off it says `sms:             disabled`. `siptooth status --json` has the same data under `sms`. A failure never affects calls.
+
+Logs: `sms received` lines (`sms_id`, `from`, `type`, `text_chars`), state changes, and failed attempts with the next retry delay (`journalctl --user-unit siptooth | grep -i sms`).
+
+Limits: incoming SMS only, no sending; MMS, RCS chats and group messages are not forwarded; a message that arrives while there is no message session (phone disconnected, the hourly power cycle, a failed attempt) is lost, not replayed.
+
+| Symptom | Check |
+| --- | --- |
+| State stays `retrying` or `connecting`, `sms error` mentions the permission or an OBEX refusal | Allow message access for siptooth on the phone (see above). The journal also logs the hint "allow message access for siptooth on the phone". |
+| State `ready` but no messages arrive | Only SMS in the inbox arrive; RCS chats ("chat features" in Google Messages) and MMS never do. Switch the conversation to SMS to check. |
+| `sms error: phone did not open the notification channel` | The phone connects back to siptooth's notification profile. After two such failures the daemon re-registers the profile itself (at most every 10 minutes). If it persists look at `journalctl -u bluetooth` (needs an administrator): BlueZ logs a failed listener there, for example the RFCOMM channel is already taken. `siptooth doctor` warns `sms_obexd` when an `obexd` process runs; stop it (`systemctl --user disable --now obex`), it can hold the channel. |
+| `system.error` `sms_unavailable` | The message channel has not been up for 5 minutes while the phone is connected; the detail is the last error. See the rows above. |
+| `sms error` shows a Bluetooth profile registration error | BlueZ refused the notification profile; check `bluetoothd` is running and that no other program registers MAP. Registration is retried every 10 s and never affects HFP. |
+
 ## Power cycle
 
 Every `bluetooth.power_cycle_minutes` (default 60; `0` = off, otherwise 10..1440) while no call is in progress, siptooth powers the adapter off and on and the phone reconnects by itself. This works around a controller that gets stuck after a long time connected.

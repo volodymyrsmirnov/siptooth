@@ -37,6 +37,9 @@ Development happens on macOS; Linux-only code (`*_linux.go`) is compiled by `mak
 | `internal/g711` | mu-law, A-law, `Codec` type |
 | `internal/placeholder` | template expansion with component-aware escaping |
 | `internal/config` | config, validation, env file, embedded default `config.yaml` |
+| `internal/btsdp` | SDP over L2CAP (MAS record lookup), RFCOMM dial to the phone's MAS (linux sockets behind `_other.go` stubs) |
+| `internal/obex` | OBEX packet codec, stream framing, client and put server (the MAP subset) |
+| `internal/sms` | SMS forwarding over Bluetooth MAP: parsers, MAS client, MNS server, `Service` (spec 17) |
 | `internal/stun` | STUN Binding request encode/decode, query on a PacketConn |
 | `internal/nat` | local address probe, mode selection, STUN keepalive |
 | `internal/dnsv4` | IPv4-only DNS resolver (never sends AAAA upstream; installed as `net.DefaultResolver` in `main`) |

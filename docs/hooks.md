@@ -1,6 +1,6 @@
 # Hooks
 
-Hooks run owner-configured shell commands on call lifecycle events. They never affect calls: a hook that fails, hangs or is dropped is only logged.
+Hooks run owner-configured shell commands on call lifecycle events and, when `sms.enabled` is true, on incoming text messages (`sms.received`). They never affect calls: a hook that fails, hangs or is dropped is only logged.
 
 ```yaml
 hooks:
@@ -17,6 +17,7 @@ Test without the daemon: `siptooth hooks test --event call.ended` runs the match
 - One worker runs all hooks sequentially, in emission order, so the order of events within a call is preserved (`call.ringing`, `call.connected`, `call.ended`). A slow hook delays the ones behind it.
 - The command runs as `/bin/sh -c COMMAND` as the daemon's user, with the JSON payload on stdin (one line, newline terminated).
 - On `timeout_seconds` the process group gets SIGTERM and then SIGKILL. stdout and stderr are captured up to 8 KiB each and logged.
+- stdout and stderr of `sms.received` hooks are never logged (they may echo the message); the log line has the exit code, the timeout flag and the byte counts of both streams instead.
 - One attempt, no retries. The queue holds 100 events; when it is full the event is dropped with a warning (`hook_queue_full`), which is never dispatched as a hook.
 
 ## Environment
@@ -26,8 +27,9 @@ The daemon's environment minus `SIPTOOTH_SIP_PASSWORD`, plus:
 | Variable | Value |
 | --- | --- |
 | `SIPTOOTH_EVENT` | event name, for example `call.ended` |
-| `SIPTOOTH_CALL_ID` | call ID, for example `20261014T094331Z-b5fa` (empty for `system.error`) |
-| `SIPTOOTH_CALLER` | caller number; empty when withheld |
+| `SIPTOOTH_CALL_ID` | call ID, for example `20261014T094331Z-b5fa` (empty for `system.error` and `sms.received`) |
+| `SIPTOOTH_CALLER` | caller number; empty when withheld (empty for `sms.received`) |
+| `SIPTOOTH_SMS_FROM` | sender of an `sms.received` message; empty when unknown or for other events |
 
 ## Events
 
@@ -91,6 +93,22 @@ Exactly once per call, whatever the outcome. A call that ended before `call.ring
                   "discarded_silence":0,"srtp_fail":0}}}
 ```
 
+### sms.received
+
+An incoming SMS was fetched from the phone (needs `sms.enabled: true`, see `docs/operations.md`). There is no `call` object; `sms.id` has the same format as a call ID.
+
+```json
+{"schema_version":1,"event":"sms.received","occurred_at":"2026-10-14T09:43:31Z","test":false,
+ "sms":{"id":"20261014T094331Z-7c1e","from":"+380501234567","from_name":"Jane Doe",
+        "text":"Hello","type":"SMS_GSM","handle":"0400000000000012"}}
+```
+
+`from` and `from_name` are `null` when unknown (`from_name` is the contact name the phone knows; `from` may be alphanumeric for service senders). `text` is the whole message in UTF-8 (concatenated SMS arrive joined). `type` is `SMS_GSM` or `SMS_CDMA`. `occurred_at` is when siptooth fetched the message. The environment has `SIPTOOTH_EVENT=sms.received` and `SIPTOOTH_SMS_FROM`.
+
+Delivery is best effort with one hook attempt per message, through the same queue and worker as call hooks (a slow SMS hook delays call hooks behind it). A message that arrives while siptooth has no message session with the phone is not delivered and is not replayed later. MMS, RCS chats (Google Messages "chat features") and Android group messages never appear. The logs hold the message id, sender number, type and length only, never the text or the sender's name.
+
+`siptooth hooks test --event sms.received` sends a sample (`from` `+380501234567`, `from_name` `Test Sender`, `text` `Test message from siptooth`) to the matching hooks and prints the hook's output.
+
 ### system.error
 
 Operational problems, emitted once per outage or rate-limited. There is no `call` object.
@@ -100,7 +118,7 @@ Operational problems, emitted once per outage or rate-limited. There is no `call
  "error":{"code":"sip_registration","detail":"401 Unauthorized"}}
 ```
 
-Codes: `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed` (at most once per hour), `sip_registration`.
+Codes: `bluetooth_unavailable`, `profile_registration`, `routing`, `stun_failed` (at most once per hour), `sip_registration`, `sms_unavailable` (SMS forwarding enabled, the phone is connected and the message channel has not been up for 5 minutes; the detail is the last error; emitted again only after the channel was up in between).
 
 ## Examples
 
@@ -109,19 +127,20 @@ Ready-to-copy scripts are in `config/hooks/`:
 | Script | What it does |
 | --- | --- |
 | `write-file.sh` | appends every payload to `~/.siptooth/data/hook-events.jsonl` (`SIPTOOTH_HOOK_LOG` overrides the path) |
+| `sms-log.sh` | appends `<time> <sender>: <text>` of every `sms.received` to `~/.siptooth/data/sms.log` (`SIPTOOTH_SMS_LOG` overrides the path; mode 0600). Uses `jq` when installed, else appends the raw JSON payload |
 | `http-post.sh` | POSTs the payload as JSON to the URL in `~/.siptooth/hooks/http-post.env` (`SIPTOOTH_WEBHOOK_URL`), with an `X-Siptooth-Event` header |
 
 Install them:
 
 ```sh
 mkdir -p ~/.siptooth/hooks ~/.siptooth/data
-cp config/hooks/write-file.sh config/hooks/http-post.sh ~/.siptooth/hooks/
+cp config/hooks/write-file.sh config/hooks/http-post.sh config/hooks/sms-log.sh ~/.siptooth/hooks/
 cp config/hooks/http-post.env.example ~/.siptooth/hooks/http-post.env
 chmod 0755 ~/.siptooth/hooks/*.sh
 chmod 0600 ~/.siptooth/hooks/http-post.env
 ```
 
-Then reference them in `~/.siptooth/config.yaml` and run `siptooth hooks test --event call.ended`.
+Then reference them in `~/.siptooth/config.yaml` and run `siptooth hooks test --event call.ended` (or `--event sms.received`).
 
 A one-liner for a missed-call style notification, using `jq` on the payload:
 
