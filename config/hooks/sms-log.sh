@@ -2,7 +2,7 @@
 # Appends every received SMS (time, sender, text) to a private log file. Example hook for sms.received.
 # Copy to ~/.siptooth/hooks/ and configure in ~/.siptooth/config.yaml (needs `sms.enabled: true`):
 #   hooks:
-#     - id: sms-log
+#     - id: sms_log
 #       events: [sms.received]
 #       command: "/home/pi/.siptooth/hooks/sms-log.sh"
 # With jq installed the line is "<time> <sender>: <text>" (newlines in the text become spaces);

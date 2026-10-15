@@ -146,7 +146,7 @@ A one-liner for a missed-call style notification, using `jq` on the payload:
 
 ```yaml
 hooks:
-  - id: failed-to-forward
+  - id: failed_to_forward
     events: [call.ended]
     command: "jq -r 'select(.call.bridged_seconds == null) | \"unforwarded call from \\(.call.caller // \"withheld\"): \\(.call.outcome)\"' >> $HOME/.siptooth/data/unforwarded.log"
 ```
