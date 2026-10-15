@@ -246,10 +246,14 @@ func (p Packet) Marshal() ([]byte, error) {
 func ParseRequest(b []byte) (Packet, error) { return parse(b, len(b) > 0 && b[0] == OpConnect) }
 
 // ParseResponse parses a response; toConnect says it answers a Connect.
-// A refusal to a Connect may be a bare 3-byte packet without the Connect fields.
+// A refusal to a Connect may lack the Connect fields (a bare 3-byte packet or only headers).
 func ParseResponse(b []byte, toConnect bool) (Packet, error) {
-	if toConnect && len(b) > 0 && b[0] != RespSuccess && len(b) < 7 {
-		toConnect = false
+	if toConnect && len(b) > 0 && b[0] != RespSuccess {
+		// A refusal may carry the Connect fields or not; try with them first.
+		if p, err := parse(b, true); err == nil {
+			return p, nil
+		}
+		return parse(b, false)
 	}
 	return parse(b, toConnect)
 }

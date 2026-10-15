@@ -206,3 +206,21 @@ func TestParseResponseBareConnectRefusal(t *testing.T) {
 		t.Fatalf("got %+v, %v", p, err)
 	}
 }
+
+func TestParseResponseRefusalShapes(t *testing.T) {
+	// With Connect fields and a header.
+	p, err := ParseResponse([]byte{0xC3, 0x00, 0x0C, 0x10, 0x00, 0x01, 0x00, 0xCB, 0, 0, 0, 1}, true)
+	if err != nil || p.Code != RespForbidden || p.Connect == nil || len(p.Headers) != 1 {
+		t.Fatalf("got %+v", p)
+	}
+	// Without Connect fields but with a header, 8 bytes: the Connect parse fails, the plain one works.
+	p, err = ParseResponse([]byte{0xC3, 0x00, 0x08, 0xCB, 0x00, 0x00, 0x00, 0x01}, true)
+	if err != nil || p.Code != RespForbidden || p.Connect != nil || len(p.Headers) != 1 {
+		t.Fatalf("got %+v, %v", p, err)
+	}
+	// Proper Connect fields on a refusal are kept.
+	p, err = ParseResponse([]byte{0xC3, 0x00, 0x07, 0x10, 0x00, 0x01, 0x00}, true)
+	if err != nil || p.Code != RespForbidden || p.Connect == nil {
+		t.Fatalf("got %+v, %v", p, err)
+	}
+}
