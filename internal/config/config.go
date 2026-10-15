@@ -19,7 +19,7 @@ import (
 )
 
 // KnownEvents lists hook event names (spec section 10).
-var KnownEvents = []string{"call.ringing", "call.connected", "call.ended", "system.error"}
+var KnownEvents = []string{"call.ringing", "call.connected", "call.ended", "system.error", "sms.received"}
 
 // DefaultHookTimeoutSeconds applies to a hook that sets no timeout_seconds.
 const DefaultHookTimeoutSeconds = 10
@@ -98,7 +98,13 @@ type Config struct {
 	NAT       NAT       `yaml:"nat"`
 	Calls     Calls     `yaml:"calls"`
 	Control   Control   `yaml:"control"`
+	SMS       SMS       `yaml:"sms"`
 	Hooks     []Hook    `yaml:"hooks"`
+}
+
+// SMS configures SMS forwarding over Bluetooth MAP (spec 17.11).
+type SMS struct {
+	Enabled bool `yaml:"enabled"`
 }
 
 // Default returns the configuration with every default from spec section 9 applied.

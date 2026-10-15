@@ -52,6 +52,9 @@ calls:
 control:
   socket: siptooth.sock
 
+sms:
+  enabled: false               # forward incoming SMS to sms.received hooks over Bluetooth MAP (spec 17)
+
 hooks: []
 #   - id: notify
 #     events: [call.ended]

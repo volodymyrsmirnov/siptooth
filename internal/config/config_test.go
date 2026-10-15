@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -374,5 +375,28 @@ func TestRegistrationAOR(t *testing.T) {
 	c.SIP.From = "sip:{caller}@example.org"
 	if got := c.SIP.RegistrationAOR(); got != "sip:alice@reg.example:5061" {
 		t.Errorf("placeholder from = %q, want the username form", got)
+	}
+}
+
+func TestSMSConfig(t *testing.T) {
+	if Default().SMS.Enabled {
+		t.Fatal("sms.enabled must default to false")
+	}
+	if !slices.Contains(KnownEvents, "sms.received") {
+		t.Fatal("sms.received must be a known event")
+	}
+	p := write(t, t.TempDir(), "sms:\n  enabled: true\nhooks:\n  - id: a\n    events: [sms.received]\n    command: x\n")
+	c, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.SMS.Enabled {
+		t.Fatal("sms.enabled not loaded")
+	}
+	if strings.Contains(problems(c, ""), "unknown event") {
+		t.Fatal("sms.received hook rejected")
+	}
+	if _, err := Load(write(t, t.TempDir(), "sms:\n  enabld: true\n")); err == nil || !strings.Contains(err.Error(), "enabld") {
+		t.Fatalf("unknown sms key must fail: %v", err)
 	}
 }
