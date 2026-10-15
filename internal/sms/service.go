@@ -125,6 +125,7 @@ type Service struct {
 	masCtx            context.Context
 	ops               chan any
 	opBusy            bool
+	masDead           bool // the MAS connection closed while an operation was in flight
 	regPending, regOK bool
 
 	mnsGen    uint64
@@ -310,13 +311,12 @@ func (s *Service) Status() Status {
 		return Status{Enabled: false, State: StateDisabled}
 	}
 	st := *s.status.Load()
-	if st.LastError == "" {
-		s.regMu.Lock()
-		if s.regErr != nil {
-			st.LastError = "MNS profile registration: " + s.regErr.Error()
-		}
-		s.regMu.Unlock()
+	// A failed MNS profile registration is the root cause of any service error.
+	s.regMu.Lock()
+	if s.regErr != nil {
+		st.LastError = "MNS profile registration: " + s.regErr.Error()
 	}
+	s.regMu.Unlock()
 	return st
 }
 
@@ -408,9 +408,16 @@ func (s *Service) handle(m any) {
 			s.dispatch()
 		}
 	case masGone:
-		if m.gen == s.gen && s.mas != nil {
-			s.fail(errors.New("MAS connection closed"))
+		if m.gen != s.gen || s.mas == nil {
+			break
 		}
+		if s.opBusy {
+			// The request in flight fails with the real cause now that the transport is
+			// gone; its result ends the session (dispatch covers a result that succeeded).
+			s.masDead = true
+			break
+		}
+		s.fail(errors.New("MAS connection closed"))
 	case mnsConnMsg:
 		s.onMNSConn(m)
 	case mnsConnectedMsg:
@@ -444,7 +451,7 @@ func (s *Service) resetSession() {
 	s.tries = map[string]int{}
 	s.seen = map[string]struct{}{}
 	s.seenOrder = nil
-	s.opBusy, s.regPending, s.regOK = false, false, false
+	s.opBusy, s.regPending, s.regOK, s.masDead = false, false, false, false
 }
 
 // closeMNS closes the current MNS connection (under the admission mutex) and forgets it.
@@ -606,6 +613,10 @@ func (s *Service) opWorker(ctx context.Context, gen uint64, m *MAS, ops <-chan a
 // dispatch gives the idle operation worker its next job: registration first, then handles.
 func (s *Service) dispatch() {
 	if s.mas == nil || s.opBusy {
+		return
+	}
+	if s.masDead {
+		s.fail(errors.New("MAS connection closed"))
 		return
 	}
 	if s.regPending {

@@ -425,6 +425,31 @@ func TestGetMessageEOFEndsSession(t *testing.T) {
 	phone.event("h1")
 	waitCh(t, mse.gets, "get")
 	r.waitState(StateRetrying)
+	// The real cause of the failed GetMessage, not the generic "closed" from the watcher.
+	if got := r.svc.Status().LastError; !strings.Contains(got, "get message") || strings.Contains(got, "MAS connection closed") {
+		t.Fatalf("last_error %q", got)
+	}
+}
+
+func TestIdleMASCloseEndsSession(t *testing.T) {
+	r := startedRig(t)
+	mse, _ := r.ready()
+	mse.c.Close()
+	r.waitState(StateRetrying)
+	if got := r.svc.Status().LastError; !strings.Contains(got, "MAS connection closed") {
+		t.Fatalf("last_error %q", got)
+	}
+}
+
+func TestSetRegistrationErrorWinsOverServiceError(t *testing.T) {
+	r := startedRig(t)
+	r.up()
+	r.clock.Advance(mnsWindow)
+	r.waitState(StateRetrying)
+	r.svc.SetRegistrationError(errors.New("boom"))
+	if got := r.svc.Status().LastError; got != "MNS profile registration: boom" {
+		t.Fatalf("last_error %q", got)
+	}
 }
 
 func TestGetMessageRetryThenSuccess(t *testing.T) {
