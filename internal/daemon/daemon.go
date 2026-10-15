@@ -21,6 +21,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/sco"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 	"github.com/volodymyrsmirnov/siptooth/internal/sipaddr"
+	"github.com/volodymyrsmirnov/siptooth/internal/sms"
 )
 
 // coordinator is the part of *bridge.Coordinator the Bluetooth glue uses.
@@ -142,7 +143,7 @@ func run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 	ctlDone := make(chan struct{})
 	go func() {
 		defer close(ctlDone)
-		if err := control.Serve(ctlCtx, cfg.Control.Socket, control.NewServer(coord)); err != nil && !errors.Is(err, context.Canceled) {
+		if err := control.Serve(ctlCtx, cfg.Control.Socket, control.NewServer(coord, func() sms.Status { return sms.Status{State: sms.StateDisabled} })); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- fmt.Errorf("control socket: %w", err)
 		}
 	}()

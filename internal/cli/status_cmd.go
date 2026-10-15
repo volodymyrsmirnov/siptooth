@@ -12,6 +12,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
 	"github.com/volodymyrsmirnov/siptooth/internal/config"
 	"github.com/volodymyrsmirnov/siptooth/internal/control"
+	"github.com/volodymyrsmirnov/siptooth/internal/sms"
 )
 
 func init() { register(command{"status", "Show daemon status", runStatus}) }
@@ -58,7 +59,7 @@ func yesNo(b bool) string {
 	return "no"
 }
 
-func printStatus(w io.Writer, st bridge.Status, now time.Time) {
+func printStatus(w io.Writer, st control.Status, now time.Time) {
 	fmt.Fprintf(w, "ready:           %s\nphone connected: %s\nstate:           %s\n", yesNo(st.Ready), yesNo(st.PhoneConnected), st.State)
 	if st.CallID != "" {
 		caller := st.Caller
@@ -74,7 +75,11 @@ func printStatus(w io.Writer, st bridge.Status, now time.Time) {
 	if st.LastOutcome != "" {
 		fmt.Fprintf(w, "last call:       %s\n", st.LastOutcome)
 	}
-	r := st.Registration
+	printRegistration(w, st.Registration)
+	printSMS(w, st.SMS)
+}
+
+func printRegistration(w io.Writer, r bridge.RegistrationStatus) {
 	if !r.Enabled {
 		fmt.Fprintln(w, "registration:    disabled")
 		return
@@ -90,4 +95,23 @@ func printStatus(w io.Writer, st bridge.Status, now time.Time) {
 		fmt.Fprintf(w, " error=%s", r.Error)
 	}
 	fmt.Fprintln(w)
+}
+
+// printSMS prints the SMS service lines (spec 17.10); they do not depend on the SIP registration.
+func printSMS(w io.Writer, s sms.Status) {
+	if !s.Enabled {
+		fmt.Fprintln(w, "sms:             disabled")
+		return
+	}
+	fmt.Fprintf(w, "sms:             %s", s.State)
+	if s.Notifications != nil {
+		fmt.Fprintf(w, ", notifications %s", yesNo(*s.Notifications))
+	}
+	if s.Received != nil {
+		fmt.Fprintf(w, ", %d received", *s.Received)
+	}
+	fmt.Fprintln(w)
+	if s.LastError != "" {
+		fmt.Fprintf(w, "sms error:       %s\n", s.LastError)
+	}
 }

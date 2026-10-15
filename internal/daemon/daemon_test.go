@@ -121,7 +121,7 @@ func TestRegistrationShownInStatusAndRemovedAtShutdown(t *testing.T) {
 	cfg.SIP.Register, cfg.SIP.Username = true, "alice"
 	c, stop := startDaemon(t, cfg, "s3cret")
 
-	var st bridge.Status
+	var st control.Status
 	for end := time.Now().Add(5 * time.Second); time.Now().Before(end); time.Sleep(20 * time.Millisecond) {
 		var err error
 		if st, err = c.Status(context.Background()); err == nil && st.Registration.Registered {

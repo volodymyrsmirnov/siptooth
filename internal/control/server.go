@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
+	"github.com/volodymyrsmirnov/siptooth/internal/sms"
 )
 
 // ErrAlreadyRunning means a live daemon owns the socket.
@@ -25,12 +26,23 @@ type StatusProvider interface {
 	Status() bridge.Status
 }
 
-// NewServer returns the handler: GET /status.
-func NewServer(sp StatusProvider) http.Handler {
+// Status is the GET /status response: the coordinator's status plus the SMS service snapshot
+// (spec 17.10).
+type Status struct {
+	bridge.Status
+	SMS sms.Status `json:"sms"`
+}
+
+// NewServer returns the handler: GET /status. smsStatus may be nil (reported as disabled).
+func NewServer(sp StatusProvider, smsStatus func() sms.Status) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		st := Status{Status: sp.Status(), SMS: sms.Status{State: sms.StateDisabled}}
+		if smsStatus != nil {
+			st.SMS = smsStatus()
+		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(sp.Status())
+		_ = json.NewEncoder(w).Encode(st)
 	})
 	return mux
 }

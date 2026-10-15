@@ -18,6 +18,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/control"
 	"github.com/volodymyrsmirnov/siptooth/internal/doctor"
 	"github.com/volodymyrsmirnov/siptooth/internal/host"
+	"github.com/volodymyrsmirnov/siptooth/internal/sms"
 )
 
 func runCLI(args ...string) (int, string, string) {
@@ -138,17 +139,51 @@ func TestPrintStatus(t *testing.T) {
 	started := time.Now().Add(-90 * time.Second)
 	expires := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
 	var b bytes.Buffer
-	printStatus(&b, bridge.Status{Ready: true, PhoneConnected: true, State: "bridged", CallID: "c1", Caller: "+100", CallStartedAt: &started,
-		LastOutcome: "completed", Registration: bridge.RegistrationStatus{Enabled: true, Registered: true, Contact: "sip:x@1.2.3.4:5", Expires: &expires}}, time.Now())
+	printStatus(&b, control.Status{Status: bridge.Status{Ready: true, PhoneConnected: true, State: "bridged", CallID: "c1", Caller: "+100", CallStartedAt: &started,
+		LastOutcome: "completed", Registration: bridge.RegistrationStatus{Enabled: true, Registered: true, Contact: "sip:x@1.2.3.4:5", Expires: &expires}}}, time.Now())
 	for _, want := range []string{"ready:           yes", "state:           bridged", "c1 from +100 (1m30s)", "last call:       completed", "registered=yes contact=sip:x@1.2.3.4:5 expires=2026-10-14T12:00:00Z"} {
 		if !strings.Contains(b.String(), want) {
 			t.Errorf("missing %q in\n%s", want, b.String())
 		}
 	}
 	b.Reset()
-	printStatus(&b, bridge.Status{State: "idle"}, time.Now())
+	printStatus(&b, control.Status{Status: bridge.Status{State: "idle"}}, time.Now())
 	if !strings.Contains(b.String(), "registration:    disabled") {
 		t.Errorf("%s", b.String())
+	}
+}
+
+func TestPrintStatusSMS(t *testing.T) {
+	yes, no, n := true, false, 4
+	cases := []struct {
+		name string
+		st   control.Status
+		want []string
+		not  []string
+	}{
+		{"no registration, sms disabled", control.Status{Status: bridge.Status{State: "idle"}, SMS: sms.Status{State: "disabled"}},
+			[]string{"registration:    disabled\n", "sms:             disabled\n"}, []string{"sms error"}},
+		{"no registration, sms ready", control.Status{Status: bridge.Status{State: "idle"}, SMS: sms.Status{Enabled: true, State: "ready", Notifications: &yes, Received: &n}},
+			[]string{"registration:    disabled\n", "sms:             ready, notifications yes, 4 received\n"}, []string{"sms error"}},
+		{"registration, sms retrying with error", control.Status{Status: bridge.Status{State: "idle", Registration: bridge.RegistrationStatus{Enabled: true, Registered: true}},
+			SMS: sms.Status{Enabled: true, State: "retrying", Notifications: &no, Received: &n, LastError: "no MAS"}},
+			[]string{"registered=yes", "sms:             retrying, notifications no, 4 received\n", "sms error:       no MAS\n"}, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var b bytes.Buffer
+			printStatus(&b, c.st, time.Now())
+			for _, w := range c.want {
+				if !strings.Contains(b.String(), w) {
+					t.Errorf("missing %q in\n%s", w, b.String())
+				}
+			}
+			for _, w := range c.not {
+				if strings.Contains(b.String(), w) {
+					t.Errorf("unexpected %q in\n%s", w, b.String())
+				}
+			}
+		})
 	}
 }
 

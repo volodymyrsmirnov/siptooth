@@ -9,8 +9,6 @@ import (
 	"net"
 	"net/http"
 	"time"
-
-	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
 )
 
 // ErrUnavailable means the daemon does not answer on the socket.
@@ -31,8 +29,8 @@ func NewClient(socketPath string) *Client {
 }
 
 // Status fetches GET /status.
-func (c *Client) Status(ctx context.Context) (bridge.Status, error) {
-	var st bridge.Status
+func (c *Client) Status(ctx context.Context) (Status, error) {
+	var st Status
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://siptooth/status", nil)
 	if err != nil {
 		return st, err

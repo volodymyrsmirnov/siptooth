@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/volodymyrsmirnov/siptooth/internal/bridge"
+	"github.com/volodymyrsmirnov/siptooth/internal/sms"
 )
 
 type fakeSP struct{ st bridge.Status }
@@ -45,7 +46,7 @@ func startServer(t *testing.T, sp *fakeSP) string {
 	p := sockPath(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	go Serve(ctx, p, NewServer(sp))
+	go Serve(ctx, p, NewServer(sp, nil))
 	waitSocket(t, p)
 	return p
 }
@@ -123,7 +124,7 @@ func TestServeReplacesStaleSocket(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- Serve(ctx, p, NewServer(&fakeSP{})) }()
+	go func() { errCh <- Serve(ctx, p, NewServer(&fakeSP{}, nil)) }()
 	waitSocket(t, p)
 	if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0o660 {
 		t.Fatalf("socket mode: %v %v", fi, err)
@@ -143,10 +144,58 @@ func TestServeReplacesStaleSocket(t *testing.T) {
 func TestServeRefusesLiveSocket(t *testing.T) {
 	sp := &fakeSP{}
 	p := startServer(t, sp)
-	if err := Serve(context.Background(), p, NewServer(sp)); !errors.Is(err, ErrAlreadyRunning) {
+	if err := Serve(context.Background(), p, NewServer(sp, nil)); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("got %v", err)
 	}
 	if err := Probe(p); !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("probe: %v", err)
+	}
+}
+
+func getBody(t *testing.T, p string) []byte {
+	t.Helper()
+	hc := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", p)
+	}}}
+	resp, err := hc.Get("http://siptooth/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return b
+}
+
+func TestStatusSMSDisabledExactJSON(t *testing.T) {
+	p := startServer(t, &fakeSP{})
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(getBody(t, p), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(raw["sms"]); got != `{"enabled":false,"state":"disabled"}` {
+		t.Fatalf("sms = %s", got)
+	}
+	if _, ok := raw["ready"]; !ok {
+		t.Fatal("bridge fields must stay at the top level")
+	}
+}
+
+func TestStatusSMSEnabled(t *testing.T) {
+	yes, n := true, 3
+	p := sockPath(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	smsSt := func() sms.Status {
+		return sms.Status{Enabled: true, State: "ready", Notifications: &yes, Received: &n, LastError: "boom"}
+	}
+	go Serve(ctx, p, NewServer(&fakeSP{}, smsSt))
+	waitSocket(t, p)
+	st, err := NewClient(p).Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := st.SMS
+	if !s.Enabled || s.State != "ready" || s.Notifications == nil || !*s.Notifications || s.Received == nil || *s.Received != 3 || s.LastError != "boom" {
+		t.Fatalf("sms = %+v", s)
 	}
 }
