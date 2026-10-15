@@ -10,7 +10,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
 
-// A: a CallActive after teardown is ours only if the ATA result is ok or ambiguous.
+// A CallActive after teardown is ours only if the ATA result is ok or ambiguous.
 func TestLateWindowWaitsForATAResult(t *testing.T) {
 	for name, tc := range map[string]struct {
 		err   error
@@ -42,7 +42,7 @@ func TestLateWindowWaitsForATAResult(t *testing.T) {
 	}
 }
 
-// D: CallActive seen, then the SIP side ends while the ATA result is pending.
+// CallActive seen, then the SIP side ends while the ATA result is pending.
 func TestTeardownWithCallActiveWatchesPendingATA(t *testing.T) {
 	for name, tc := range map[string]struct {
 		err   error
@@ -69,7 +69,7 @@ func TestTeardownWithCallActiveWatchesPendingATA(t *testing.T) {
 	}
 }
 
-// C: a new ring while the old call only waits out its CallActive window.
+// A new ring while the old call only waits out its CallActive window.
 func TestRingEndsCallWaitingAfterSetupCleared(t *testing.T) {
 	r := newRig(t, noMediaTimeout).start()
 	fc := r.answer()
@@ -94,7 +94,7 @@ func TestRingEndsCallWaitingAfterSetupCleared(t *testing.T) {
 	r.wantHangups(fc, 1, 0)
 }
 
-// E: a panic inside the pump is contained and reported as media_error.
+// A panic inside the pump is contained and reported as media_error.
 func TestPumpPanicIsMediaError(t *testing.T) {
 	r := newRig(t, noMediaTimeout).start()
 	fc, phone := r.bridge()

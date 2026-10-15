@@ -10,7 +10,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
 
-// ---- A1: the owner's outgoing call is never ours ----
+// ---- the owner's outgoing call is never ours ----
 
 // The late window is armed (ATA ok, SIP ended before CallActive); the owner dials out. The
 // CallActive that follows is the owner's call, not the old ATA's.
@@ -68,7 +68,7 @@ func TestOutgoingSetupWhileAnsweringNeverHangsUpThePhone(t *testing.T) {
 	r.wantHangups(fc, 1, 0)
 }
 
-// ---- A2: callsetup=0 before call=1 must not close the late window ----
+// ---- callsetup=0 before call=1 must not close the late window ----
 
 func TestLateWindowSurvivesSetupClearedWhenATAWorked(t *testing.T) {
 	for name, err := range map[string]error{"ok": nil, "ambiguous": hfp.ErrTimeout} {
@@ -99,7 +99,7 @@ func TestLateWindowEndsOnNewRing(t *testing.T) {
 	r.wantHangups(fc, 0, 0)
 }
 
-// ---- A3: shutdown resolves a pending ATA ----
+// ---- shutdown resolves a pending ATA ----
 
 func TestShutdownWaitsForPendingATAWithCallActive(t *testing.T) {
 	for name, tc := range map[string]struct {
@@ -157,7 +157,7 @@ func TestShutdownATAWaitIsBounded(t *testing.T) {
 	}
 }
 
-// ---- A4: the phone's physical state ----
+// ---- the phone's physical state ----
 
 func TestPhoneBusyAfterSIPFailureUntilSetupClears(t *testing.T) {
 	r := newRig(t, nil).start()

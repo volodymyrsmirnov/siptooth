@@ -49,17 +49,17 @@ func TestAddrFromDevicePath(t *testing.T) {
 func TestApprovalsSettle(t *testing.T) {
 	var a approvals
 	t0 := time.Unix(1000, 0)
-	before := map[string]bool{"0C:7D:B0:76:0E:F1": true}
-	now := map[string]bool{"0C:7D:B0:76:0E:F1": true}
+	before := map[string]bool{"AA:BB:CC:DD:EE:01": true}
+	now := map[string]bool{"AA:BB:CC:DD:EE:01": true}
 	if _, ok := selectPairedDevice(before, now, a.settled(t0, bondSettle)); ok {
 		t.Fatal("selected an already-bonded phone before any approval")
 	}
-	a.note("0C:7D:B0:76:0E:F1", t0)
+	a.note("AA:BB:CC:DD:EE:01", t0)
 	if _, ok := selectPairedDevice(before, now, a.settled(t0.Add(time.Second), bondSettle)); ok {
 		t.Fatal("selected before the bond settled")
 	}
 	addr, ok := selectPairedDevice(before, now, a.settled(t0.Add(bondSettle), bondSettle))
-	if !ok || addr != "0C:7D:B0:76:0E:F1" {
+	if !ok || addr != "AA:BB:CC:DD:EE:01" {
 		t.Fatalf("got %q %v", addr, ok)
 	}
 	a.note("", t0) // ignored

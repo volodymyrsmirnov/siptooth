@@ -15,7 +15,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 )
 
-// ---- item 1: ownership needs a successful (or ambiguous) ATA ----
+// ---- ownership needs a successful (or ambiguous) ATA ----
 
 // The owner picked up on the handset while our ATA was still queued; the ATA
 // then failed. The CallActive was the owner's, so the call is never touched.
@@ -59,7 +59,7 @@ func TestNoCHUPWhileATAPending(t *testing.T) {
 	}
 }
 
-// ---- item 2: stale AT commands ----
+// ---- stale AT commands ----
 
 func TestUnsentATADiscardedWhenCallEnds(t *testing.T) {
 	r := newRig(t, nil)
@@ -96,7 +96,7 @@ func TestCHUPCancelledByCallEndedOrRing(t *testing.T) {
 	}
 }
 
-// ---- item 3: reversed setup indicators ----
+// ---- reversed setup indicators ----
 
 func TestSetupClearedBeforeCallActiveProceeds(t *testing.T) {
 	r := newRig(t, noMediaTimeout).start()
@@ -144,7 +144,7 @@ func TestSetupClearedThenATAFailure(t *testing.T) {
 	r.wantHangups(fc, 1, 0)
 }
 
-// ---- item 4: the SCO-loss latch ----
+// ---- the SCO-loss latch ----
 
 func TestSCOLossLatchesNoCHUP(t *testing.T) {
 	for name, trigger := range map[string]func(r *rig){
@@ -164,7 +164,7 @@ func TestSCOLossLatchesNoCHUP(t *testing.T) {
 	}
 }
 
-// ---- item 7: late SCO link at shutdown ----
+// ---- late SCO link at shutdown ----
 
 func TestLateSCOLinkClosedAtShutdown(t *testing.T) {
 	for i := 0; i < 20; i++ {
@@ -182,8 +182,6 @@ func TestLateSCOLinkClosedAtShutdown(t *testing.T) {
 		}
 	}
 }
-
-// ---- item 8 ----
 
 func TestLateCallActiveAfterMediaTimeout(t *testing.T) {
 	r := newRig(t, func(c *config.Config) { c.Calls.MediaTimeoutSeconds = 3 }).start()
@@ -228,8 +226,6 @@ func TestCallEndedEmittedEvenIfPayloadPanics(t *testing.T) {
 	r.waitState("idle")
 }
 
-// ---- item 9 ----
-
 func TestRemoteMediaPrefersLatched(t *testing.T) {
 	r := newRig(t, nil).start()
 	fc := r.answer()
@@ -259,8 +255,6 @@ func TestPumpWarningCarriesCallID(t *testing.T) {
 		}
 	}
 }
-
-// ---- item 6 (coordinator side) ----
 
 func TestDrainPlaysSubTargetRemnant(t *testing.T) {
 	r := newRig(t, noMediaTimeout).start()
