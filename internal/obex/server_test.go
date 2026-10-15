@@ -132,17 +132,15 @@ func TestServeConnectionIDMismatch(t *testing.T) {
 	if len(s.calls) != 0 {
 		t.Fatal("handler called")
 	}
-	// A multipart put with a wrong id on a later packet is rejected through to its end.
+	// A multipart put with a wrong id on a later packet is rejected and the operation ends there.
 	s.pe.send(put(OpPut, Bytes(HBody, []byte("a"))))
 	s.expect(RespContinue)
 	s.pe.send(Packet{Code: OpPut, Headers: Headers{U32(HConnectionID, 9)}})
 	s.expect(RespForbidden)
-	s.pe.send(put(OpPutFinal, Bytes(HEndOfBody, []byte("b"))))
-	s.expect(RespForbidden)
 	if len(s.calls) != 0 {
 		t.Fatal("handler called")
 	}
-	// The next Put works again.
+	// The next Put is a fresh operation (nothing of "a" is carried over).
 	s.pe.send(put(OpPutFinal, Bytes(HEndOfBody, []byte("ok"))))
 	s.expect(RespSuccess)
 	if c := <-s.calls; string(c.body) != "ok" {
@@ -199,15 +197,39 @@ func TestServeBodyCap(t *testing.T) {
 	if code != RespEntityTooLarge {
 		t.Fatalf("got 0x%02X", code)
 	}
-	s.pe.send(put(OpPut, Bytes(HBody, chunk)))
-	s.expect(RespEntityTooLarge)
-	s.pe.send(put(OpPutFinal, Bytes(HEndOfBody, chunk)))
-	s.expect(RespEntityTooLarge)
 	if len(s.calls) != 0 {
 		t.Fatal("handler called")
 	}
+	// The reject ended the operation: the next Put starts afresh.
 	s.pe.send(put(OpPutFinal, Bytes(HEndOfBody, []byte("fine"))))
 	s.expect(RespSuccess)
+}
+
+func TestServeRejectedNonFinalResetsPut(t *testing.T) {
+	setTimeouts(t, 30*time.Millisecond, 60*time.Millisecond, time.Second)
+	s := startServer(t, RespSuccess)
+	s.connect()
+	chunk := bytes.Repeat([]byte{'x'}, 8000)
+	for sent, code := 0, byte(0); code != RespEntityTooLarge; sent += len(chunk) {
+		if sent > MaxBody+len(chunk) {
+			t.Fatal("never rejected")
+		}
+		s.pe.send(put(OpPut, Bytes(HBody, chunk)))
+		p, _ := ParseResponse(s.pe.recvRaw(), false)
+		code = p.Code
+	}
+	// Idle after the reject: no put deadline may close the connection.
+	time.Sleep(150 * time.Millisecond)
+	select {
+	case err := <-s.res:
+		t.Fatalf("Serve returned while idle: %v", err)
+	default:
+	}
+	s.pe.send(put(OpPutFinal, Bytes(HEndOfBody, []byte("fine"))))
+	s.expect(RespSuccess)
+	if len(s.calls) != 1 {
+		t.Fatal("handler not called once")
+	}
 }
 
 func TestServeHeaderCap(t *testing.T) {
@@ -224,9 +246,9 @@ func TestServeHeaderCap(t *testing.T) {
 		t.Fatalf("got 0x%02X", code)
 	}
 	s.pe.send(put(OpPutFinal))
-	s.expect(RespEntityTooLarge)
-	if len(s.calls) != 0 {
-		t.Fatal("handler called")
+	s.expect(RespSuccess) // the reject ended the operation; this is a fresh (empty) one
+	if len(s.calls) != 1 {
+		t.Fatal("handler not called once")
 	}
 }
 

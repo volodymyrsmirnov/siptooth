@@ -131,7 +131,10 @@ func Serve(rwc io.ReadWriteCloser, target []byte, h PutHandler, onConnect func()
 				}
 				put = putState{}
 			} else if put.reject != 0 {
+				// Answer once, then forget the operation: the phone's next Put starts afresh
+				// and the per-Put deadlines stop running while the connection is idle.
 				code = put.reject
+				put = putState{}
 			}
 			if err := reply(code); err != nil {
 				return err
