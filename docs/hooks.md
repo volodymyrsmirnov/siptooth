@@ -127,7 +127,7 @@ Ready-to-copy scripts are in `config/hooks/`:
 | Script | What it does |
 | --- | --- |
 | `write-file.sh` | appends every payload to `~/.siptooth/data/hook-events.jsonl` (`SIPTOOTH_HOOK_LOG` overrides the path) |
-| `sms-log.sh` | appends `<time> <sender>: <text>` of every `sms.received` to `~/.siptooth/data/sms.log` (`SIPTOOTH_SMS_LOG` overrides the path; mode 0600). Uses `jq` when installed, else appends the raw JSON payload |
+| `sms-log.sh` | appends `<time> [<name> ]<<number>>: <text>` of every `sms.received` to `~/.siptooth/data/sms.log` (`SIPTOOTH_SMS_LOG` overrides the path; mode 0600). Uses `jq` when installed, else appends the raw JSON payload |
 | `http-post.sh` | POSTs the payload as JSON to the URL in `~/.siptooth/hooks/http-post.env` (`SIPTOOTH_WEBHOOK_URL`), with an `X-Siptooth-Event` header |
 
 Install them:

@@ -5,7 +5,7 @@
 #     - id: sms_log
 #       events: [sms.received]
 #       command: "/home/pi/.siptooth/hooks/sms-log.sh"
-# With jq installed the line is "<time> <sender>: <text>" (newlines in the text become spaces);
+# With jq installed the line is "<time> [<name> ]<<number>>: <text>" (newlines become spaces);
 # without jq the raw JSON payload is appended instead, so nothing is lost.
 # siptooth does not log what a hook prints for sms.received, and neither does this script.
 set -eu
@@ -13,7 +13,7 @@ umask 077
 LOG="${SIPTOOTH_SMS_LOG:-$HOME/.siptooth/data/sms.log}"
 mkdir -p "$(dirname "$LOG")"
 if command -v jq >/dev/null 2>&1; then
-	jq -r '"\(.occurred_at) \(.sms.from // "unknown"): \(.sms.text | gsub("[\r\n]+"; " "))"' >> "$LOG"
+	jq -r '"\(.occurred_at) \(if .sms.from_name then (.sms.from_name | gsub("[\r\n]+"; " ")) + " " else "" end)<\(.sms.from // "unknown")>: \(.sms.text | gsub("[\r\n]+"; " "))"' >> "$LOG"
 else
 	cat >> "$LOG"
 fi
