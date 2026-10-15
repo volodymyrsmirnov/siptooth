@@ -181,7 +181,7 @@ func New(d Deps) *Coordinator {
 		d.Clock = RealClock{}
 	}
 	if d.NewCallID == nil {
-		d.NewCallID = newCallID
+		d.NewCallID = NewCallID
 	}
 	if d.Hooks == nil {
 		d.Hooks = nopHooks{}
@@ -193,8 +193,8 @@ type nopHooks struct{}
 
 func (nopHooks) Emit(string, hooks.CallInfo) {}
 
-// newCallID is the default call ID: 20261014T094331Z-b5fa.
-func newCallID(t time.Time) string {
+// NewCallID is the default call ID (also used for SMS ids): 20261014T094331Z-b5fa.
+func NewCallID(t time.Time) string {
 	var b [2]byte
 	_, _ = rand.Read(b[:])
 	return t.UTC().Format("20060102T150405Z") + "-" + hex.EncodeToString(b[:])
