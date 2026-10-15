@@ -120,8 +120,8 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // runBluetooth runs Bluetooth sessions until ctx ends. A session ends early only when the
 // system bus connection is lost; a new one (new connection, profile, routing) starts 10 s
 // later (production review 2026-10-05: the daemon kept a dead connection forever).
-func runBluetooth(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, logger *slog.Logger) {
-	for runBluetoothSession(ctx, cfg, coord, d, logger) {
+func runBluetooth(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, smsb *smsBinding, logger *slog.Logger) {
+	for runBluetoothSession(ctx, cfg, coord, d, smsb, logger) {
 		if !sleepCtx(ctx, bluezRetryInterval) {
 			return
 		}
@@ -130,7 +130,7 @@ func runBluetooth(ctx context.Context, cfg config.Config, coord coordinator, d e
 
 // runBluetoothSession runs one system bus connection; it reports whether the bus was lost
 // (false: ctx ended).
-func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, logger *slog.Logger) bool {
+func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, smsb *smsBinding, logger *slog.Logger) bool {
 	var m *bluez.Manager
 	for reported := false; ; {
 		var err error
@@ -151,6 +151,7 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 	ctx, cancel := context.WithCancel(ctx) // ends the session's workers when the bus is lost
 	defer cancel()
 
+	var bg sync.WaitGroup
 	retry := make(chan struct{}, 1)
 	scheduleRetry := func() {
 		select {
@@ -261,10 +262,34 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 		registerReported = false
 	}
 
+	// The MNS profile (SMS forwarding, spec 17.8) registers on a worker so that it never delays
+	// adapter events, the power cycle or HFP; its result is tagged with this bus session. Without
+	// SMS, mns stays nil and its channels block forever.
+	var mns *mnsRegistrar
+	var mnsResults <-chan mnsResult
+	var mnsStuck <-chan struct{}
+	if smsb != nil {
+		mnsH := newMNSHandler(smsb.link, cfg.Bluetooth.Adapter, cfg.Bluetooth.PhoneAddress, logger)
+		mns = newMNSRegistrar(ctx, &bg, func(rctx context.Context, kind mnsKind) error {
+			if kind == mnsReregister {
+				if err := m.UnregisterMNSProfile(rctx); err != nil {
+					logger.Warn("bluetooth: MNS profile unregister", "err", err)
+				}
+			}
+			return m.RegisterMNSProfile(rctx, mnsH)
+		}, smsb.link.SetRegistrationError, logger)
+		mnsResults, mnsStuck = mns.Results(), smsb.stuck
+	}
+	mnsRetry := func() <-chan time.Time { // nil channel (blocks forever) without SMS
+		if mns == nil {
+			return nil
+		}
+		return mns.Retry()
+	}
+
 	// Changes are handled on this goroutine; the Watch callback only forwards them.
 	changes := make(chan bluez.Change, 32)
 	watchEnded := make(chan struct{}) // Watch returns before ctx ends only when the bus is gone
-	var bg sync.WaitGroup
 	bg.Add(1)
 	go func() {
 		defer bg.Done()
@@ -309,6 +334,9 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 	}
 
 	register() // powers the adapter
+	if mns != nil {
+		mns.Request(mnsRegister)
+	}
 	routing()
 	// The connect loop starts only now: its first ConnectProfile needs the adapter powered
 	// and the HF profile registered, or the phone would connect only on the 30 s tick.
@@ -342,6 +370,13 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 			if registerRetry == nil {
 				scheduleRetry() // registered: connect the phone now rather than on the 30 s tick
 			}
+		case res := <-mnsResults:
+			mns.Handle(res)
+		case <-mnsRetry():
+			mns.RetryDue()
+		case <-mnsStuck:
+			logger.Warn("bluetooth: the phone never opened the MNS channel; re-registering the MNS profile")
+			mns.Request(mnsReregister)
 		case ch := <-changes:
 			switch ch.Kind {
 			case bluez.AdapterUp: // also fires for a merely present adapter: routing re-checks Powered
@@ -361,13 +396,23 @@ func runBluetoothSession(ctx context.Context, cfg config.Config, coord coordinat
 				logger.Warn("bluetooth: bluetoothd left the bus")
 				coord.SetAudioRouting(false)
 				h.Disconnected("") // the current call becomes interrupted
+				if smsb != nil {
+					smsb.link.MNSDisconnected()
+				}
 			case bluez.BluezRestarted:
 				logger.Warn("bluetooth: bluetoothd restarted, re-registering")
 				h.Disconnected("")
+				if smsb != nil {
+					smsb.link.MNSDisconnected()
+				}
 				if !sleepCtx(ctx, bluezRestartSettle) {
 					return false
 				}
 				register()
+				if mns != nil {
+					mns.Invalidate() // a result from before the restart describes the old registration
+					mns.Request(mnsRegister)
+				}
 				routing()
 				scheduleRetry()
 			case bluez.PhoneConnected:

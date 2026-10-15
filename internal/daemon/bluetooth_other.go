@@ -11,7 +11,7 @@ import (
 
 // runBluetooth has no telephony off Linux: the coordinator never gets a phone and never
 // answers, while the control socket keeps working.
-func runBluetooth(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, logger *slog.Logger) {
+func runBluetooth(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, _ *smsBinding, logger *slog.Logger) {
 	logger.Warn("bluetooth: not supported on this platform; running without telephony (control socket only)")
 	<-ctx.Done()
 }

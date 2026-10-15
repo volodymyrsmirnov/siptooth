@@ -51,7 +51,9 @@ const (
 var btStopTimeout = 5 * time.Second
 
 // bluetoothRunner is runBluetooth; tests inject a fake so they never touch real adapters.
-type bluetoothRunner func(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, logger *slog.Logger)
+//
+// smsb is nil when SMS forwarding is off.
+type bluetoothRunner func(ctx context.Context, cfg config.Config, coord coordinator, d errorSink, smsb *smsBinding, logger *slog.Logger)
 
 // Run starts the daemon and blocks until ctx ends (nil) or a component fails
 // (that error). Every goroutine it started has returned when it does, except a
@@ -71,12 +73,12 @@ func run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 
 	// Components are stopped in a fixed order at shutdown: the coordinator
 	// first (it ends the call in progress, which needs Bluetooth and SIP),
-	// then Bluetooth, the registration, the hook dispatcher (so the final
-	// call.ended is delivered) and finally the control socket and the user
-	// agent. Each stop is a no-op until its component started.
+	// then Bluetooth, the SMS service, the registration, the hook dispatcher
+	// (so the final call.ended is delivered) and finally the control socket and
+	// the user agent. Each stop is a no-op until its component started.
 	nop := func() {}
 	var st stops
-	st.coord, st.bt, st.reg, st.hooks, st.ctl, st.ua = nop, nop, nop, nop, nop, nop
+	st.coord, st.bt, st.sms, st.reg, st.hooks, st.ctl, st.ua = nop, nop, nop, nop, nop, nop, nop
 	defer st.run()
 
 	dispatcher, stopHooks := startHooks(cfg.Hooks, logger)
@@ -111,9 +113,28 @@ func run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 			return r.State(), true
 		},
 	})
-	coord := bridge.New(bridge.Deps{
+	// The SMS service exists even when disabled so that the status can say so. It runs, and the
+	// coordinator reports the phone link to it, only when enabled.
+	var smsb *smsBinding
+	smsDeps := sms.Deps{Enabled: cfg.SMS.Enabled, Sink: smsSink{hooks: dispatcher, log: logger},
+		Logger: logger, NewID: bridge.NewCallID}
+	if cfg.SMS.Enabled {
+		smsb = newSMSBinding(nil)
+		smsDeps.MNSStuck = smsb.requestReregister
+	}
+	smsSvc := sms.NewService(smsDeps)
+	coordDeps := bridge.Deps{
 		Config: cfg, SIP: adapter, Dialer: sco.NewDialer(), Hooks: dispatcher, Logger: logger,
-	})
+	}
+	if cfg.SMS.Enabled {
+		smsb.link = smsSvc
+		coordDeps.PhoneLink = phoneLink(smsSvc, cfg.Bluetooth.PhoneAddress)
+		smsCtx, smsCancel := context.WithCancel(context.Background())
+		smsDone := make(chan struct{})
+		go func() { defer close(smsDone); smsSvc.Run(smsCtx) }()
+		st.sms = func() { smsCancel(); <-smsDone }
+	}
+	coord := bridge.New(coordDeps)
 	coordCtx, coordCancel := context.WithCancel(context.Background())
 	coordDone := make(chan struct{})
 	go func() { defer close(coordDone); _ = coord.Run(coordCtx) }()
@@ -143,7 +164,7 @@ func run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 	ctlDone := make(chan struct{})
 	go func() {
 		defer close(ctlDone)
-		if err := control.Serve(ctlCtx, cfg.Control.Socket, control.NewServer(coord, func() sms.Status { return sms.Status{State: sms.StateDisabled} })); err != nil && !errors.Is(err, context.Canceled) {
+		if err := control.Serve(ctlCtx, cfg.Control.Socket, control.NewServer(coord, smsSvc.Status)); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- fmt.Errorf("control socket: %w", err)
 		}
 	}()
@@ -151,7 +172,7 @@ func run(ctx context.Context, cfg config.Config, password string, logger *slog.L
 
 	btCtx, btCancel := context.WithCancel(context.Background())
 	btDone := make(chan struct{})
-	go func() { defer close(btDone); bt(btCtx, cfg, coord, dispatcher, logger) }()
+	go func() { defer close(btDone); bt(btCtx, cfg, coord, dispatcher, smsb, logger) }()
 	st.bt = func() {
 		btCancel()
 		select {
@@ -199,13 +220,14 @@ func localSIPPort(cfg config.Config) int {
 
 // stops are the component shutdown steps, run in a fixed order: the
 // coordinator first (it ends the call in progress, which needs Bluetooth and
-// SIP), then Bluetooth, the registration, the hook dispatcher (so the final
+// SIP), then Bluetooth, the SMS service, the registration, the hook dispatcher (so the final
 // call.ended is delivered) and finally the control socket and the user agent.
-type stops struct{ coord, bt, reg, hooks, ctl, ua func() }
+type stops struct{ coord, bt, sms, reg, hooks, ctl, ua func() }
 
 func (s *stops) run() {
 	s.coord()
 	s.bt()
+	s.sms()
 	s.reg()
 	s.hooks()
 	s.ctl()

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 	"github.com/volodymyrsmirnov/siptooth/internal/hooks"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip"
 	"github.com/volodymyrsmirnov/siptooth/internal/sip/siptest"
+	"github.com/volodymyrsmirnov/siptooth/internal/sms"
 )
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -231,7 +233,7 @@ func TestShutdownDeliversCallEnded(t *testing.T) {
 	}}, quietLogger())
 	nop := func() {}
 	st := stops{coord: func() { d.Emit("call.ended", hooks.CallInfo{ID: "c1"}) },
-		bt: nop, reg: nop, hooks: stopHooks, ctl: nop, ua: nop}
+		bt: nop, sms: nop, reg: nop, hooks: stopHooks, ctl: nop, ua: nop}
 	st.run()
 	b, err := os.ReadFile(out)
 	if err != nil || !strings.Contains(string(b), `"call.ended"`) {
@@ -240,7 +242,7 @@ func TestShutdownDeliversCallEnded(t *testing.T) {
 }
 
 // idleBluetooth is the Bluetooth runner of tests: no hardware, just wait for shutdown.
-func idleBluetooth(ctx context.Context, _ config.Config, _ coordinator, _ errorSink, _ *slog.Logger) {
+func idleBluetooth(ctx context.Context, _ config.Config, _ coordinator, _ errorSink, _ *smsBinding, _ *slog.Logger) {
 	<-ctx.Done()
 }
 
@@ -258,7 +260,7 @@ func TestShutdownContinuesWhenBluetoothHangs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- run(ctx, cfg, "", quietLogger(), func(context.Context, config.Config, coordinator, errorSink, *slog.Logger) { <-hung })
+		errCh <- run(ctx, cfg, "", quietLogger(), func(context.Context, config.Config, coordinator, errorSink, *smsBinding, *slog.Logger) { <-hung })
 	}()
 	c := control.NewClient(cfg.Control.Socket)
 	for end := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
@@ -295,5 +297,64 @@ func TestRegistrationStopSilencesReporterFirst(t *testing.T) {
 	stop()
 	if got := errs.list(); len(got) != 0 {
 		t.Fatalf("sip_registration emitted by a failed final unregister: %v", got)
+	}
+}
+
+func rawStatus(t *testing.T, cfg config.Config) map[string]json.RawMessage {
+	t.Helper()
+	c, stop := startDaemon(t, cfg, "")
+	defer stop()
+	st, err := c.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(st)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestStatusSMSDisabled(t *testing.T) {
+	cfg := testConfig(t, siptest.NewTrunk(t, "udp"))
+	raw := rawStatus(t, cfg)
+	if got := string(raw["sms"]); got != `{"enabled":false,"state":"disabled"}` {
+		t.Fatalf("sms = %s", got)
+	}
+}
+
+func TestStatusSMSEnabledWaitsForPhone(t *testing.T) {
+	cfg := testConfig(t, siptest.NewTrunk(t, "udp"))
+	cfg.SMS.Enabled = true
+	raw := rawStatus(t, cfg)
+	var s sms.Status
+	if err := json.Unmarshal(raw["sms"], &s); err != nil || !s.Enabled || s.State != sms.StateWaiting {
+		t.Fatalf("sms = %s (%v)", raw["sms"], err)
+	}
+}
+
+// The Bluetooth runner gets a binding only when SMS is enabled.
+func TestBluetoothRunnerGetsSMSBindingOnlyWhenEnabled(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		cfg := testConfig(t, siptest.NewTrunk(t, "udp"))
+		cfg.SMS.Enabled = enabled
+		got := make(chan *smsBinding, 1)
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- run(ctx, cfg, "", quietLogger(), func(ctx context.Context, _ config.Config, _ coordinator, _ errorSink, b *smsBinding, _ *slog.Logger) {
+				got <- b
+				<-ctx.Done()
+			})
+		}()
+		b := <-got
+		if (b != nil) != enabled || (enabled && (b.link == nil || b.stuck == nil)) {
+			t.Fatalf("enabled=%v binding=%+v", enabled, b)
+		}
+		cancel()
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
