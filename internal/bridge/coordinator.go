@@ -84,6 +84,10 @@ type Deps struct {
 	Logger    *slog.Logger
 	Clock     Clock
 	NewCallID func(time.Time) string
+	// PhoneLink, when set, learns that a phone was attached (up, with its
+	// adapter address) or dropped (Detach or the HFP link's EOF), in order,
+	// from the loop (spec 17.7). It must not block.
+	PhoneLink func(up bool, adapterAddr string)
 }
 
 // cleanupTimeout bounds each background BYE and AT+CHUP (spec 4.6).
@@ -318,6 +322,9 @@ func (c *Coordinator) dispatch(ctx context.Context, m msg) {
 		c.clearLate()
 		c.cancelChups()
 		c.tel, c.listener, c.adapterAddr = m.telRef, m.lis, m.addr
+		if c.d.PhoneLink != nil {
+			c.d.PhoneLink(true, m.addr)
+		}
 		gen := c.telGen
 		go func(t Telephony) {
 			// hfp delivers losslessly, so keep draining for the client's whole
@@ -461,6 +468,9 @@ func (c *Coordinator) onTimer(m msg) {
 
 // dropPhone forgets the HFP client; a call in progress ends as bluetooth_lost.
 func (c *Coordinator) dropPhone() {
+	if c.tel != nil && c.d.PhoneLink != nil {
+		c.d.PhoneLink(false, "")
+	}
 	c.tel, c.listener = nil, nil
 	c.phone = phoneIdle
 	c.telGen++
